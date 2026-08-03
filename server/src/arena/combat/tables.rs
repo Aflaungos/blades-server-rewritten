@@ -494,3 +494,4 @@ mod tests {
         assert!(fallback::weapon_base_for_level(30, Weight::Light) > 0.0);
     }
 }
+

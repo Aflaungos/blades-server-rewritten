@@ -1013,7 +1013,37 @@ fn resolve_ability_cast(
         AbilityTag::Absorb => out.extend(apply_absorb(combat, sender, level, now)),
         AbilityTag::ResistElements => out.extend(apply_resist_elements(combat, sender, level, now)),
         AbilityTag::Perk => {}
-        AbilityTag::Paralyze | AbilityTag::Damage | AbilityTag::Maneuver | AbilityTag::Generic => {
+        // A MANEUVER is a weapon attack, not a spell. It deals the attacker's WEAPON
+        // damage on the Middle side — which the damage model already implements and
+        // `roundtrip_s506_damage::s506_middle_maneuver_lands_in_recorded_band` already
+        // validates against recorded s506 values.
+        //
+        // It was routed to `resolve_ability` instead, which reads the ability's own
+        // shipped `_damage` — and a maneuver rank does not have one. Measured on prod
+        // 2026-08-03: QuickStrikes (150 stamina) and PiercingStrikes (180 stamina) ship
+        // NO damage field at any rank, so `unwrap_or(0.0)` made both cost a third of
+        // the stamina bar and do literally nothing. 87 of 160 casts that day dealt 0.0.
+        AbilityTag::Maneuver => {
+            let attacker_loadout = combat.fighters[sender].loadout.clone();
+            // Middle is not part of a Left/Right chain, so it resets the combo — the
+            // same rule `resolve_swing_with_side` applies to a Middle swing.
+            combat.fighters[sender].reset_combo();
+            let resolved = RetailDamageModel.resolve_attack(
+                &attacker_loadout,
+                &combat.fighters[target_slot],
+                DamageSource::Attack,
+                ActiveSide::Middle,
+                1.0,
+                0,
+                now,
+            );
+            info!(
+                "combat: slot {sender} maneuver {} → weapon damage {:.1} (Middle)",
+                ea.ability_uuid, resolved.total,
+            );
+            out.extend(emit_damage(combat, sender, target_slot, &resolved, now));
+        }
+        AbilityTag::Paralyze | AbilityTag::Damage | AbilityTag::Generic => {
             let resolved = RetailDamageModel.resolve_ability(
                 &ea.ability_uuid,
                 level,
