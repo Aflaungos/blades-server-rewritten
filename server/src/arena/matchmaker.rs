@@ -673,6 +673,7 @@ mod bot_pick_tests {
             solo_fallback_secs: 15,
             debug_ghost_user_id: None,
             bot_user_ids: Vec::new(),
+            busy_fallback_secs: 230,
         };
         // No DB pool → the function's first early return. `block_on` because the
         // path never awaits anything real once `db` is None.
@@ -1565,7 +1566,6 @@ mod tests {
             solo_fallback_secs: 15,
             debug_ghost_user_id: None,
             bot_user_ids: Vec::new(),
-            // Tests drive the SOLO path; the busy delay is exercised by its own test.
             busy_fallback_secs: 230,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
@@ -1624,7 +1624,6 @@ mod tests {
             solo_fallback_secs: 600, // long fallback — the Failed must arrive BEFORE it
             debug_ghost_user_id: None,
             bot_user_ids: Vec::new(),
-            // Tests drive the SOLO path; the busy delay is exercised by its own test.
             busy_fallback_secs: 230,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
@@ -1704,7 +1703,6 @@ mod tests {
             solo_fallback_secs: 1,
             debug_ghost_user_id: None,
             bot_user_ids: Vec::new(),
-            // Tests drive the SOLO path; the busy delay is exercised by its own test.
             busy_fallback_secs: 230,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
@@ -1747,7 +1745,6 @@ mod tests {
             solo_fallback_secs: 1,
             debug_ghost_user_id: None,
             bot_user_ids: Vec::new(),
-            // Tests drive the SOLO path; the busy delay is exercised by its own test.
             busy_fallback_secs: 230,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
@@ -1798,7 +1795,6 @@ mod tests {
             solo_fallback_secs: 1,
             debug_ghost_user_id: None,
             bot_user_ids: Vec::new(),
-            // Tests drive the SOLO path; the busy delay is exercised by its own test.
             busy_fallback_secs: 230,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
