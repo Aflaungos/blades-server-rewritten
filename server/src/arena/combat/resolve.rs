@@ -81,9 +81,48 @@ const CRIT_FACTOR_VERSATILE: f32 = 1.625;
 /// available; the threshold is also the `AttackChargeState.PreCritical → Critical`
 /// state transition in `dump.cs TypeDefIndex 13116`.
 ///
-/// **CALIBRATION FLAG** — set this const once `MinDamageTime`/`MaxDamageTime` are
-/// captured from the CDN WeaponTemplate assets.
-const CRITICAL_HOLD_SECS: f32 = 1.2;
+/// **CALIBRATION FLAG RESOLVED, 2026-08-04.** The flag asked for
+/// `MinDamageTime`/`MaxDamageTime` from the CDN WeaponTemplate assets. They are in
+/// hand, from the shipped `*WeaponTemplateList` assets, and 1.2 s was far too long:
+///
+/// Across 246 real swings in captured sessions 615/616, the hold-at-release
+/// distribution is median **0.317 s**, p90 0.47-0.60 s, **maximum 1.73 s**. At a
+/// 1.2 s threshold a critical hit was very nearly unreachable — which is why nobody
+/// has ever reported landing one.
+///
+/// The real full-charge threshold is `WeaponTemplate._backswingTime`, which is the
+/// input to `AttackChargeState::DetermineState(chargeTime)`
+/// (`dump.cs` TypeDefIndex 13115) — the damage ramps from `minDamageFactor` (0) to
+/// `maxDamageFactor` over the backswing, holds for `_maxDamageTime` (0.035 s), then
+/// decays. 363 of 368 shipped weapon entries collapse onto three signatures:
+///
+/// | class | backswing |
+/// |---|---|
+/// | Light (Dagger/HandAxe/LightHammer) | 0.1167 s |
+/// | Versatile / Balanced (Longsword/WarAxe/Mace) | 0.2 s |
+/// | Heavy (Greatsword/Battleaxe/Warhammer) | 0.25 s |
+///
+/// This also explains why players cluster around 0.32 s: they are holding just past
+/// the sweet spot, exactly as the ramp rewards.
+///
+/// Kept as a per-class constant rather than per-weapon because `x_items.py` still
+/// discards the eleven `WeaponTemplate` timing fields; when it carries them, this
+/// should read the weapon's own value.
+const CRIT_HOLD_LIGHT_SECS: f32 = 0.116_667;
+const CRIT_HOLD_VERSATILE_SECS: f32 = 0.2;
+const CRIT_HOLD_HEAVY_SECS: f32 = 0.25;
+
+/// The full-charge threshold for this fighter's weapon.
+fn critical_hold_secs(fighter: &super::state::Fighter) -> f32 {
+    match fighter.loadout.weapon.weight {
+        Some(tables::Weight::Heavy) => CRIT_HOLD_HEAVY_SECS,
+        Some(tables::Weight::Versatile) => CRIT_HOLD_VERSATILE_SECS,
+        // Default to Light when the class is unknown — the shortest threshold, so an
+        // unclassified weapon errs toward letting a genuine charge count rather than
+        // silently swallowing it, which is the failure this replaces.
+        _ => CRIT_HOLD_LIGHT_SECS,
+    }
+}
 
 /// Fallback ability cooldown for abilities without authoritative game-data.
 const ABILITY_COOLDOWN: Duration = Duration::from_millis(3000);
@@ -412,7 +451,7 @@ fn parse_op46_held(user_data: &[u8]) -> Option<bool> {
 ///
 /// Light/Heavy/Versatile multipliers come from `tables::Weight::crit_combo().0`.
 fn charge_crit_factor(fighter: &super::state::Fighter, hold_secs: f32) -> f32 {
-    if hold_secs < CRITICAL_HOLD_SECS {
+    if hold_secs < critical_hold_secs(fighter) {
         return 1.0;
     }
     // Full charge: pick multiplier by weapon class.
@@ -514,13 +553,13 @@ pub fn on_c2s_input(
                 let is_crit = swing_factor > 1.0;
                 if is_crit {
                     info!(
-                        "combat: slot {sender} op46 UP — hold {hold_secs:.3}s ≥ {CRITICAL_HOLD_SECS}s threshold \
+                        "combat: slot {sender} op46 UP — hold {hold_secs:.3}s ≥ threshold \
                          → CRIT ×{swing_factor:.3} (weapon {:?})",
                         combat.fighters[sender].loadout.weapon.weight,
                     );
                 } else {
                     debug!(
-                        "combat: slot {sender} op46 UP — hold {hold_secs:.3}s < {CRITICAL_HOLD_SECS}s \
+                        "combat: slot {sender} op46 UP — hold {hold_secs:.3}s < threshold \
                          → normal swing ×1.0",
                     );
                 }
@@ -2382,7 +2421,7 @@ mod tests {
         // Simulate a full-charge hold: press at t=0, release at t = CRITICAL_HOLD_SECS + 0.5s.
         let press_time = now;
         combat.fighters[0].charge_press_at = Some(press_time);
-        let release_time = press_time + Duration::from_secs_f32(CRITICAL_HOLD_SECS + 0.5);
+        let release_time = press_time + Duration::from_secs_f32(CRIT_HOLD_HEAVY_SECS + 0.5);
 
         let up_frame = make_op46_frame(0x1234_5678, false);
         let mut out = on_c2s_input(&mut combat, 0, &up_frame, release_time);
@@ -2433,7 +2472,7 @@ mod tests {
         let mut combat = make_live_combat_no_enchant(now, super::super::tables::Weight::Heavy);
 
         combat.fighters[0].charge_press_at =
-            Some(now - Duration::from_secs_f32(CRITICAL_HOLD_SECS + 0.3));
+            Some(now - Duration::from_secs_f32(CRIT_HOLD_HEAVY_SECS + 0.3));
 
         let up_frame = make_op46_frame(0x1234_5678, false);
         let mut out = on_c2s_input(&mut combat, 0, &up_frame, now);
@@ -2455,6 +2494,41 @@ mod tests {
         );
     }
 
+    /// A hold of the length players actually use must be able to CRIT.
+    ///
+    /// The old flat threshold was 1.2 s. Across 246 real swings the hold-at-release
+    /// distribution is median 0.317 s, p90 0.47-0.60 s and MAXIMUM 1.73 s — so at
+    /// 1.2 s a critical hit was very nearly unreachable, and nobody ever reported
+    /// landing one. This test fails if the threshold is put back above what a human
+    /// actually holds.
+    #[test]
+    fn a_typical_player_hold_can_crit() {
+        // The measured median hold. Not a number picked to make the test pass — it is
+        // what players did, and the whole complaint is that it did nothing.
+        const MEASURED_MEDIAN_HOLD: f32 = 0.3167;
+        for (weight, name) in [
+            (super::super::tables::Weight::Light, "Light"),
+            (super::super::tables::Weight::Versatile, "Versatile"),
+            (super::super::tables::Weight::Heavy, "Heavy"),
+        ] {
+            let now = Instant::now();
+            let mut combat = make_live_combat_no_enchant(now, weight);
+            let factor = charge_crit_factor(&combat.fighters[0], MEASURED_MEDIAN_HOLD);
+            assert!(
+                factor > 1.0,
+                "{name}: a median-length hold ({MEASURED_MEDIAN_HOLD}s) must crit, got x{factor}"
+            );
+            // And a hold below the weapon's own backswing must not.
+            let below = critical_hold_secs(&combat.fighters[0]) * 0.5;
+            assert_eq!(
+                charge_crit_factor(&combat.fighters[0], below),
+                1.0,
+                "{name}: a hold below the backswing must NOT crit"
+            );
+            let _ = &mut combat;
+        }
+    }
+
     /// Op46 UP after a SHORT hold (< CRITICAL_HOLD_SECS) → normal swing ×1.0 (no crit).
     /// Damage must equal an uncharged swing (no crit boost applied).
     #[test]
@@ -2463,10 +2537,13 @@ mod tests {
         // No-enchant so the comparison is exact (no rounding from fixed enchant contribution).
         let mut combat = make_live_combat_no_enchant(now, super::super::tables::Weight::Light);
 
-        // Press at t=0, release at t = CRITICAL_HOLD_SECS / 2 (definitely partial).
+        // Press at t=0, release halfway to the LIGHT threshold — this combat holds a
+        // Light weapon, and the threshold is now per-weapon (0.1167 s), not a flat
+        // 1.2 s. Half of the HEAVY threshold would be 0.125 s, which is now a
+        // genuine full charge for this weapon and would crit.
         let press_time = now;
         combat.fighters[0].charge_press_at = Some(press_time);
-        let release_time = press_time + Duration::from_secs_f32(CRITICAL_HOLD_SECS / 2.0);
+        let release_time = press_time + Duration::from_secs_f32(CRIT_HOLD_LIGHT_SECS / 2.0);
 
         let up_frame = make_op46_frame(0x1234_5678, false);
         let _ = on_c2s_input(&mut combat, 0, &up_frame, release_time);
@@ -2482,7 +2559,7 @@ mod tests {
         // Partial charge must be equal to uncharged (×1.0, no crit boost).
         assert_eq!(
             partial_dealt, normal_dealt,
-            "partial hold (< {CRITICAL_HOLD_SECS}s) must NOT crit: partial dealt {partial_dealt}, \
+            "partial hold (below the weapon threshold) must NOT crit: partial dealt {partial_dealt}, \
              uncharged dealt {normal_dealt}"
         );
     }
@@ -3065,7 +3142,7 @@ mod phase4_tests {
         let mut real = live_combat(now);
         on_c2s_input(&mut real, 0, &make_pos_frame(0.814, 0.5, 0.0), t);
         on_c2s_input(&mut real, 0, &make_act_frame(true, 0.0, false), t);
-        let held_to = t + Duration::from_secs_f32(CRITICAL_HOLD_SECS + 0.1);
+        let held_to = t + Duration::from_secs_f32(CRIT_HOLD_HEAVY_SECS + 0.1);
         on_c2s_input(&mut real, 0, &make_act_frame(false, 1.3, false), held_to);
         land(&mut real, held_to);
         assert!(
@@ -3238,7 +3315,8 @@ mod phase4_tests {
     #[test]
     fn stagger_locks_inputs_for_the_shipped_duration() {
         use super::super::state::BASE_STAGGER_DURATION_SECS;
-        assert!((BASE_STAGGER_DURATION_SECS - 1.5).abs() < 1e-6);
+        // PvP value (PvpDefaultSettings.BASE_STAGGER_DURATION), not the PvE 1.5.
+        assert!((BASE_STAGGER_DURATION_SECS - 2.5).abs() < 1e-6);
         let now = Instant::now();
         let mut f = Fighter::new(0, 564, super::super::loadout::starter(), now);
         f.apply_stagger(now);
@@ -3247,8 +3325,9 @@ mod phase4_tests {
         assert!(f.blocking_until.is_none(), "a stagger drops the guard");
         // Still locked just before the duration, recovered just after.
         assert!(f.is_staggered(now + Duration::from_millis(1400)));
-        assert!(!f.is_staggered(now + Duration::from_millis(1600)));
-        assert!(f.reconcile_stagger(now + Duration::from_millis(1600)));
+        // Past the PvP 2.5 s stagger, not the PvE 1.5 s.
+        assert!(!f.is_staggered(now + Duration::from_millis(2600)));
+        assert!(f.reconcile_stagger(now + Duration::from_millis(2600)));
         assert_eq!(f.actor_state, super::super::state::ActorStateType::Idle);
     }
 

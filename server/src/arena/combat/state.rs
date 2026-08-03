@@ -179,12 +179,32 @@ pub const BLOCK_OPTIMAL_TIME_SECS: f32 = 2.0;
 /// Cooldown (seconds) after dropping the block before a new OPTIMAL window can
 /// begin. Re-raising within this window starts as LATE, not OPTIMAL.
 ///
-/// **Phase 3.5:** this is `PlayerCombatParameters.postOptimalBlockResetTime`
-/// (**1.4 s**), replacing the dump's `OPTIMAL_BLOCK_RECOVERY_TIME = 0.8 s`. The
-/// shipped player-combat asset is the authority for a *player* re-raising a guard;
-/// `PvpDefaultSettings` 0.8 was a server-cheat default.
-pub const OPTIMAL_BLOCK_RECOVERY_SECS: f32 =
-    super::gamedata::combat_params::POST_OPTIMAL_BLOCK_RESET_TIME;
+/// **REVERSED 2026-08-04, and the reversal deserves stating plainly.**
+///
+/// This used to be `PlayerCombatParameters.postOptimalBlockResetTime` (1.4 s), with
+/// a comment arguing that the shipped player-combat asset is the authority for a
+/// player re-raising a guard and that `PvpDefaultSettings`' 0.8 s "was a
+/// server-cheat default". That was a considered choice, not an oversight — but it
+/// is inconsistent with what this same module already does.
+///
+/// `ARENA_HEALTH_MULTIPLIER` (line 19) is `PvpDefaultSettings
+/// .CHEAT_BASE_HEALTH_MULTIPLIER`, and we apply it to every arena fighter. So the
+/// codebase already treats that class as authoritative for the arena. Taking its
+/// health value and refusing its block value is the position that needs defending,
+/// not this one. `PvpDefaultSettings` is, by name and by content, the PvP settings
+/// — and the arena is PvP.
+///
+/// Retail PvP: **0.8 s**. This shortens the penalty for dropping and re-raising a
+/// guard, so blocking becomes more forgiving — which is the direction tracker #21
+/// item 1 complains about.
+pub const OPTIMAL_BLOCK_RECOVERY_SECS: f32 = PVP_OPTIMAL_BLOCK_RECOVERY_TIME;
+
+/// `PvpDefaultSettings.OPTIMAL_BLOCK_RECOVERY_TIME` (`dump.cs:427015`).
+const PVP_OPTIMAL_BLOCK_RECOVERY_TIME: f32 = 0.8;
+
+/// `PvpDefaultSettings.BASE_STAGGER_DURATION` (`dump.cs:427016`). The PvE value in
+/// `CombatParameters` is 1.5 s; arena is PvP and staggers for longer.
+const PVP_BASE_STAGGER_DURATION: f32 = 2.5;
 
 /// The block phase for a defending fighter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -667,7 +687,7 @@ pub const HEALTH_PERCENT_TO_CAUSE_STATUS: f32 =
 
 /// `CombatParameters.baseStaggerDuration` — how long a staggered actor is locked out.
 /// [Phase 3.13]
-pub const BASE_STAGGER_DURATION_SECS: f32 = super::gamedata::combat_params::BASE_STAGGER_DURATION;
+pub const BASE_STAGGER_DURATION_SECS: f32 = PVP_BASE_STAGGER_DURATION;
 
 /// `CombatParameters.criticalHealthThreshold` — health **percentage** (0..100) below
 /// which a fighter is "critical" (drives the potion prompt + `Fortify Health
@@ -1543,7 +1563,9 @@ mod tests {
         // Drop the block (record last_block_dropped_at = now).
         f.last_block_dropped_at = Some(now);
 
-        // Re-raise inside the `postOptimalBlockResetTime` (1.4 s) recovery window.
+        // Re-raise inside the recovery window, which is now the PvP
+        // OPTIMAL_BLOCK_RECOVERY_TIME (0.8 s) rather than the PvE 1.4 s. 300 ms is
+        // still comfortably inside it.
         let reraise = now + std::time::Duration::from_millis(300);
         f.actor_state = ActorStateType::Blocking;
         f.blocking_side = ActiveSide::Right;
@@ -1553,17 +1575,19 @@ mod tests {
         assert_eq!(
             f.block_phase(reraise),
             Some(BlockPhase::Late),
-            "re-raised within postOptimalBlockResetTime (1.4 s) → starts as LATE, not OPTIMAL"
+            "re-raised within the PvP recovery window (0.8 s) → starts as LATE, not OPTIMAL"
         );
 
-        // Phase 3.5: the recovery window is `postOptimalBlockResetTime` = 1.4 s
-        // (PlayerCombatParameters), NOT the dump's 0.8 s server-cheat default — so a
-        // raise at 0.9 s is still LATE and only a raise past 1.4 s is OPTIMAL again.
+        // The recovery window is now the PvP OPTIMAL_BLOCK_RECOVERY_TIME (0.8 s),
+        // taken from the same PvpDefaultSettings class this module already uses for
+        // ARENA_HEALTH_MULTIPLIER — so a raise past 0.8 s is OPTIMAL again.
         assert!(
-            (OPTIMAL_BLOCK_RECOVERY_SECS - 1.4).abs() < 1e-6,
-            "postOptimalBlockResetTime is 1.4 s, got {OPTIMAL_BLOCK_RECOVERY_SECS}"
+            (OPTIMAL_BLOCK_RECOVERY_SECS - 0.8).abs() < 1e-6,
+            "PvP OPTIMAL_BLOCK_RECOVERY_TIME is 0.8 s, got {OPTIMAL_BLOCK_RECOVERY_SECS}"
         );
-        let still_late = now + std::time::Duration::from_millis(900);
+        // 0.5 s is inside the 0.8 s window, so still LATE. (Was 0.9 s, which is now
+        // OUTSIDE the shorter PvP window and would be OPTIMAL.)
+        let still_late = now + std::time::Duration::from_millis(500);
         f.block_raised_at = Some(still_late);
         f.blocking_until = Some(still_late + block_window);
         assert_eq!(f.block_phase(still_late), Some(BlockPhase::Late), "0.9 s < 1.4 s → still LATE");
