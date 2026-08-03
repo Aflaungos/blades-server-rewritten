@@ -12,7 +12,7 @@
 //! match instance land in milestone (c)/(d).
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use actix_web::{
     HttpResponse, post,
@@ -510,6 +510,126 @@ async fn pick_bot_loadout(
 }
 
 #[cfg(test)]
+mod human_priority_tests {
+    use super::*;
+
+    fn cfg() -> ArenaConfig {
+        ArenaConfig {
+            advertise_host: "127.0.0.1".into(),
+            udp_port: 7777,
+            max_concurrent_matches: 4,
+            max_queued_players: 64,
+            solo_fallback_secs: 4,
+            debug_ghost_user_id: None,
+            bot_user_ids: Vec::new(),
+            busy_fallback_secs: 230,
+        }
+    }
+
+    /// Alone in the arena → a bot straight away. This is the case the 4 s fallback
+    /// was written for and it must not regress: one tester must never sit in
+    /// "Searching".
+    #[test]
+    fn a_lone_player_still_gets_a_bot_fast() {
+        assert_eq!(fallback_delay(&cfg(), 0), Duration::from_secs(4));
+    }
+
+    /// Somebody else is mid-match → hold the queue open for them.
+    #[test]
+    fn a_busy_arena_makes_the_bot_wait() {
+        assert_eq!(fallback_delay(&cfg(), 1), Duration::from_secs(230));
+        assert_eq!(fallback_delay(&cfg(), 7), Duration::from_secs(230));
+    }
+
+    /// **The reason for the number.** Prod 2026-08-03: two players shared the arena
+    /// for six minutes and never met, because their cycles were offset by ~50 s and
+    /// the fallback was 4 s. Measured human-vs-AI matches were 81, 110, 78, 110 and
+    /// 84 seconds — mean 92.6, longest 110.
+    ///
+    /// For the second player to arrive while the first is still queued, the wait has
+    /// to outlast a whole match plus the menu time before a re-queue. One match is
+    /// not enough; this asserts the default clears the LONGEST observed match with
+    /// room to spare, which is what "100-200 % longer" buys.
+    #[test]
+    fn the_busy_wait_outlasts_a_whole_human_ai_match() {
+        const OBSERVED_MATCH_SECS: &[u64] = &[81, 110, 78, 110, 84];
+        let mean = OBSERVED_MATCH_SECS.iter().sum::<u64>() / OBSERVED_MATCH_SECS.len() as u64;
+        let longest = *OBSERVED_MATCH_SECS.iter().max().unwrap();
+        let busy = cfg().busy_fallback_secs;
+
+        assert!(
+            busy >= mean * 2,
+            "the busy wait ({busy}s) must be at least 100% longer than the mean \
+             human-vs-AI match ({mean}s), or two offset players still miss each other"
+        );
+        assert!(
+            busy <= mean * 3,
+            "…and at most 200% longer ({}s), or a player whose opponent quietly left \
+             waits absurdly long before the deadline collapses",
+            mean * 3
+        );
+        assert!(
+            busy > longest,
+            "it must clear the LONGEST observed match ({longest}s), not just the mean"
+        );
+    }
+
+    /// **The wiring.** Everything above passes even if the loop never asks the
+    /// registry how many people are playing — so this drives the seam that actually
+    /// reads it, with a real registry and a real admitted peer.
+    #[test]
+    fn the_deadline_reflects_who_is_actually_playing() {
+        use crate::arena::combat::Loadout;
+        let reg = MatchRegistry::new(4);
+        let config = cfg();
+        let since = Instant::now();
+
+        // Empty arena → the fast deadline.
+        assert_eq!(
+            fallback_deadline(&config, &reg, since),
+            since + Duration::from_secs(4),
+            "nobody else is playing, so a lone player must not be made to wait"
+        );
+
+        // One human mid-match → the long deadline.
+        let psid = "aaaaaaaa-0000-0000-0000-000000000000";
+        assert!(reg.allocate_with_bots(
+            &[psid.to_string()],
+            vec![Loadout::default(), Loadout::default()],
+            Uuid::new_v4(),
+            1,
+        ));
+        let peer: std::net::SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        assert!(reg.admit(peer, psid, &[7u8; 32]).is_some());
+        assert_eq!(
+            fallback_deadline(&config, &reg, since),
+            since + Duration::from_secs(230),
+            "somebody is mid-match — hold the queue open for them"
+        );
+
+        // They leave → back to the fast deadline, so a departed player cannot strand
+        // whoever is waiting.
+        reg.remove(&peer);
+        assert_eq!(
+            fallback_deadline(&config, &reg, since),
+            since + Duration::from_secs(4),
+            "the delay must collapse when the arena empties"
+        );
+    }
+
+    /// The delay must be reachable from the environment without a code change — the
+    /// right number is a matter of how many people are actually playing, and that
+    /// changes without us.
+    #[test]
+    fn the_busy_wait_is_configurable_and_defaults_sanely() {
+        // Defaults come from `from_env`; assert the default here rather than mutating
+        // process env (which races other tests in the same binary).
+        assert_eq!(cfg().busy_fallback_secs, 230);
+        assert!(cfg().busy_fallback_secs > cfg().solo_fallback_secs);
+    }
+}
+
+#[cfg(test)]
 mod bot_pick_tests {
     use super::*;
 
@@ -553,6 +673,7 @@ mod bot_pick_tests {
             solo_fallback_secs: 15,
             debug_ghost_user_id: None,
             bot_user_ids: Vec::new(),
+            busy_fallback_secs: 230,
         };
         // No DB pool → the function's first early return. `block_on` because the
         // path never awaits anything real once `db` is None.
@@ -846,10 +967,52 @@ impl ArenaGlobal {
     }
 }
 
-/// The matchmaker actor. Single owner of the ticket queue — no locks. A lone ticket
-/// waits `config.solo_fallback_secs` for a human opponent to PAIR with; if none
-/// arrives it falls back to a solo match against a server-driven bot, so a single
+/// How often the fallback branch re-checks whether anyone else is playing, while a
+/// ticket waits. Short enough that the deadline collapses promptly when the last other
+/// player leaves; long enough to be free (it only ticks while someone is queued).
+const FALLBACK_REEVALUATE: Duration = Duration::from_secs(2);
+
+/// How long a waiting ticket may hold out for a human, given how many other humans
+/// are in a live match right now.
+///
+/// Pulled out of the loop so the rule is testable without spinning a matchmaker, a
+/// registry and a clock — the loop then has no decision left to get wrong.
+fn fallback_delay(config: &ArenaConfig, others_live: usize) -> Duration {
+    if others_live > 0 {
+        Duration::from_secs(config.busy_fallback_secs)
+    } else {
+        Duration::from_secs(config.solo_fallback_secs)
+    }
+}
+
+/// When a ticket that started waiting at `since` may fall back to a bot.
+///
+/// The seam that READS the arena's state. Split from [`fallback_delay`] so a test can
+/// pin the wiring — a test of `fallback_delay` alone passes even if the loop never
+/// asks the registry anything, which is how this feature would ship green and do
+/// nothing at all.
+fn fallback_deadline(config: &ArenaConfig, registry: &MatchRegistry, since: Instant) -> Instant {
+    since + fallback_delay(config, registry.live_human_count())
+}
+
+/// The matchmaker actor. Single owner of the ticket queue — no locks.
+///
+/// A lone ticket waits for a human opponent to PAIR with; if none arrives before its
+/// deadline it falls back to a solo match against a server-driven bot, so a single
 /// tester always gets a fight instead of being stuck "Searching".
+///
+/// **HUMANS GET FIRST REFUSAL.** The deadline is not one number. While another human
+/// is in a live match it is `busy_fallback_secs` (≈2.5 human-vs-AI matches); when
+/// nobody else is playing it is `solo_fallback_secs` (4 s). Without that split, two
+/// players can share the arena for minutes and never meet — their cycles sit offset by
+/// tens of seconds and a 4 s fallback cannot bridge the gap, so each is handed a bot
+/// before the other can finish. Observed on prod 2026-08-03; the trace is in
+/// `ArenaConfig::busy_fallback_secs`.
+///
+/// The delay is only ever paid when it can buy something. It applies solely while
+/// somebody else is mid-match, and it is recomputed every pass — so if that player
+/// finishes and does not return, the deadline drops back to the solo one instead of
+/// stranding whoever is waiting.
 async fn matchmaker_loop(
     mut rx: UnboundedReceiver<MatchmakerCommand>,
     config: ArenaConfig,
@@ -861,25 +1024,51 @@ async fn matchmaker_loop(
         config.advertise_host, config.udp_port, registry.max_matches
     );
 
-    // A single ticket held while it waits for an opponent to pair with.
-    let mut waiting: Option<TicketRequest> = None;
+    // A single ticket held while it waits for an opponent to pair with, and WHEN it
+    // started waiting. One Option, not two: the deadline is derived from the instant,
+    // and a separate `waiting_since` could drift out of step with `waiting`.
+    let mut waiting: Option<(TicketRequest, Instant)> = None;
     loop {
-        // If a ticket is already waiting, race the next command against a fallback
-        // timer; otherwise just block for the next command.
-        let next = if waiting.is_some() {
-            tokio::select! {
-                r = rx.recv() => r,
-                _ = tokio::time::sleep(Duration::from_secs(config.solo_fallback_secs)) => {
-                    let lone = waiting.take().expect("waiting is some");
-                    // Don't spin up a bot match for a client that's already gone.
-                    if lone.rms.is_gone().await {
-                        info!("matchmaker: waiting ticket {} abandoned (RMS gone) — dropped, no fallback", lone.ticket_id);
-                        continue;
-                    }
-                    info!("matchmaker: no opponent for ticket {} — solo fallback (vs bot)", lone.ticket_id);
-                    resolve(&registry, &config, &db, &[lone], 1).await;
+        // If a ticket is already waiting, race the next command against its fallback
+        // deadline; otherwise just block for the next command.
+        let next = if let Some((_, since)) = waiting.as_ref() {
+            // HUMANS FIRST. While anyone else is in a live match they are, by
+            // definition, about to be free — so hold the queue open long enough to
+            // catch them, rather than handing this player a bot they did not ask for.
+            //
+            // Recomputed on every pass, which is the point: if that other player
+            // finishes and does NOT come back, `live_human_count()` drops to 0 and the
+            // deadline collapses to `solo_fallback_secs`. Nobody is left waiting
+            // minutes for a player who left.
+            let deadline = fallback_deadline(&config, &registry, *since);
+            let others_live = registry.live_human_count();
+            let now = Instant::now();
+            if now >= deadline {
+                let (lone, waited) = waiting.take().map(|(t, s)| (t, s.elapsed())).expect("waiting is some");
+                // Don't spin up a bot match for a client that's already gone.
+                if lone.rms.is_gone().await {
+                    info!("matchmaker: waiting ticket {} abandoned (RMS gone) — dropped, no fallback", lone.ticket_id);
                     continue;
                 }
+                info!(
+                    "matchmaker: no human opponent for ticket {} after {:.1}s ({} other human(s) in a live match) — solo fallback (vs bot)",
+                    lone.ticket_id,
+                    waited.as_secs_f32(),
+                    others_live,
+                );
+                resolve(&registry, &config, &db, &[lone], 1).await;
+                continue;
+            }
+            // Sleep to the deadline, but wake at least every FALLBACK_REEVALUATE so the
+            // branch above can react to matches starting and ending. Also fixes a
+            // latent bug: this used to be `sleep(solo_fallback_secs)` created fresh on
+            // every iteration, so ANY unrelated command — another player's enqueue, a
+            // cancel — silently restarted the timer. At 4 s that was invisible; at 230 s
+            // it would mean a busy queue never falls back at all.
+            let nap = (deadline - now).min(FALLBACK_REEVALUATE);
+            tokio::select! {
+                r = rx.recv() => r,
+                _ = tokio::time::sleep(nap) => continue,
             }
         } else {
             rx.recv().await
@@ -894,7 +1083,7 @@ async fn matchmaker_loop(
             // timer — the client saw a `Succeeded` for a match it had abandoned. Match
             // on both ticket_id AND user_id so a cancel can only drop THAT user's ticket.
             MatchmakerCommand::Cancel { ticket_id, user_id } => {
-                match &waiting {
+                match waiting.as_ref().map(|(t, _)| t) {
                     Some(w) if w.ticket_id == ticket_id && w.user_id == user_id => {
                         info!("matchmaker: cancelled waiting ticket {ticket_id} (user {user_id}) — dequeued");
                         waiting = None;
@@ -924,7 +1113,7 @@ async fn matchmaker_loop(
         match waiting.take() {
             // A LIVE second player is already waiting → pair the two into ONE shared
             // match (no bot).
-            Some(first) if !first.rms.is_gone().await => {
+            Some((first, _)) if !first.rms.is_gone().await => {
                 resolve(&registry, &config, &db, &[first, req], 0).await
             }
             // The waiting ticket's client is gone — its RMS feed closed (it cancelled,
@@ -933,15 +1122,15 @@ async fn matchmaker_loop(
             // which is exactly the emu-vs-pixel failure: each device kept pairing against
             // the other's stale cancelled ticket. DISCARD it and let the fresh, live
             // ticket wait for a live opponent instead.
-            Some(stale) => {
+            Some((stale, _)) => {
                 info!(
                     "matchmaker: discarded stale waiting ticket {} (RMS gone); {} now waiting",
                     stale.ticket_id, req.ticket_id
                 );
-                waiting = Some(req);
+                waiting = Some((req, Instant::now()));
             }
             // First player → hold it and wait for an opponent (or the timer above).
-            None => waiting = Some(req),
+            None => waiting = Some((req, Instant::now())),
         }
     }
     warn!("matchmaker: queue closed, actor exiting");
@@ -1377,6 +1566,7 @@ mod tests {
             solo_fallback_secs: 15,
             debug_ghost_user_id: None,
             bot_user_ids: Vec::new(),
+            busy_fallback_secs: 230,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         tokio::spawn(matchmaker_loop(rx, config, registry.clone(), None));
@@ -1434,6 +1624,7 @@ mod tests {
             solo_fallback_secs: 600, // long fallback — the Failed must arrive BEFORE it
             debug_ghost_user_id: None,
             bot_user_ids: Vec::new(),
+            busy_fallback_secs: 230,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         tokio::spawn(matchmaker_loop(rx, config, registry.clone(), None));
@@ -1512,6 +1703,7 @@ mod tests {
             solo_fallback_secs: 1,
             debug_ghost_user_id: None,
             bot_user_ids: Vec::new(),
+            busy_fallback_secs: 230,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         tokio::spawn(matchmaker_loop(rx, config, registry.clone(), None));
@@ -1553,6 +1745,7 @@ mod tests {
             solo_fallback_secs: 1,
             debug_ghost_user_id: None,
             bot_user_ids: Vec::new(),
+            busy_fallback_secs: 230,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         tokio::spawn(matchmaker_loop(rx, config, registry.clone(), None));
@@ -1602,6 +1795,7 @@ mod tests {
             solo_fallback_secs: 1,
             debug_ghost_user_id: None,
             bot_user_ids: Vec::new(),
+            busy_fallback_secs: 230,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         tokio::spawn(matchmaker_loop(rx, config, registry.clone(), None));

@@ -357,7 +357,28 @@ impl DamageModel for RetailDamageModel {
         // The shipped per-rank `_damage` + the ability's own `damage_type`.
         let (ty, base) = match super::gamedata::ability(ability_uuid) {
             Some(a) => {
-                let dmg = tables::ability_damage(ability_uuid, ability_level).unwrap_or(0.0);
+                // Some spells are DAMAGE-OVER-TIME and ship no direct `_damage` at all —
+                // only `_damagePerSecond`. Frostbite is one: rank 1 carries
+                // dps = 35.51 and no `damage`, so reading `_damage` alone returned None
+                // and `unwrap_or(0.0)` made a 280-magicka spell deal NOTHING. Measured on
+                // prod 2026-08-03, where 87 of 160 casts dealt exactly 0.0.
+                //
+                // The total is `dps × ELEMENTAL_STATUS_DURATION` — the same shipped
+                // duration the engine already uses for every elemental condition DoT
+                // (`resolve::CONDITION_DURATION_SECS`), so the number is derived from
+                // game data rather than invented.
+                //
+                // CAVEAT, stated rather than hidden: retail almost certainly TICKS this
+                // over the duration instead of landing it in one hit. Applying it as a
+                // lump sum is the honest floor — the spell does its shipped total damage
+                // — and the tick schedule is the follow-up. It is not pinned by any
+                // capture we have.
+                let dmg = tables::ability_damage(ability_uuid, ability_level).unwrap_or_else(|| {
+                    super::gamedata::ability_rank_clamped(ability_uuid, ability_level.max(1) as u16)
+                        .and_then(|r| r.damage_per_second())
+                        .map(|dps| dps * super::gamedata::combat_params::ELEMENTAL_STATUS_DURATION)
+                        .unwrap_or(0.0)
+                });
                 let ty = a
                     .damage_type
                     .map(super::loadout::map_damage_type)
@@ -492,7 +513,7 @@ mod tests {
     }
 
     /// An un-armored, un-blocking L100 target.
-    fn target() -> Fighter {
+    pub(super) fn target() -> Fighter {
         Fighter::new(1, 565, Loadout { level: 100, ..Default::default() }, Instant::now())
     }
 
@@ -740,6 +761,106 @@ mod tests {
             "DoT {} should exceed the direct hit {} (resistance de-rated, block not)",
             comp(&dot, DamageType::Poison),
             comp(&hit, DamageType::Poison)
+        );
+    }
+}
+
+#[cfg(test)]
+mod every_cast_does_something {
+    use super::*;
+    use crate::arena::combat::gamedata;
+    use crate::arena::combat::loadout::ability_tag_for_template;
+    use crate::arena::combat::state::AbilityTag;
+    use super::tests::target;
+
+    /// **No ability a player can equip may cost a resource and do nothing.**
+    ///
+    /// Reported 2026-08-03 ("magic doesn't cause damage, neither do abilities") and
+    /// measured on prod the same day: of 160 spell casts, **87 dealt exactly 0.0**.
+    /// Every one of the six abilities players actually cast, and what it ships:
+    ///
+    /// | ability | tag | rank-1 data | before |
+    /// |---|---|---|---|
+    /// | Fireball | Damage | `damage=73.89` | worked |
+    /// | IceSpike | Damage | `damage=108.83` | worked |
+    /// | Frostbite | Damage | **`dps=35.51`, no `damage`** | **0.0** |
+    /// | ResistElements | ResistElements | `resistance_amount=48.54` | 0 damage, correctly — it is a buff |
+    /// | QuickStrikes | Maneuver | **nothing at all** | **0.0** for 150 stamina |
+    /// | PiercingStrikes | Maneuver | **nothing at all** | **0.0** for 180 stamina |
+    ///
+    /// So this walks the WHOLE shipped ability table rather than those six, and asserts
+    /// that anything routed to the direct-damage path produces a positive number. A
+    /// spell that ships neither `_damage` nor `_damagePerSecond` would still be caught.
+    ///
+    /// Buffs (Ward / Absorb / ResistElements) and Perks are excluded — dealing zero is
+    /// the correct answer for them. Maneuvers are excluded because they no longer use
+    /// this path at all; they take the weapon path, which
+    /// `roundtrip_s506_damage::s506_middle_maneuver_lands_in_recorded_band` pins against
+    /// recorded s506 values.
+    ///
+    /// **A KNOWN GAP this test deliberately does NOT cover.** Sweeping the table turned
+    /// up six more abilities that resolve to zero, and every one of them ships no damage
+    /// number at all — they are buffs whose tag says otherwise:
+    ///
+    /// ```text
+    ///   SnakeBite       (tag Damage)   MagickaSurge  (tag Generic)
+    ///   EchoWeapon      (tag Generic)
+    /// ```
+    ///
+    /// Plus the three `*Armor` spells — FirestormArmor, BlizzardArmor, TempestArmor —
+    /// which DO ship a dps but are damage-shield AURAS: the dps burns whoever attacks
+    /// the caster, for the buff's duration. Resolving that as a direct hit on the target
+    /// would turn a defensive buff into a nuke, so they are skipped here and belong with
+    /// the buffs above.
+    ///
+    /// Zero damage is arguably the RIGHT answer for a buff. What is wrong is that their
+    /// buff does nothing either, and fixing that means implementing each effect — not
+    /// giving them a damage number we would have to invent. Hence the `ships_damage`
+    /// filter: this test pins the bug class where the data exists and the code ignored
+    /// it, and does not pretend to cover the class where the data is absent.
+    #[test]
+    fn no_damage_ability_resolves_to_zero() {
+        let m = RetailDamageModel;
+        let now = Instant::now();
+        let mut dead: Vec<String> = Vec::new();
+
+        for a in gamedata::ABILITIES.iter() {
+            let tag = ability_tag_for_template(a.uuid);
+            if !matches!(tag, AbilityTag::Damage | AbilityTag::Paralyze | AbilityTag::Generic) {
+                continue;
+            }
+            // Only abilities that SHIP a damage number. An ability with neither
+            // `_damage` nor `_damagePerSecond` is almost always a buff whose tag is
+            // wrong (see the note below) — asserting it deals damage would demand a
+            // number we would have to invent.
+            let ships_damage = gamedata::ability_rank_clamped(a.uuid, 1)
+                .map(|r| r.damage().is_some() || r.damage_per_second().is_some())
+                .unwrap_or(false);
+            if !ships_damage {
+                continue;
+            }
+            // `*Armor` spells (Firestorm / Blizzard / Tempest) are damage-shield AURAS:
+            // their dps burns whoever attacks the caster, over the buff's duration. They
+            // ship a damage number, so the filter above lets them through, but resolving
+            // it as a direct hit on the TARGET is the wrong model entirely — it would
+            // make a defensive buff a nuke. They belong with the unimplemented buffs
+            // listed above, not here.
+            if a.editor_name.ends_with("Armor") {
+                continue;
+            }
+            // Rank 1 is what a freshly-equipped ability resolves at, so it is the
+            // floor that matters.
+            let r = m.resolve_ability(a.uuid, 1, &target(), ActiveSide::Middle, now);
+            if r.total <= 0.0 {
+                dead.push(format!("{} ({}, tag {tag:?})", a.editor_name, a.uuid));
+            }
+        }
+
+        assert!(
+            dead.is_empty(),
+            "these abilities are routed to the damage path but deal NOTHING — a player \
+             spends the resource and sees no effect:\n  {}",
+            dead.join("\n  "),
         );
     }
 }

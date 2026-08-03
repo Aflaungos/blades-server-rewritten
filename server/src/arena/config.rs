@@ -51,6 +51,35 @@ pub struct ArenaConfig {
     /// the match-end card resolves (the 2026-07-03 invisible-bot / post-match-hang fix).
     /// Unlike `debug_ghost_user_id` this is the PRODUCTION bot path (not a debug crutch).
     pub bot_user_ids: Vec<Uuid>,
+    /// How long a queued player waits for a HUMAN before falling back to a bot, when
+    /// **somebody else is already in a live match** (env `ARENA_BUSY_FALLBACK_SECS`).
+    ///
+    /// `solo_fallback_secs` (4 s) is right when a player is genuinely alone, and wrong
+    /// the moment two are around. Observed on prod 2026-08-03, two players for six
+    /// minutes, never once matched with each other:
+    ///
+    /// ```text
+    ///   20:38:31  A queues → 20:38:35 bot   (match ends 20:39:56)
+    ///   20:39:25  B queues → 20:39:29 bot   (match ends 20:41:19)
+    ///   20:41:03  A queues → 20:41:07 bot   (match ends 20:42:25)
+    ///   20:41:49  B queues → 20:41:53 bot   (match ends 20:43:43)
+    ///   20:42:43  A queues → 20:42:47 bot
+    /// ```
+    ///
+    /// Their cycles are offset by ~50 s, and a 4 s fallback is far too short to bridge
+    /// that: each is handed a bot before the other can possibly finish. Waiting longer
+    /// than one human-vs-AI match guarantees the offset is absorbed — whoever queues
+    /// second arrives while the first is still holding the queue open, and they pair.
+    ///
+    /// The default is **230 s ≈ 2.5×** the measured mean human-vs-AI match of 92.6 s
+    /// (the five matches above: 81, 110, 78, 110, 84). That is "150 % longer", inside
+    /// the 100–200 % the owner asked for.
+    ///
+    /// The cost is bounded and paid only when it can help: the delay applies solely
+    /// while another human is in a live match, and collapses back to
+    /// `solo_fallback_secs` the moment nobody is (see `matchmaker_loop`). A player who
+    /// really is alone never waits longer than they do today.
+    pub busy_fallback_secs: u64,
 }
 
 impl ArenaConfig {
@@ -69,6 +98,7 @@ impl ArenaConfig {
             // human still pairs instantly within the window (its ticket arrives while
             // the 1st waits). Bump ARENA_SOLO_FALLBACK_SECS to widen the pairing window.
             solo_fallback_secs: parse("ARENA_SOLO_FALLBACK_SECS", 4),
+            busy_fallback_secs: parse("ARENA_BUSY_FALLBACK_SECS", 230),
             // DEBUG ghost opponent (off when unset / unparseable → normal bot).
             debug_ghost_user_id: env::var("ARENA_DEBUG_GHOST")
                 .ok()
