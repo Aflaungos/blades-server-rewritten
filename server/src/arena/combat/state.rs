@@ -1048,8 +1048,26 @@ impl Fighter {
 
     /// Enter the staggered state for `CombatParameters.baseStaggerDuration`.
     pub fn apply_stagger(&mut self, now: Instant) {
+        self.apply_stagger_for(now, BASE_STAGGER_DURATION_SECS);
+    }
+
+    /// Enter the staggered state for an explicit duration.
+    ///
+    /// Exists because some abilities ship their OWN `_stunDuration` — IceSpike 1.20 s,
+    /// StaggeringBash, Guardbreaker — and that field was read by nothing, so every one
+    /// of them produced the generic `baseStaggerDuration` instead of its own.
+    ///
+    /// Stagger is used as the vehicle deliberately. `StatusEffectType` has no `Stun`
+    /// member: the wire value for a distinct stun status is not pinned by any capture
+    /// we hold, and inventing a status id risks the client dropping the frame silently
+    /// (`FindStateTypeByID` returns null and the effect evaporates). A stun and a
+    /// stagger do the same observable thing here — inputs locked, guard dropped, combo
+    /// broken — so this reuses the capture-validated stagger path with the ability's
+    /// real duration. If a real Stun id turns up in the dump, this is the one place to
+    /// change.
+    pub fn apply_stagger_for(&mut self, now: Instant, secs: f32) {
         self.staggered_until =
-            Some(now + std::time::Duration::from_secs_f32(BASE_STAGGER_DURATION_SECS));
+            Some(now + std::time::Duration::from_secs_f32(secs.max(0.05)));
         self.set_actor_state(ActorStateType::Staggered, now);
         // A stagger overrides whatever swing was in flight: drop its queued
         // follow-through/recovery/idle, which would otherwise fire mid-stagger and
@@ -2004,5 +2022,52 @@ mod tests {
         // Verify they expire at the same time (both created simultaneously).
         assert!(f.effects.iter().all(|e| e.expires_at == expires),
             "both instances share the same expiry");
+    }
+}
+
+#[cfg(test)]
+mod stun_duration_tests {
+    use super::*;
+    use crate::arena::combat::loadout;
+
+    /// An ability's own `_stunDuration` must size the stagger, not the global default.
+    /// IceSpike ships 1.20 s; `baseStaggerDuration` is 1.5 s — so before this, a stun
+    /// from IceSpike lasted 25% longer than the game data says.
+    #[test]
+    fn an_abilitys_own_stun_duration_sizes_the_stagger() {
+        let now = Instant::now();
+        let mut f = Fighter::new(0, 1, loadout::starter(), now);
+        f.apply_stagger_for(now, 1.20);
+        assert!(f.is_staggered(now + std::time::Duration::from_millis(1100)));
+        assert!(
+            !f.is_staggered(now + std::time::Duration::from_millis(1300)),
+            "a 1.20s stun must be over by 1.3s — it was using the 1.5s global default"
+        );
+    }
+
+    /// The no-duration path is unchanged: `apply_stagger` still means the shipped
+    /// `baseStaggerDuration`, so nothing that relied on it moves.
+    #[test]
+    fn the_default_stagger_is_unchanged() {
+        let now = Instant::now();
+        let mut f = Fighter::new(0, 1, loadout::starter(), now);
+        f.apply_stagger(now);
+        let d = std::time::Duration::from_secs_f32(BASE_STAGGER_DURATION_SECS);
+        assert!(f.is_staggered(now + d - std::time::Duration::from_millis(50)));
+        assert!(!f.is_staggered(now + d + std::time::Duration::from_millis(50)));
+    }
+
+    /// A stun still does everything a stagger does — guard down, combo broken, queued
+    /// swing beats dropped. Those are what make it a stun rather than a debuff.
+    #[test]
+    fn a_stun_drops_the_guard_and_breaks_the_combo() {
+        let now = Instant::now();
+        let mut f = Fighter::new(0, 1, loadout::starter(), now);
+        f.blocking_until = Some(now + std::time::Duration::from_secs(5));
+        f.register_combo_swing(ActiveSide::Right);
+        f.apply_stagger_for(now, 1.20);
+        assert!(f.blocking_until.is_none(), "guard must drop");
+        assert_eq!(f.combo_count, 0, "combo must break");
+        assert_eq!(f.actor_state(), ActorStateType::Staggered);
     }
 }

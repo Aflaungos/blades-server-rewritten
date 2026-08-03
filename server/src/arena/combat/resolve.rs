@@ -1064,13 +1064,20 @@ fn resolve_ability_cast(
                 .and_then(|r| r.damage_to_cause_stagger())
             {
                 if resolved.total >= threshold && !combat.fighters[target_slot].is_dead() {
-                    combat.fighters[target_slot].apply_stagger(now);
+                    // Prefer the ability's OWN `_stunDuration` when it ships one —
+                    // IceSpike 1.20 s, StaggeringBash, Guardbreaker. That field was read
+                    // by nothing, so all three produced the generic
+                    // `baseStaggerDuration` regardless of what the game data said.
+                    let secs = super::gamedata::ability_rank_clamped(&ea.ability_uuid, level as u16)
+                        .and_then(|r| r.stun_duration())
+                        .unwrap_or(super::state::BASE_STAGGER_DURATION_SECS);
+                    combat.fighters[target_slot].apply_stagger_for(now, secs);
                     let obj = combat.fighters[target_slot].net_object_id;
                     let frame = messages::change_combat_status_effect(
                         obj,
                         true,
                         super::state::StatusEffectType::Staggered,
-                        super::state::BASE_STAGGER_DURATION_SECS,
+                        secs,
                         0,
                     );
                     for slot in 0..combat.fighters.len() {
