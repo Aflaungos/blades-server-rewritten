@@ -780,6 +780,23 @@ impl MatchRegistry {
     pub fn active_count(&self) -> usize {
         self.matches.lock().unwrap().len()
     }
+
+    /// How many HUMANS are in a live match right now.
+    ///
+    /// Counts connected peers, because a bot never has one — a solo-vs-bot match
+    /// contributes exactly 1. This is the matchmaker's "is anyone else actually
+    /// playing" signal, and counting peers rather than logins is what makes it
+    /// self-healing: a match that ends frees its peers immediately, and one that was
+    /// allocated but never connected contributes 0, so nobody is ever made to wait
+    /// on a ghost.
+    pub fn live_human_count(&self) -> usize {
+        self.matches
+            .lock()
+            .unwrap()
+            .values()
+            .map(|m| m.players.len())
+            .sum()
+    }
     pub fn available_permits(&self) -> usize {
         self.semaphore.available_permits()
     }
@@ -1187,6 +1204,51 @@ mod tests {
         buf.extend_from_slice(psid.as_bytes());
         buf.extend_from_slice(b"\x00\x00trailing bytes");
         buf
+    }
+
+    /// **The signal the human-priority matchmaker runs on.** If this returns 0 while
+    /// somebody is mid-match, the whole busy-fallback delay never triggers and two
+    /// players keep getting bots — so it is worth pinning rather than assuming.
+    ///
+    /// Counting connected PEERS is what makes it right: a bot has no peer, so a
+    /// solo-vs-bot match contributes exactly 1 (the human), and a match allocated but
+    /// never connected contributes 0 so nobody waits on a ghost.
+    #[test]
+    fn live_human_count_counts_people_not_matches() {
+        let reg = MatchRegistry::new(4);
+        assert_eq!(reg.live_human_count(), 0, "empty arena");
+
+        // A solo-vs-bot match: 1 peer slot, 2 fighters, 1 bot.
+        let gsid = Uuid::new_v4();
+        let psid = "aaaaaaaa-0000-0000-0000-000000000000";
+        assert!(reg.allocate_with_bots(
+            &[psid.to_string()],
+            vec![Loadout::default(), Loadout::default()],
+            gsid,
+            1,
+        ));
+        assert_eq!(
+            reg.live_human_count(),
+            0,
+            "allocated but nobody connected yet — a ghost must not make anyone wait"
+        );
+
+        // The human's ENet peer connects.
+        let peer: SocketAddr = "10.0.0.1:5000".parse().unwrap();
+        assert!(
+            reg.admit(peer, psid, &[7u8; 32]).is_some(),
+            "the peer should be admitted"
+        );
+        assert_eq!(
+            reg.live_human_count(),
+            1,
+            "one human is now playing — the BOT in the same match must not be counted"
+        );
+
+        // They leave: the count must fall, or a departed player keeps delaying
+        // everyone else forever.
+        reg.remove(&peer);
+        assert_eq!(reg.live_human_count(), 0, "the count must fall when they leave");
     }
 
     #[test]
