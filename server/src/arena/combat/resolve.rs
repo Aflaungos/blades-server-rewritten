@@ -36,7 +36,9 @@ use log::{debug, info};
 use super::damage::{DamageModel, ResolvedDamage, RetailDamageModel};
 use super::input;
 use super::messages;
-use super::state::{ActiveSide, DamageSource, FlowState, MatchCombat, MatchState, NetObjectType};
+use super::state::{
+    ActiveSide, DamageSource, FlowState, MatchCombat, MatchState, NetObjectType, PendingSwing,
+};
 use super::tables;
 
 /// Carrier MessageType (`user_data[1]`) of the combat-input family — `0x36` (54).
@@ -104,6 +106,32 @@ fn ability_cooldown(ability_uuid: &str, rank: u8) -> Duration {
 /// `BLOCK_OPTIMAL_TIME` is 2.0s (docs/blades-combat-formulae.md §2); we use it as the
 /// block window since the on/off flag isn't byte-pinned from a two-sided capture.
 const BLOCK_WINDOW: Duration = Duration::from_secs(2);
+
+/// Commit → damage. **MEASURED, not inferred** (tracker #21).
+///
+/// Retail put 0.050 s between the attack button being released and the damage
+/// landing. Two independent sources agree: the attack state declares its own
+/// duration on the wire as exactly `0.05` in 377 of 395 captured phase messages
+/// across sessions 615 and 616 and both swing sides, and the interval measured
+/// from the ENet header's millisecond `sentTime` has a hard floor of 47-49 ms in
+/// both sessions. It also reconciles with the shipped
+/// `PvpParameters.serverHitTime = 0.04` rounded up to three whole frames at
+/// `SERVER_DEFAULT_FRAMERATE = 60` — that last step is inferred, the 0.050 is not.
+///
+/// NOTE: 50 ms is NOT the defender's reaction window and must not be tuned as
+/// though it were. In retail the window is the attacker's CHARGE (median 0.317 s,
+/// replicated to the opponent as gmid 45, which we already send). This constant
+/// exists so that an attack has a duration at all, and so the guard can be sampled
+/// when the hit lands rather than when it was thrown.
+pub(super) const ATTACK_WINDUP: Duration = Duration::from_millis(50);
+
+/// Damage → recovery. One frame at the client's 60 Hz; declared on the wire as
+/// exactly `0.0167` in 336 of 338 captured messages.
+const FOLLOW_THROUGH: Duration = Duration::from_micros(16_667);
+
+/// Same durations as `f32` seconds, for propId 8 of the phase messages.
+const ATTACK_WINDUP_SECS: f32 = 0.05;
+const FOLLOW_THROUGH_SECS: f32 = 0.0167;
 
 /// True iff `user_data` is a `PlayerCombatInputActivate` (op46) frame.
 /// These have carrier `0x2e` (46) — NOT the generic `0x36` UserMessage carrier.
@@ -518,14 +546,7 @@ pub fn on_c2s_input(
                 // geometry (the usual case on this path) this is `None` and the
                 // synthetic fallback applies.
                 let side = classified_side_for(&combat.fighters[sender], now);
-                return resolve_swing_with_side(
-                    combat,
-                    sender,
-                    target_slot,
-                    swing_factor,
-                    side,
-                    now,
-                );
+                return commit_swing(combat, sender, target_slot, swing_factor, side, 0.0, now);
             }
             None => {
                 // Frame too short or not op46 — ignore.
@@ -696,7 +717,7 @@ pub fn on_c2s_input(
              side {side:?} from x={:?}",
             combat.fighters[sender].last_input_x
         );
-        return resolve_swing_with_side(combat, sender, target_slot, swing_factor, side, now);
+        return commit_swing(combat, sender, target_slot, swing_factor, side, hold_secs, now);
     }
 
 
@@ -713,7 +734,7 @@ pub fn on_c2s_input(
         // streamed fresh pointer geometry; otherwise `resolve_swing_with_side`
         // applies the synthetic-alternation fallback.
         let side = classified_side_for(&combat.fighters[sender], now);
-        resolve_swing_with_side(combat, sender, target_slot, 1.0, side, now)
+        commit_swing(combat, sender, target_slot, 1.0, side, 0.0, now)
     }
 }
 
@@ -723,14 +744,28 @@ pub fn on_c2s_input(
 ///   - `1.0` for a normal (partial / uncharged) swing via carrier-0x36 or bot swings.
 ///   - `CRIT_FACTOR_*` for a full-charge crit dispatched from the op46 (0x2e) path
 ///     when the server-measured hold ≥ `CRITICAL_HOLD_SECS` (bug 4 fix).
-fn resolve_swing_with_side(
+/// Accept a swing and schedule its hit — the COMMIT half of an attack.
+///
+/// Before tracker #21 the button-up handler called `resolve_swing_with_side`
+/// directly and damage landed on that same frame, so an attack had no duration at
+/// all and the defender's only reaction window was network latency. Now commit and
+/// impact are separated by `ATTACK_WINDUP`, which is what lets a guard raised
+/// during the swing still count, and what gives items 2 and 3 of #21 a moment to
+/// hang off.
+///
+/// Returns the attack-state message (gmid 52, or 40 for the manual path) that
+/// retail sent at this instant and we never sent at all.
+fn commit_swing(
     combat: &mut MatchCombat,
     sender: usize,
     target_slot: usize,
     swing_factor: f32,
-    decoded_side: Option<ActiveSide>,
+    side: Option<ActiveSide>,
+    charge_held_secs: f32,
     now: Instant,
 ) -> Vec<(usize, Vec<u8>)> {
+    // Weapon cadence, checked at COMMIT so a burst of releases cannot queue several
+    // hits. Moved here from `resolve_swing_with_side` for exactly that reason.
     let cooldown = swing_cooldown_for(&combat.fighters[sender]);
     if let Some(last) = combat.fighters[sender].last_swing {
         if now.duration_since(last) < cooldown {
@@ -739,6 +774,90 @@ fn resolve_swing_with_side(
         }
     }
     combat.fighters[sender].last_swing = Some(now);
+
+    combat.pending_swings.push(PendingSwing {
+        sender,
+        target: target_slot,
+        swing_factor,
+        side,
+        charge_held_secs,
+        due: now + ATTACK_WINDUP,
+    });
+    debug!(
+        "combat: slot {sender} swing COMMITTED — lands in {:?} (hold {charge_held_secs:.3}s)",
+        ATTACK_WINDUP
+    );
+    phase_message_to_both(
+        combat,
+        sender,
+        side,
+        charge_held_secs,
+        PhaseMsg::AttackState,
+    )
+}
+
+/// Which phase message to build. Kept as an enum so the three emission points
+/// share one addressing/stat-packing path rather than three near-copies.
+#[derive(Clone, Copy)]
+enum PhaseMsg {
+    AttackState,
+    FollowThrough,
+    Recovery,
+}
+
+/// Build one phase message for `sender` and address it to BOTH fighters — the
+/// attacker needs it to animate its own swing and the defender needs it to see the
+/// swing coming. Retail sent these to both; we sent none of them.
+fn phase_message_to_both(
+    combat: &MatchCombat,
+    sender: usize,
+    side: Option<ActiveSide>,
+    duration_of_state_left: f32,
+    which: PhaseMsg,
+) -> Vec<(usize, Vec<u8>)> {
+    if sender >= combat.fighters.len() {
+        return Vec::new();
+    }
+    // Same packing and addressing as the gmid-45 charge broadcast above: one
+    // message, own stats from the actor and opponent stats from its opponent, sent
+    // to both viewers. Not re-packed per viewer — the captured frames are not.
+    let own = combat.fighters[sender].packed_stats();
+    let opp = combat
+        .opponent_of(sender)
+        .and_then(|o| combat.fighters.get(o))
+        .map(|f| f.packed_stats())
+        .unwrap_or(0);
+    let obj = combat.fighters[sender].net_object_id;
+    let side = side.unwrap_or(ActiveSide::Right);
+    let bytes = match which {
+        PhaseMsg::AttackState => {
+            messages::player_auto_attack_state_change(obj, own, opp, duration_of_state_left, side)
+        }
+        PhaseMsg::FollowThrough => {
+            messages::player_follow_through_state_change(obj, own, opp, duration_of_state_left, side)
+        }
+        PhaseMsg::Recovery => {
+            messages::player_recovery_state_change(obj, own, opp, duration_of_state_left, side)
+        }
+    };
+    let mut out = vec![(sender, bytes.clone())];
+    if let Some(o) = combat.opponent_of(sender) {
+        out.push((o, bytes));
+    }
+    out
+}
+
+fn resolve_swing_with_side(
+    combat: &mut MatchCombat,
+    sender: usize,
+    target_slot: usize,
+    swing_factor: f32,
+    decoded_side: Option<ActiveSide>,
+    now: Instant,
+) -> Vec<(usize, Vec<u8>)> {
+    // The weapon-cadence gate lives in `commit_swing`, not here: this function now
+    // LANDS a swing that was already accepted `ATTACK_WINDUP` ago, and re-checking
+    // the cadence at landing time would compare against the wrong instant.
 
     // ---- Phase 4.1: swing side ----
     //
@@ -797,7 +916,7 @@ fn resolve_swing(
     swing_factor: f32,
     now: Instant,
 ) -> Vec<(usize, Vec<u8>)> {
-    resolve_swing_with_side(combat, sender, target_slot, swing_factor, None, now)
+    commit_swing(combat, sender, target_slot, swing_factor, None, 0.0, now)
 }
 
 /// A spell/ability cast: cooldown-gated, resource-gated (stamina for maneuvers /
@@ -1775,6 +1894,62 @@ const BOT_SWING_COOLDOWN: Duration = Duration::from_millis(1800);
 /// (return empty). This is belt-and-suspenders — with HOLD on the FSM never reaches
 /// `StateTimeout` so this guard is already satisfied below, but we make the no-bot
 /// intent explicit and robust to any future tick path.
+/// Resolve every committed swing whose `ATTACK_WINDUP` has elapsed.
+///
+/// Emits, per landed swing, in retail's order: the damage (from
+/// `resolve_swing_with_side`), then FollowThrough (gmid 43) carrying the attack
+/// state's 0.050 s, then Recovery (gmid 44) carrying FollowThrough's 0.0167 s.
+///
+/// Recovery is emitted in the same pass rather than scheduled for another
+/// 16.7 ms: the host services matches roughly every 2 ms, so a second queue would
+/// buy ordering precision the client cannot observe, at the cost of another piece
+/// of state that can leak. If a capture ever shows the client reacting to the gap,
+/// this is the place to split it.
+fn land_due_swings(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8>)> {
+    if combat.pending_swings.is_empty() {
+        return Vec::new();
+    }
+    // Partition rather than drain-filter so ordering among simultaneous hits is
+    // stable (commit order), and so a swing whose fighter died meanwhile is dropped.
+    let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut combat.pending_swings)
+        .into_iter()
+        .partition(|p| now >= p.due);
+    combat.pending_swings = waiting;
+
+    let mut out = Vec::new();
+    for p in due {
+        if p.sender >= combat.fighters.len() || p.target >= combat.fighters.len() {
+            continue;
+        }
+        // A round can end while a swing is in the air. Landing it afterwards would
+        // deal damage into the next round.
+        if !matches!(combat.phase, FlowState::StateTimeout) {
+            continue;
+        }
+        if combat.fighters[p.target].is_dead() || combat.fighters[p.sender].is_dead() {
+            continue;
+        }
+        out.extend(resolve_swing_with_side(
+            combat, p.sender, p.target, p.swing_factor, p.side, now,
+        ));
+        out.extend(phase_message_to_both(
+            combat,
+            p.sender,
+            p.side,
+            ATTACK_WINDUP_SECS,
+            PhaseMsg::FollowThrough,
+        ));
+        out.extend(phase_message_to_both(
+            combat,
+            p.sender,
+            p.side,
+            FOLLOW_THROUGH_SECS,
+            PhaseMsg::Recovery,
+        ));
+    }
+    out
+}
+
 pub fn on_tick(combat: &mut MatchCombat, now: Instant, debug_hold: bool) -> Vec<(usize, Vec<u8>)> {
     if debug_hold {
         return Vec::new();
@@ -1788,6 +1963,19 @@ pub fn on_tick(combat: &mut MatchCombat, now: Instant, debug_hold: bool) -> Vec<
         f.reconcile_block(now);
     }
     let mut out = Vec::new();
+
+    // Land any swings whose windup has elapsed (tracker #21). BEFORE the DoT ticks
+    // and the bot's turn, so a swing thrown last tick resolves in the same order it
+    // would have if it had landed instantly.
+    //
+    // The guard is sampled HERE, inside `resolve_swing_with_side`, not at commit —
+    // which is the entire point of the windup: a block raised while the attack was
+    // in flight now counts.
+    out.extend(land_due_swings(combat, now));
+    if matches!(combat.phase, FlowState::RoundEnd | FlowState::NextState) {
+        // A landing blow just ended the round.
+        return out;
+    }
 
     // DoT ticks — one tick per second per active condition instance, independent of
     // whether a bot or player is the source. Runs BEFORE bot swings so a DoT killing
@@ -1835,6 +2023,30 @@ pub fn on_tick(combat: &mut MatchCombat, now: Instant, debug_hold: bool) -> Vec<
 
 #[cfg(test)]
 mod tests {
+
+    /// Commit a swing and advance past `ATTACK_WINDUP` so it lands.
+    ///
+    /// Tracker #21 separated commit from impact, so a test that swings and then
+    /// reads health in the same instant now reads it before the hit exists. These
+    /// tests were updated to ADVANCE A CLOCK rather than to relax their
+    /// assertions — the numbers they assert are unchanged.
+    fn swing_and_land(
+        combat: &mut MatchCombat,
+        sender: usize,
+        target: usize,
+        factor: f32,
+        now: Instant,
+    ) -> Vec<(usize, Vec<u8>)> {
+        let mut out = super::resolve_swing(combat, sender, target, factor, now);
+        out.extend(super::land_due_swings(combat, now + super::ATTACK_WINDUP));
+        out
+    }
+
+    /// Land whatever is already in flight, for tests that commit through the op46
+    /// path rather than through `resolve_swing`.
+    fn land(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8>)> {
+        super::land_due_swings(combat, now + super::ATTACK_WINDUP)
+    }
     use super::*;
     use super::super::messages::{self, frame_for_test};
     use super::super::state::{EquippedAbility, AbilityTag, Fighter, FlowState, MatchCombat, DamageType};
@@ -1860,7 +2072,8 @@ mod tests {
             f
         };
 
-        let out = on_c2s_input(&mut combat, 0, &block_frame, now);
+        let mut out = on_c2s_input(&mut combat, 0, &block_frame, now);
+        out.extend(land(&mut combat, now));
 
         // A block produces NO DAMAGE, but it DOES relay the blocking state — that
         // relay is what raises the shield on screen. This assertion used to demand
@@ -1907,7 +2120,8 @@ mod tests {
         combat.fighters[0].stamina = 0; // completely empty
 
         let ability_frame = make_ability_frame(120, qs_uuid);
-        let out = on_c2s_input(&mut combat, 0, &ability_frame, now);
+        let mut out = on_c2s_input(&mut combat, 0, &ability_frame, now);
+        out.extend(land(&mut combat, now));
 
         assert!(
             out.is_empty(),
@@ -1939,7 +2153,8 @@ mod tests {
         assert!(stam_before >= 150, "fighter must have ≥ 150 stamina for this test");
 
         let ability_frame = make_ability_frame(120, qs_uuid);
-        let out = on_c2s_input(&mut combat, 0, &ability_frame, now);
+        let mut out = on_c2s_input(&mut combat, 0, &ability_frame, now);
+        out.extend(land(&mut combat, now));
 
         // Stamina must be deducted by the R1 cost (150).
         let stam_after = combat.fighters[0].stamina;
@@ -2101,7 +2316,8 @@ mod tests {
         let mut combat = make_live_combat(now);
 
         let down_frame = make_op46_frame(0x1234_5678, true);
-        let out = on_c2s_input(&mut combat, 0, &down_frame, now);
+        let mut out = on_c2s_input(&mut combat, 0, &down_frame, now);
+        out.extend(land(&mut combat, now));
 
         assert!(
             combat.fighters[0].charge_press_at.is_some(),
@@ -2169,7 +2385,8 @@ mod tests {
         let release_time = press_time + Duration::from_secs_f32(CRITICAL_HOLD_SECS + 0.5);
 
         let up_frame = make_op46_frame(0x1234_5678, false);
-        let out = on_c2s_input(&mut combat, 0, &up_frame, release_time);
+        let mut out = on_c2s_input(&mut combat, 0, &up_frame, release_time);
+        out.extend(land(&mut combat, release_time));
 
         // Must emit ReceiveDamage frames (not empty).
         assert!(!out.is_empty(), "full-charge op46 UP must emit damage frames");
@@ -2184,7 +2401,7 @@ mod tests {
         // uncharged swing resolved directly via resolve_swing(×1.0).
         // The crit (×1.325 Light) must produce strictly MORE damage than ×1.0.
         let mut uncharged_combat = make_live_combat_no_enchant(now, super::super::tables::Weight::Light);
-        let _uncharged_out = resolve_swing(&mut uncharged_combat, 0, 1, 1.0, now);
+        let _uncharged_out = swing_and_land(&mut uncharged_combat, 0, 1, 1.0, now);
 
         // The charged combat emitted frames → the target (slot 1) received some HP reduction.
         let crit_hp_after = combat.fighters[1].health;
@@ -2219,13 +2436,14 @@ mod tests {
             Some(now - Duration::from_secs_f32(CRITICAL_HOLD_SECS + 0.3));
 
         let up_frame = make_op46_frame(0x1234_5678, false);
-        let out = on_c2s_input(&mut combat, 0, &up_frame, now);
+        let mut out = on_c2s_input(&mut combat, 0, &up_frame, now);
+        out.extend(land(&mut combat, now));
 
         assert!(!out.is_empty(), "full-charge Heavy op46 UP must emit damage");
 
         // Compare against uncharged heavy.
         let mut uncharged = make_live_combat_no_enchant(now, super::super::tables::Weight::Heavy);
-        let _ = resolve_swing(&mut uncharged, 0, 1, 1.0, now);
+        let _ = swing_and_land(&mut uncharged, 0, 1, 1.0, now);
 
         let crit_dealt = combat.fighters[1].max_health.saturating_sub(combat.fighters[1].health);
         let norm_dealt = uncharged.fighters[1].max_health.saturating_sub(uncharged.fighters[1].health);
@@ -2252,10 +2470,11 @@ mod tests {
 
         let up_frame = make_op46_frame(0x1234_5678, false);
         let _ = on_c2s_input(&mut combat, 0, &up_frame, release_time);
+        let _ = land(&mut combat, release_time);
 
         // Resolve an uncharged swing on a fresh combat at the same `release_time`.
         let mut uncharged = make_live_combat_no_enchant(now, super::super::tables::Weight::Light);
-        let _ = resolve_swing(&mut uncharged, 0, 1, 1.0, release_time);
+        let _ = swing_and_land(&mut uncharged, 0, 1, 1.0, release_time);
 
         let partial_dealt = combat.fighters[1].max_health.saturating_sub(combat.fighters[1].health);
         let normal_dealt = uncharged.fighters[1].max_health.saturating_sub(uncharged.fighters[1].health);
@@ -2355,19 +2574,19 @@ mod tests {
         let interval = tables::fallback_swing_interval(Weight::Light); // 400 ms
 
         // First swing lands.
-        let out1 = resolve_swing(&mut combat, 0, 1, 1.0, now);
+        let out1 = swing_and_land(&mut combat, 0, 1, 1.0, now);
         assert!(!out1.is_empty(), "first swing lands (emits ReceiveDamage)");
         let hp_after_first = combat.fighters[1].health;
 
         // Second swing HALF an interval later → rejected, no additional damage.
         let too_soon = now + interval / 2;
-        let out2 = resolve_swing(&mut combat, 0, 1, 1.0, too_soon);
+        let out2 = swing_and_land(&mut combat, 0, 1, 1.0, too_soon);
         assert!(out2.is_empty(), "a swing before the weapon cadence elapses is rejected");
         assert_eq!(combat.fighters[1].health, hp_after_first, "rejected swing deals no damage");
 
         // A swing just past the interval lands again.
         let ok_time = now + interval + Duration::from_millis(1);
-        let out3 = resolve_swing(&mut combat, 0, 1, 1.0, ok_time);
+        let out3 = swing_and_land(&mut combat, 0, 1, 1.0, ok_time);
         assert!(!out3.is_empty(), "a swing after the cadence elapses lands");
         assert!(combat.fighters[1].health < hp_after_first, "the cadence-legal swing deals damage");
     }
@@ -2387,7 +2606,7 @@ mod tests {
         for i in 0..n {
             // 20 evenly-spaced inputs across the 1s window (~50 ms apart — spam).
             let t = now + window * i / n;
-            if !resolve_swing(&mut combat, 0, 1, 1.0, t).is_empty() {
+            if !swing_and_land(&mut combat, 0, 1, 1.0, t).is_empty() {
                 landed += 1;
             }
         }
@@ -2410,14 +2629,14 @@ mod tests {
         let mut light = make_live_combat_no_enchant(now, Weight::Light);
         let mut heavy = make_live_combat_no_enchant(now, Weight::Heavy);
         // First swing for both.
-        assert!(!resolve_swing(&mut light, 0, 1, 1.0, now).is_empty());
-        assert!(!resolve_swing(&mut heavy, 0, 1, 1.0, now).is_empty());
+        assert!(!swing_and_land(&mut light, 0, 1, 1.0, now).is_empty());
+        assert!(!swing_and_land(&mut heavy, 0, 1, 1.0, now).is_empty());
 
         // A time past the Light interval but before the Heavy interval.
         let t = now + tables::fallback_swing_interval(Weight::Light) + Duration::from_millis(1);
         assert!(t < now + tables::fallback_swing_interval(Weight::Heavy), "test time is inside the Heavy cadence");
-        assert!(!resolve_swing(&mut light, 0, 1, 1.0, t).is_empty(), "Light can swing again");
-        assert!(resolve_swing(&mut heavy, 0, 1, 1.0, t).is_empty(), "Heavy is still on cadence — rejected");
+        assert!(!swing_and_land(&mut light, 0, 1, 1.0, t).is_empty(), "Light can swing again");
+        assert!(swing_and_land(&mut heavy, 0, 1, 1.0, t).is_empty(), "Heavy is still on cadence — rejected");
     }
 
     /// The spell/ability cooldown gate: a second cast of the SAME ability before its
@@ -2540,6 +2759,30 @@ fn on_consume_consumable(
 
 #[cfg(test)]
 mod phase4_tests {
+
+    /// Commit a swing and advance past `ATTACK_WINDUP` so it lands.
+    ///
+    /// Tracker #21 separated commit from impact, so a test that swings and then
+    /// reads health in the same instant now reads it before the hit exists. These
+    /// tests were updated to ADVANCE A CLOCK rather than to relax their
+    /// assertions — the numbers they assert are unchanged.
+    fn swing_and_land(
+        combat: &mut MatchCombat,
+        sender: usize,
+        target: usize,
+        factor: f32,
+        now: Instant,
+    ) -> Vec<(usize, Vec<u8>)> {
+        let mut out = super::resolve_swing(combat, sender, target, factor, now);
+        out.extend(super::land_due_swings(combat, now + super::ATTACK_WINDUP));
+        out
+    }
+
+    /// Land whatever is already in flight, for tests that commit through the op46
+    /// path rather than through `resolve_swing`.
+    fn land(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8>)> {
+        super::land_due_swings(combat, now + super::ATTACK_WINDUP)
+    }
     use super::*;
     use crate::arena::combat::state::Fighter;
 

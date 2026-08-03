@@ -995,8 +995,15 @@ pub fn results_json(
 ///   * propId 7 `stateHistory` is a ByteArray whose contents vary per frame; we send
 ///     it EMPTY. If the client turns out to need real history, that is the next
 ///     thing to pin (correlate consecutive frames within one session).
-///   * propId 8 is the time already spent in the state; 0.0 is correct at entry
-///     (0.0 is also the single most common captured value).
+///   * propId 8 is the duration of the state being LEFT, not the time already spent
+///     in the state being entered. (Corrected 2026-08-03. The two readings are
+///     indistinguishable from the s2c stream alone, but the client's own c2s
+///     `PlayerCombatInputActivate` hold field — a different message, decoded
+///     independently, in the other direction — reports median 0.317 s, and only the
+///     "state being left" reading reproduces that; the other implies 69 ms, below
+///     that distribution's observed minimum.) 0.0 is still correct HERE, because
+///     Charging is entered from Idle and there is no meaningful prior duration; it
+///     is also the single most common captured value at 117/395.
 pub fn player_charging_state_change(
     actor_net_object_id: i32,
     own_packed_stats: u64,
@@ -1020,6 +1027,136 @@ pub fn player_charging_state_change(
 /// `ActorStateType` for charging — propId 6 of gmid 45, constant across all 13,060
 /// captured frames.
 pub const ACTOR_STATE_CHARGING: u8 = 2;
+
+/// The rest of the `ActorStateType` ids that make up a swing, from
+/// `ActorStateType.StateId` (`dump.cs:340171`) and confirmed against captured
+/// sessions 615/616, where propId 6 carried exactly these values on every one of
+/// the corresponding messages (4/4, 233/233, 230/230, 199/199).
+pub const ACTOR_STATE_PLAYER_ATTACK: u8 = 15;
+pub const ACTOR_STATE_RECOVERY: u8 = 16;
+pub const ACTOR_STATE_FOLLOW_THROUGH: u8 = 17;
+pub const ACTOR_STATE_AUTO_ATTACK: u8 = 19;
+
+/// One phase of a swing — the shared body behind gmids 40, 43, 44 and 52.
+///
+/// WHY THIS EXISTS (tracker #21)
+///
+/// Retail sent a state message at every step of a swing. We sent NONE of these
+/// four: a `grep` for the four opcode names returned zero hits outside the opcode
+/// enum itself, even though the enum has carried them all along. The client
+/// therefore got a charge circle (gmid 45, which we do send) and then a damage
+/// number, with no attack, follow-through or recovery in between — which is the
+/// visible half of "the attack lands too early to block".
+///
+/// Shape is identical to [`player_charging_state_change`]; only propId 6 (the
+/// state id) and propId 8 (the duration of the state being LEFT) differ. Measured
+/// durations from sessions 615/616: the attack state lasts **0.050 s** (exact in
+/// 377/395 messages) and FollowThrough **0.0167 s**, one frame at the client's
+/// 60 Hz (`SERVER_DEFAULT_FRAMERATE`, `dump.cs:583040`), exact in 336/338.
+fn player_phase_state_change(
+    actor_net_object_id: i32,
+    own_packed_stats: u64,
+    opponent_packed_stats: u64,
+    gmid: GameMessageId,
+    actor_state: u8,
+    duration_of_state_left: f32,
+    side: ActiveSide,
+) -> Vec<u8> {
+    let mut w = NetDataWriter::new();
+    w.int(0, actor_net_object_id)
+        .byte(1, NetObjectType::Avatar as u8)
+        .byte(2, NetRole::Authority as u8)
+        .byte(3, gmid as u8)
+        .long(4, own_packed_stats as i64)
+        .long(5, opponent_packed_stats as i64)
+        .byte(6, actor_state)
+        .string(7, "")
+        .float(8, duration_of_state_left)
+        .byte(9, side as u8);
+    frame(MSGTYPE_USERMESSAGE, w.finish())
+}
+
+/// gmid 52 — the swing has been committed and the attack state is entered.
+/// propId 8 carries the duration of Charging, which the attacker chose by holding.
+pub fn player_auto_attack_state_change(
+    actor_net_object_id: i32,
+    own_packed_stats: u64,
+    opponent_packed_stats: u64,
+    charge_held_secs: f32,
+    side: ActiveSide,
+) -> Vec<u8> {
+    player_phase_state_change(
+        actor_net_object_id,
+        own_packed_stats,
+        opponent_packed_stats,
+        GameMessageId::PlayerAutoAttackStateChange,
+        ACTOR_STATE_AUTO_ATTACK,
+        charge_held_secs,
+        side,
+    )
+}
+
+/// gmid 40 — the manual (swipe) attack equivalent of gmid 52.
+///
+/// Sent only 4 times across both captured sessions against 396 auto-attacks, so
+/// the shape is copied from its sibling rather than independently pinned, and the
+/// 0.050 s figure is only weakly established for this path — its own shipped
+/// constant `ATTACK_STATE_MINIMUM_TIME` is 0.15 s. See docs/arena-combat-plan.md.
+pub fn player_attack_state_change(
+    actor_net_object_id: i32,
+    own_packed_stats: u64,
+    opponent_packed_stats: u64,
+    charge_held_secs: f32,
+    side: ActiveSide,
+) -> Vec<u8> {
+    player_phase_state_change(
+        actor_net_object_id,
+        own_packed_stats,
+        opponent_packed_stats,
+        GameMessageId::PlayerAttackStateChange,
+        ACTOR_STATE_PLAYER_ATTACK,
+        charge_held_secs,
+        side,
+    )
+}
+
+/// gmid 43 — damage has landed; propId 8 carries the attack state's 0.050 s.
+pub fn player_follow_through_state_change(
+    actor_net_object_id: i32,
+    own_packed_stats: u64,
+    opponent_packed_stats: u64,
+    attack_state_secs: f32,
+    side: ActiveSide,
+) -> Vec<u8> {
+    player_phase_state_change(
+        actor_net_object_id,
+        own_packed_stats,
+        opponent_packed_stats,
+        GameMessageId::PlayerFollowThroughStateChange,
+        ACTOR_STATE_FOLLOW_THROUGH,
+        attack_state_secs,
+        side,
+    )
+}
+
+/// gmid 44 — the swing is over; propId 8 carries FollowThrough's 0.0167 s.
+pub fn player_recovery_state_change(
+    actor_net_object_id: i32,
+    own_packed_stats: u64,
+    opponent_packed_stats: u64,
+    follow_through_secs: f32,
+    side: ActiveSide,
+) -> Vec<u8> {
+    player_phase_state_change(
+        actor_net_object_id,
+        own_packed_stats,
+        opponent_packed_stats,
+        GameMessageId::PlayerRecoveryStateChange,
+        ACTOR_STATE_RECOVERY,
+        follow_through_secs,
+        side,
+    )
+}
 
 /// Constants retail put in every captured `PlayerBlockingStateChange` (41). Copied,
 /// not derived: 400/400 decoded frames carry these exact values. See

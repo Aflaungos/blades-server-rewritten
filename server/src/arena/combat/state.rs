@@ -1163,6 +1163,34 @@ pub struct MatchCombat {
     /// When the last stat-regen tick fired. Initialised to the match's `phase_entered`
     /// so the first tick fires 1s into the live round. [spec §2]
     pub last_regen_tick: std::time::Instant,
+    /// Swings committed but not yet landed — see [`PendingSwing`] and tracker #21.
+    pub pending_swings: Vec<PendingSwing>,
+}
+
+/// A swing that has been committed and is waiting out its windup.
+///
+/// WHY (tracker #21): the server used to apply damage on the frame the attack
+/// button was released, so an attack had no duration at all. Retail put 0.050 s
+/// between commit and damage — declared on the wire as the attack state's own
+/// duration in 377 of 395 captured phase messages, and independently measured at
+/// a 47-49 ms floor off the ENet millisecond clock.
+///
+/// Everything needed to resolve the swing is captured HERE, at commit time, so the
+/// hit is computed from the world as it was when the player swung. The one thing
+/// deliberately NOT captured is the defender's guard: that is sampled when the hit
+/// lands, which is the whole point — it is what lets a block raised during the
+/// windup still count.
+#[derive(Debug, Clone)]
+pub struct PendingSwing {
+    pub sender: usize,
+    pub target: usize,
+    pub swing_factor: f32,
+    pub side: Option<ActiveSide>,
+    /// How long the attacker held the charge — goes on the wire as propId 8 of the
+    /// attack-state message, which carries the duration of the state being left.
+    pub charge_held_secs: f32,
+    /// When the damage should land.
+    pub due: Instant,
 }
 
 impl MatchCombat {
@@ -1185,6 +1213,7 @@ impl MatchCombat {
             matchend_step: 0,
             interround_step: 0,
             last_regen_tick: now,
+            pending_swings: Vec::new(),
         }
     }
 

@@ -1258,6 +1258,18 @@ mod tests {
     /// burst) → BackendMatchCreation(5) (after the stagger hold) → the round-0
     /// MatchState walk 6→7→11→12→13 → StateTimeout. Returns the engine, t0, and the
     /// instant the round went live (so heartbeat/combat ticks advance from there).
+
+    /// Swing and advance past the attack windup so the hit lands.
+    ///
+    /// Tracker #21 separated commit from impact: `on_c2s` now returns the
+    /// attack-state message and the damage arrives on a later tick. These tests
+    /// advance a clock rather than relaxing what they assert — every damage number
+    /// below is unchanged from before the windup existed.
+    fn swing(m: &mut MatchInstance, slot: usize, t: Instant) -> Vec<(usize, Vec<u8>)> {
+        m.on_c2s(slot, &[0x84, 0x36], t);
+        m.on_tick(2, t + super::super::resolve::ATTACK_WINDUP + Duration::from_millis(1))
+    }
+
     fn live_inst(capacity: usize) -> (MatchInstance, Instant) {
         let (m, t0, _live) = live_inst_at(capacity);
         (m, t0)
@@ -1646,7 +1658,7 @@ mod tests {
 
         // A (slot 0) sends a combat-input (carrier 54) → B (slot 1) takes damage;
         // a ReceiveDamage goes to both target and attacker.
-        let out = m.on_c2s(0, &[0x84, 0x36], t0);
+        let out = swing(&mut m, 0, t0);
         assert_eq!(out.len(), 2, "ReceiveDamage to both target and attacker");
         for (_, ud) in &out {
             assert_eq!(ud[1], 0x36, "carrier 54");
@@ -2076,7 +2088,7 @@ mod tests {
         let mut t = live;
         for _ in 0..12 {
             t += Duration::from_millis(500); // > SWING_COOLDOWN, < the 5 s window
-            let out = m.on_c2s(0, &[0x84, 0x36], t);
+            let out = swing(&mut m, 0, t);
             if out.iter().any(|(_, b)| is_op51_paralyze(b)) {
                 saw_paralyze = true;
                 break;
@@ -2205,7 +2217,7 @@ mod tests {
         let full = m.fighter_health(1);
         // Well past the 2s window → the guard has lapsed; a Middle swing now lands.
         let late = t0 + Duration::from_secs(3);
-        m.on_c2s(0, &[0x84, 0x36], late);
+        swing(&mut m, 0, late);
         assert!(m.fighter_health(1) < full, "after the block window expires, the hit lands");
     }
 
