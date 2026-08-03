@@ -1501,7 +1501,12 @@ mod tests {
         assert_eq!(m.phase(), FlowState::StateTimeout);
         let before = m.fighter_health(0);
         // Past the bot's swing cadence → the bot (slot 1) damages the player (slot 0).
-        m.on_tick(1, now + setup_to_live() + Duration::from_secs(3));
+        // The bot COMMITS on this tick; its hit lands `ATTACK_WINDUP` later, so a
+        // second tick is needed. In production the host services matches every ~2 ms,
+        // so this is ~50 ms of wall clock, not an extra round trip.
+        let t_bot = now + setup_to_live() + Duration::from_secs(3);
+        m.on_tick(1, t_bot);
+        m.on_tick(1, t_bot + super::super::resolve::ATTACK_WINDUP + Duration::from_millis(1));
         assert!(m.fighter_health(0) < before, "bot should damage the player on tick");
     }
 
@@ -1659,15 +1664,16 @@ mod tests {
         // A (slot 0) sends a combat-input (carrier 54) → B (slot 1) takes damage;
         // a ReceiveDamage goes to both target and attacker.
         let out = swing(&mut m, 0, t0);
-        assert_eq!(out.len(), 2, "ReceiveDamage to both target and attacker");
-        for (_, ud) in &out {
-            assert_eq!(ud[1], 0x36, "carrier 54");
-            assert_eq!(
-                arena_proto::parse_netdata(&ud[2..]).int(3),
-                Some(50),
-                "real GameMessageId 50 at propId 3"
-            );
-        }
+        // A swing now emits its phase family too (gmids 43/44, tracker #21), so count
+        // the ReceiveDamage frames specifically rather than every frame. Asserting on
+        // the total would have to be relaxed again the next time a message is added.
+        let damage: Vec<_> = out
+            .iter()
+            .filter(|(_, b)| {
+                b.len() > 3 && b[1] == 0x36 && arena_proto::parse_netdata(&b[2..]).int(3) == Some(50)
+            })
+            .collect();
+        assert_eq!(damage.len(), 2, "ReceiveDamage to both target and attacker");
         // B's RAW HP dropped by the model swing. Starter = L30 **Light** weapon (the new
         // default, not Heavy): base = (heavy_base(7)=120 + QUALITY_BONUS[3]=9) × 0.60 =
         // 77.4 Slashing at combo-0 (the FIRST swing is Right, ×1.0). + a Shock enchant
@@ -1693,7 +1699,9 @@ mod tests {
         let mut t = start;
         for _ in 0..40 {
             t += Duration::from_millis(500);
-            let out = m.on_c2s(attacker, &[0x84, 0x36], t);
+            // Commit, then advance past the windup so the hit (and any death it
+            // causes) actually resolves — tracker #21 moved the moment of impact.
+            let out = swing(m, attacker, t);
             let is_op29 = |b: &[u8]| {
                 b.len() > 3 && b[1] == 0x36 && arena_proto::parse_netdata(&b[2..]).int(3) == Some(29)
             };
@@ -2149,7 +2157,7 @@ mod tests {
         // An UN-guarded reference hit (fresh match) → total ≈ 105.
         let (mut m_open, t_open) = live_inst(2);
         let open_before = m_open.fighter_health(1);
-        m_open.on_c2s(0, &[0x84, 0x36], t_open);
+        swing(&mut m_open, 0, t_open);
         let open_dealt = open_before - m_open.fighter_health(1);
         assert!(open_dealt >= 100, "un-guarded reference hit is the full ~105, got {open_dealt}");
 
@@ -2179,7 +2187,7 @@ mod tests {
 
         // A (slot 0) swings Right into B's Right guard → OPTIMAL block: physical NEGATED,
         // elemental HALVED. So B takes only the halved Shock (~14), NOT 0 and NOT the full 105.
-        let dmg = m.on_c2s(0, &[0x84, 0x36], t0 + Duration::from_millis(600));
+        let dmg = swing(&mut m, 0, t0 + Duration::from_millis(600));
         assert!(!dmg.is_empty(), "the swing still resolves (ReceiveDamage emitted)");
         let opt_dealt = full - m.fighter_health(1);
         assert!(opt_dealt > 0, "optimal block still lets the HALVED elemental through (not ×0 overall)");
@@ -2198,8 +2206,60 @@ mod tests {
         // Sanity: an UN-guarded target still takes full damage — a fresh match.
         let (mut m2, t2) = live_inst(2);
         let before = m2.fighter_health(1);
-        m2.on_c2s(0, &[0x84, 0x36], t2);
+        swing(&mut m2, 0, t2);
         assert!(m2.fighter_health(1) < before, "an un-guarded target takes damage (block didn't break attacks)");
+    }
+
+    /// THE point of tracker #21: a guard raised AFTER the attacker committed, but
+    /// BEFORE the hit lands, still blocks.
+    ///
+    /// This is impossible on the old code by construction — damage was applied on
+    /// the frame the attack button was released, so there was no interval in which
+    /// to react and the defender's only window was network latency. Reverting the
+    /// windup makes this test fail, which is what makes it worth having.
+    #[test]
+    fn a_guard_raised_during_the_windup_still_blocks() {
+        let (mut m, t0) = live_inst(2);
+        let full = m.fighter_health(1);
+
+        // Reference: the same swing with no guard at all.
+        let (mut open, t_open) = live_inst(2);
+        let open_full = open.fighter_health(1);
+        swing(&mut open, 0, t_open);
+        let open_dealt = open_full - open.fighter_health(1);
+        assert!(open_dealt > 0, "the reference hit must land");
+
+        // A (slot 0) commits a swing. Nothing has happened to B yet.
+        m.on_c2s(0, &[0x84, 0x36], t0);
+        assert_eq!(
+            m.fighter_health(1),
+            full,
+            "damage must NOT be applied at commit — that is the bug being fixed"
+        );
+
+        // B (slot 1) raises a Right guard 20 ms later — after the commit, inside the
+        // 50 ms windup. On the old code this was far too late.
+        let mut block = {
+            let mut w = arena_proto::NetDataWriter::new();
+            w.int(0, m.combat.fighters[1].player_net_object_id)
+                .byte(1, 55)
+                .byte(2, 3)
+                .byte(3, 41)
+                .byte(4, 3); // ActiveSide::Right — the side the first auto-swing uses
+            messages::frame_for_test(w.finish())
+        };
+        block[0] = 0x84;
+        m.on_c2s(1, &block, t0 + Duration::from_millis(20));
+
+        // Now let the hit land.
+        m.on_tick(2, t0 + super::super::resolve::ATTACK_WINDUP + Duration::from_millis(1));
+        let guarded_dealt = full - m.fighter_health(1);
+
+        assert!(guarded_dealt > 0, "an optimal block still lets the halved elemental through");
+        assert!(
+            guarded_dealt < open_dealt / 2,
+            "the late-but-in-time guard must have blocked: took {guarded_dealt} vs {open_dealt} unguarded"
+        );
     }
 
     /// A block window auto-expires: after `BLOCK_WINDOW` a stale guard no longer

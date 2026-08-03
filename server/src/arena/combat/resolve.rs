@@ -2857,6 +2857,10 @@ mod phase4_tests {
         on_c2s_input(combat, sender, &make_pos_frame(x, 0.5, 0.0), t);
         on_c2s_input(combat, sender, &make_act_frame(true, 0.0, false), t);
         on_c2s_input(combat, sender, &make_act_frame(false, 0.1, false), t);
+        // The combo and the committed side are advanced when the swing LANDS, which
+        // tracker #21 moved to `ATTACK_WINDUP` after the release. Land it here so the
+        // test observes the same state it always did.
+        land(combat, t);
         combat.fighters[sender].combo_count
     }
 
@@ -2977,7 +2981,9 @@ mod phase4_tests {
         for i in 1..=4u32 {
             // Bare unstructured carrier-54 swing — no geometry anywhere.
             let out = on_c2s_input(&mut combat, 0, &[0x84, 0x36], now + step * i);
-            assert!(!out.is_empty(), "the fallback must still land a swing");
+            assert!(!out.is_empty(), "the fallback must still commit a swing");
+            // The side is chosen when the swing lands, not when it is committed.
+            land(&mut combat, now + step * i);
             sides.push(combat.fighters[0].last_combo_side);
         }
         assert_eq!(
@@ -3038,6 +3044,7 @@ mod phase4_tests {
         on_c2s_input(&mut honest, 0, &make_pos_frame(0.814, 0.5, 0.0), t);
         on_c2s_input(&mut honest, 0, &make_act_frame(true, 0.0, false), t);
         on_c2s_input(&mut honest, 0, &make_act_frame(false, 0.0, false), t);
+        land(&mut honest, t);
         let honest_dmg = honest.fighters[1].health;
 
         // Cheating: identical timing, but the client CLAIMS a 2.8 s charge.
@@ -3045,6 +3052,7 @@ mod phase4_tests {
         on_c2s_input(&mut liar, 0, &make_pos_frame(0.814, 0.5, 0.0), t);
         on_c2s_input(&mut liar, 0, &make_act_frame(true, 2.817, false), t);
         on_c2s_input(&mut liar, 0, &make_act_frame(false, 2.817, false), t);
+        land(&mut liar, t);
 
         assert_eq!(
             liar.fighters[1].health, honest_dmg,
@@ -3059,6 +3067,7 @@ mod phase4_tests {
         on_c2s_input(&mut real, 0, &make_act_frame(true, 0.0, false), t);
         let held_to = t + Duration::from_secs_f32(CRITICAL_HOLD_SECS + 0.1);
         on_c2s_input(&mut real, 0, &make_act_frame(false, 1.3, false), held_to);
+        land(&mut real, held_to);
         assert!(
             real.fighters[1].health < honest_dmg,
             "a real server-measured full hold must crit for more than an uncharged swing"
