@@ -108,6 +108,65 @@ pub struct TicketRequest {
     pub ticket_id: Uuid,
     pub user_id: Uuid,
     pub rms: RmsHandle,
+    /// What we know about this player's strength, for the pairing bracket.
+    /// `None` when the lookup failed or the player has no character yet — an
+    /// unknown player is never blocked from matching, only from being used as a
+    /// reason to block someone else.
+    pub skill: Option<Skill>,
+}
+
+/// A queued player's strength, read once at enqueue.
+///
+/// WHY THIS EXISTS (tracker #19)
+///
+/// Matchmaking held ONE waiting ticket and paired it with whoever queued next,
+/// with no regard for how strong either player was. Taheen, level 43, was matched
+/// against a level 66 and lost 0-2 in under a minute. It is also why his "the
+/// damage feels off" could not be judged: a 23-level gap swamps any question about
+/// damage numbers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Skill {
+    pub level: i32,
+    /// `character.matchmakingPvpTrophies` — retail's own matchmaking rating, which
+    /// is why it is preferred over level as the primary signal.
+    pub trophies: i64,
+}
+
+/// How far apart two players may be, given how long the LONGER-WAITING of them has
+/// been queued. Widens in steps, then gives up and allows anyone.
+///
+/// The numbers are chosen against our own data rather than invented: recorded
+/// arena trophies span roughly 30-850 and levels 1-100, and the pairing that
+/// prompted this was 23 levels apart. A 5-level opening bracket refuses that
+/// immediately; by 30 seconds anyone will do, because on a server with a handful
+/// of players a perfect match is worth less than a match.
+///
+/// Returns `(max level gap, max trophy gap)`. `None` means unlimited.
+pub fn bracket_for(waited: Duration) -> Option<(i32, i64)> {
+    match waited.as_secs() {
+        0..=9 => Some((5, 150)),
+        10..=19 => Some((10, 300)),
+        20..=29 => Some((20, 600)),
+        _ => None,
+    }
+}
+
+/// May these two be paired right now?
+///
+/// An unknown skill on either side returns true: a failed lookup must not strand a
+/// player in the queue forever. The bracket is a preference we enforce while we
+/// can, not a gate that can deadlock the arena.
+pub fn compatible(a: Option<Skill>, b: Option<Skill>, waited: Duration) -> bool {
+    let Some((max_level, max_trophies)) = bracket_for(waited) else {
+        return true;
+    };
+    match (a, b) {
+        (Some(x), Some(y)) => {
+            (x.level - y.level).abs() <= max_level
+                && (x.trophies - y.trophies).abs() <= max_trophies
+        }
+        _ => true,
+    }
 }
 
 /// Status of a recorded matchmaking ticket, for the web /arena activity feed.
@@ -761,6 +820,76 @@ mod bot_pick_tests {
         assert_eq!(pick_bot_index(&cands, human, gsid_with_first_byte(0)), None);
     }
 
+    /// The pairing that produced tracker #19: Taheen at level 43 against a level
+    /// 66. It must be refused on arrival and allowed only once the queue has
+    /// widened — a server with a handful of players cannot hold out forever.
+    #[test]
+    fn the_reported_mismatch_is_refused_at_first_and_allowed_later() {
+        let taheen = Some(Skill { level: 43, trophies: 240 });
+        let trickster = Some(Skill { level: 66, trophies: 720 });
+
+        assert!(
+            !compatible(taheen, trickster, Duration::from_secs(0)),
+            "43 vs 66 must not pair immediately — this is the reported bug"
+        );
+        assert!(!compatible(taheen, trickster, Duration::from_secs(15)));
+        assert!(!compatible(taheen, trickster, Duration::from_secs(25)));
+        assert!(
+            compatible(taheen, trickster, Duration::from_secs(30)),
+            "after 30s a match beats no match"
+        );
+    }
+
+    #[test]
+    fn a_close_pairing_goes_through_at_once() {
+        let a = Some(Skill { level: 45, trophies: 300 });
+        let b = Some(Skill { level: 47, trophies: 380 });
+        assert!(compatible(a, b, Duration::from_secs(0)));
+    }
+
+    /// Level and trophies are BOTH gates, not either/or. A player who is close on
+    /// one and far on the other is not a fair match.
+    #[test]
+    fn both_dimensions_are_enforced() {
+        let base = Some(Skill { level: 50, trophies: 400 });
+        let same_level_far_trophies = Some(Skill { level: 51, trophies: 900 });
+        let same_trophies_far_level = Some(Skill { level: 80, trophies: 410 });
+        assert!(!compatible(base, same_level_far_trophies, Duration::from_secs(0)));
+        assert!(!compatible(base, same_trophies_far_level, Duration::from_secs(0)));
+    }
+
+    /// A failed skill lookup must never strand someone in the queue. The bracket is
+    /// a preference, not a gate that can deadlock the arena.
+    #[test]
+    fn unknown_skill_never_blocks_a_match() {
+        let known = Some(Skill { level: 1, trophies: 0 });
+        let wildly_different = Some(Skill { level: 100, trophies: 5000 });
+        assert!(compatible(None, wildly_different, Duration::from_secs(0)));
+        assert!(compatible(known, None, Duration::from_secs(0)));
+        assert!(compatible(None, None, Duration::from_secs(0)));
+    }
+
+    /// The bracket must actually widen, or the first step is the only step.
+    #[test]
+    fn the_bracket_widens_then_gives_up() {
+        let steps: Vec<Option<(i32, i64)>> = [0u64, 10, 20, 30]
+            .iter()
+            .map(|s| bracket_for(Duration::from_secs(*s)))
+            .collect();
+        assert_eq!(steps[0], Some((5, 150)));
+        assert_eq!(steps[1], Some((10, 300)));
+        assert_eq!(steps[2], Some((20, 600)));
+        assert_eq!(steps[3], None, "eventually anyone will do");
+        // Monotonic: a longer wait is never stricter.
+        for w in [(0u64, 10u64), (10, 20)] {
+            let (a, b) = (
+                bracket_for(Duration::from_secs(w.0)).unwrap(),
+                bracket_for(Duration::from_secs(w.1)).unwrap(),
+            );
+            assert!(b.0 >= a.0 && b.1 >= a.1, "bracket must not narrow with time");
+        }
+    }
+
     #[test]
     fn pick_bot_index_rotates_across_matches() {
         let human = "zzzzzzzz-0000-0000-0000-000000000009";
@@ -1024,14 +1153,22 @@ async fn matchmaker_loop(
         config.advertise_host, config.udp_port, registry.max_matches
     );
 
-    // A single ticket held while it waits for an opponent to pair with, and WHEN it
-    // started waiting. One Option, not two: the deadline is derived from the instant,
-    // and a separate `waiting_since` could drift out of step with `waiting`.
-    let mut waiting: Option<(TicketRequest, Instant)> = None;
+    // Tickets waiting for an opponent, each with WHEN it started waiting. The
+    // instant lives alongside the ticket rather than in a parallel structure so the
+    // two cannot drift apart.
+    //
+    // This was a single `Option` — one waiting ticket, paired with whoever queued
+    // next regardless of strength. A bracket needs somewhere to put the player you
+    // decline to pair, so it needs a list (tracker #19). In practice this holds one
+    // or two entries; the arena has a handful of players, not a lobby.
+    let mut waiting: Vec<(TicketRequest, Instant)> = Vec::new();
     loop {
         // If a ticket is already waiting, race the next command against its fallback
         // deadline; otherwise just block for the next command.
-        let next = if let Some((_, since)) = waiting.as_ref() {
+        // The queue's next deadline is the OLDEST waiting ticket's — it is the one
+        // that has earned a fallback first.
+        let oldest = waiting.iter().map(|(_, s)| *s).min();
+        let next = if let Some(since) = oldest {
             // HUMANS FIRST. While anyone else is in a live match they are, by
             // definition, about to be free — so hold the queue open long enough to
             // catch them, rather than handing this player a bot they did not ask for.
@@ -1040,11 +1177,19 @@ async fn matchmaker_loop(
             // finishes and does NOT come back, `live_human_count()` drops to 0 and the
             // deadline collapses to `solo_fallback_secs`. Nobody is left waiting
             // minutes for a player who left.
-            let deadline = fallback_deadline(&config, &registry, *since);
+            let deadline = fallback_deadline(&config, &registry, since);
             let others_live = registry.live_human_count();
             let now = Instant::now();
             if now >= deadline {
-                let (lone, waited) = waiting.take().map(|(t, s)| (t, s.elapsed())).expect("waiting is some");
+                // Pop the oldest — the one whose deadline just fired.
+                let idx = waiting
+                    .iter()
+                    .enumerate()
+                    .min_by_key(|(_, (_, s))| *s)
+                    .map(|(i, _)| i)
+                    .expect("waiting is non-empty");
+                let (lone, since) = waiting.remove(idx);
+                let waited = since.elapsed();
                 // Don't spin up a bot match for a client that's already gone.
                 if lone.rms.is_gone().await {
                     info!("matchmaker: waiting ticket {} abandoned (RMS gone) — dropped, no fallback", lone.ticket_id);
@@ -1083,14 +1228,12 @@ async fn matchmaker_loop(
             // timer — the client saw a `Succeeded` for a match it had abandoned. Match
             // on both ticket_id AND user_id so a cancel can only drop THAT user's ticket.
             MatchmakerCommand::Cancel { ticket_id, user_id } => {
-                match waiting.as_ref().map(|(t, _)| t) {
-                    Some(w) if w.ticket_id == ticket_id && w.user_id == user_id => {
-                        info!("matchmaker: cancelled waiting ticket {ticket_id} (user {user_id}) — dequeued");
-                        waiting = None;
-                    }
-                    _ => {
-                        info!("matchmaker: cancel for ticket {ticket_id} — not the waiting ticket (already resolved/gone)");
-                    }
+                let before = waiting.len();
+                waiting.retain(|(t, _)| !(t.ticket_id == ticket_id && t.user_id == user_id));
+                if waiting.len() < before {
+                    info!("matchmaker: cancelled waiting ticket {ticket_id} (user {user_id}) — dequeued");
+                } else {
+                    info!("matchmaker: cancel for ticket {ticket_id} — not in the queue (already resolved/gone)");
                 }
                 continue;
             }
@@ -1110,27 +1253,67 @@ async fn matchmaker_loop(
             .send(MatchmakingMessage::PotentialMatch { ticket_id: req.ticket_id })
             .await;
 
-        match waiting.take() {
-            // A LIVE second player is already waiting → pair the two into ONE shared
-            // match (no bot).
-            Some((first, _)) if !first.rms.is_gone().await => {
+        // Drop any waiting ticket whose client has gone. Pairing against a stale
+        // ticket mints a ghost match the opponent never connects to — the emu-vs-pixel
+        // failure where each device kept pairing with the other's cancelled ticket.
+        let mut live: Vec<(TicketRequest, Instant)> = Vec::with_capacity(waiting.len());
+        for (t, since) in std::mem::take(&mut waiting) {
+            if t.rms.is_gone().await {
+                info!("matchmaker: discarded stale waiting ticket {} (RMS gone)", t.ticket_id);
+            } else {
+                live.push((t, since));
+            }
+        }
+        waiting = live;
+
+        // Pick an opponent inside the bracket. Among those that qualify, take the
+        // CLOSEST in trophies — the bracket says who is allowed, this says who is
+        // best. Ties and unknown skills fall back to the longest-waiting, so nobody
+        // is starved by a stream of better-matched arrivals.
+        let now = Instant::now();
+        let mut best: Option<(usize, i64, Duration)> = None;
+        for (i, (cand, since)) in waiting.iter().enumerate() {
+            let waited = now.saturating_duration_since(*since);
+            if !compatible(cand.skill, req.skill, waited) {
+                continue;
+            }
+            let gap = match (cand.skill, req.skill) {
+                (Some(a), Some(b)) => (a.trophies - b.trophies).abs(),
+                _ => i64::MAX,
+            };
+            let better = match best {
+                None => true,
+                Some((_, best_gap, best_waited)) => {
+                    gap < best_gap || (gap == best_gap && waited > best_waited)
+                }
+            };
+            if better {
+                best = Some((i, gap, waited));
+            }
+        }
+
+        match best {
+            Some((idx, gap, waited)) => {
+                let (first, _) = waiting.remove(idx);
+                info!(
+                    "matchmaker: paired {} with {} (trophy gap {}, opponent waited {:.1}s)",
+                    req.ticket_id,
+                    first.ticket_id,
+                    if gap == i64::MAX { -1 } else { gap },
+                    waited.as_secs_f32(),
+                );
                 resolve(&registry, &config, &db, &[first, req], 0).await
             }
-            // The waiting ticket's client is gone — its RMS feed closed (it cancelled,
-            // timed out and retried, or disconnected). Pairing against it mints a ghost
-            // match the opponent never connects to ("opponent never connected; 1/2"),
-            // which is exactly the emu-vs-pixel failure: each device kept pairing against
-            // the other's stale cancelled ticket. DISCARD it and let the fresh, live
-            // ticket wait for a live opponent instead.
-            Some((stale, _)) => {
-                info!(
-                    "matchmaker: discarded stale waiting ticket {} (RMS gone); {} now waiting",
-                    stale.ticket_id, req.ticket_id
-                );
-                waiting = Some((req, Instant::now()));
+            None => {
+                if !waiting.is_empty() {
+                    info!(
+                        "matchmaker: {} queued — {} other(s) waiting but none inside the bracket yet",
+                        req.ticket_id,
+                        waiting.len()
+                    );
+                }
+                waiting.push((req, Instant::now()));
             }
-            // First player → hold it and wait for an opponent (or the timer above).
-            None => waiting = Some((req, Instant::now())),
         }
     }
     warn!("matchmaker: queue closed, actor exiting");
@@ -1437,6 +1620,40 @@ struct MatchTicket {
     port: u16,
 }
 
+/// The queueing player's level and trophies, for the pairing bracket.
+///
+/// Returns `None` rather than an error on any failure — no character, no database,
+/// a malformed row. Matchmaking must degrade to "pair anyone" rather than refuse
+/// to queue someone because a lookup went wrong.
+async fn load_skill(app_state: &Arc<ServerGlobal>, user_id: Uuid) -> Option<Skill> {
+    use crate::schema::characters;
+    use diesel::{ExpressionMethods, QueryDsl};
+    use diesel_async::RunQueryDsl;
+
+    let mut conn = app_state.db_pool.get().await.ok()?;
+    let rows: Vec<serde_json::Value> = characters::table
+        .filter(characters::user_id.eq(user_id))
+        .select(characters::character)
+        .load(&mut conn)
+        .await
+        .ok()?;
+    // A user may own several characters and the request does not say which is
+    // queueing. Take the strongest — it is the one they are most likely playing in
+    // the arena, and it is the conservative choice: it cannot under-state them into
+    // an easier bracket.
+    rows.into_iter()
+        .filter_map(|c| {
+            Some(Skill {
+                level: c.get("level")?.as_i64()? as i32,
+                trophies: c
+                    .get("matchmakingPvpTrophies")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0),
+            })
+        })
+        .max_by_key(|s| (s.trophies, s.level))
+}
+
 #[post("/blades.bgs.services/api/matchmaking/v1/public/matches/create")]
 pub async fn create_match(
     session: SessionLookedUpMaybe,
@@ -1465,6 +1682,12 @@ pub async fn create_match(
         return Err(BladeApiError::new(StatusCode::CONFLICT, 4, 1));
     }
 
+    // Read the player's strength once, here, so the matchmaker actor stays
+    // synchronous over its queue and never blocks pairing on a database round trip.
+    // A failed lookup is not fatal: `compatible` treats an unknown skill as
+    // matchable, so the worst case is the old behaviour for that one player.
+    let skill = load_skill(&app_state, session.session.user_id).await;
+
     app_state
         .arena
         .matchmaker_tx
@@ -1472,6 +1695,7 @@ pub async fn create_match(
             ticket_id,
             user_id: session.session.user_id,
             rms: RmsHandle::Session(session.session.clone()),
+            skill,
         }))
         .map_err(|_| BladeApiError::new(StatusCode::SERVICE_UNAVAILABLE, 4, 2))?;
 
@@ -1577,12 +1801,14 @@ mod tests {
             ticket_id: Uuid::new_v4(),
             user_id: Uuid::new_v4(),
             rms: RmsHandle::Direct(rms_a),
+            skill: None,
         }))
         .unwrap();
         tx.send(MatchmakerCommand::Enqueue(TicketRequest {
             ticket_id: Uuid::new_v4(),
             user_id: Uuid::new_v4(),
             rms: RmsHandle::Direct(rms_b),
+            skill: None,
         }))
         .unwrap();
 
@@ -1637,12 +1863,14 @@ mod tests {
             ticket_id: tid_a,
             user_id: Uuid::new_v4(),
             rms: RmsHandle::Direct(rms_a),
+            skill: None,
         }))
         .unwrap();
         tx.send(MatchmakerCommand::Enqueue(TicketRequest {
             ticket_id: tid_b,
             user_id: Uuid::new_v4(),
             rms: RmsHandle::Direct(rms_b),
+            skill: None,
         }))
         .unwrap();
 
@@ -1715,6 +1943,7 @@ mod tests {
             ticket_id: Uuid::new_v4(),
             user_id: Uuid::new_v4(),
             rms: RmsHandle::Direct(rms_a),
+            skill: None,
         }))
         .unwrap();
 
@@ -1757,6 +1986,7 @@ mod tests {
             ticket_id: tid,
             user_id: uid,
             rms: RmsHandle::Direct(rms),
+            skill: None,
         }))
         .unwrap();
 
@@ -1807,6 +2037,7 @@ mod tests {
             ticket_id: tid,
             user_id: uid,
             rms: RmsHandle::Direct(rms),
+            skill: None,
         }))
         .unwrap();
 
