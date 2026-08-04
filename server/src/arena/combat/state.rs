@@ -595,6 +595,14 @@ pub struct Loadout {
     /// attacker's enchants — subtracted from the defender's resistance rating before
     /// the reduction is computed. [Phase 3.4]
     pub elem_resist_piercing_rating: f32,
+    /// Flat BLOCK-piercing ratings, subtracted from the defender's Block Rating before
+    /// the block reduction is computed — the block-stage mirror of
+    /// `armor_piercing_rating`. `block_piercing_rating` applies to physical,
+    /// `elem_block_piercing_rating` to elemental. Skullcrusher ships 60.00 for the
+    /// former, PiercingStrikes 122.40 for the latter. Zero for every other attack, so
+    /// the block stage is unchanged unless an ability sets them.
+    pub block_piercing_rating: f32,
+    pub elem_block_piercing_rating: f32,
     /// The caster's Paralyze ability rank (0 = not equipped) — selects the shipped
     /// `_damageToCauseParalyze` / `_duration` row. [Phase 3.9]
     pub paralyze_rank: u8,

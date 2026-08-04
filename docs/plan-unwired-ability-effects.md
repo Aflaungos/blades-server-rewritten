@@ -1,47 +1,29 @@
 # Plan: the ability effects the server still ignores
 
-**Status: ALL SECTIONS DONE except block piercing (2 of §5's 4 fields).**
+**Status: COMPLETE.** All twelve unread fields are resolved — eleven wired,
+`projectile_speed` deliberately not (client-side presentation; see §7).
 
-§5 turned out far smaller than this plan feared. `armor_piercing_rating` and
-`elem_resist_piercing_rating` were **already consumed** by the damage pipeline —
-subtracted from the defender's armor, and fed into `resistance_rating_against`. Nothing
-ever SET them from an ability, so Skullcrusher's 225.00 and PiercingStrikes' 20.88 did
-nothing. Wiring them needed no pipeline change at all, so the "must be provably
-additive against the s506 differentials" worry never applied — there was nothing to
-thread.
+Two things this plan got wrong, both mine, both caught by looking at the data:
+* `damage_reduction` DOES ship a duration (`_blockDuration` 0.50 s) — I had only
+  surveyed a subset of the fields.
+* §5 was described as the invasive, risky one. Half of it needed **no pipeline change
+  at all**: `armor_piercing_rating` and `elem_resist_piercing_rating` were already
+  consumed and simply never set. Only block piercing needed the threading.
 
-**Still open, and it is the genuinely invasive half:** `block_piercing_percent` (60.00,
-Skullcrusher) and `elemental_block_piercing` (122.40, PiercingStrikes). `block_outcome`
-takes no piercing parameter, so these two DO need the pipeline change the plan
-describes: a piercing argument threaded to the block stage, defaulting to 0.0 at every
-existing call site, with the s506 differentials as the proof it is additive.
+Two values were recovered from `dump.cs:609793-609832` rather than guessed:
+`Blind = 8` and `ElementalStormArmor = 16` (one shared value for all three `*Armor`
+spells). Neither is capture-confirmed — nobody cast them in the sessions we hold — but
+propId 5 matched that enum 2,965/2,965 times, so the reading is well-founded.
 
-The two blocking wire values were recovered from `dump.cs:609793-609832`
-(`StatusEffectType`, 34 members):
-* **`Blind` = 8** — and `ActorStateType.StateId` has NO blind state (all 29 read), so
-  the green fog is rendered client-side off the status. The server just sends it.
-* **`ElementalStormArmor` = 16** — ONE shared value for all three `*Armor` spells;
-  `StormArmorAbility` is a single class and the element lives on the ability.
-Neither is capture-confirmed (nobody cast them in the sessions we hold) but propId 5
-matched the dump enum 2,965/2,965 across three sessions. Fifteen further members were
-missing from `state.rs` and are now transcribed.
-`stun_duration` was done in the previous pass.
-
-**Two open questions in this plan are now answered by data, and one of my own
-assumptions was wrong:**
-* `damage_reduction` is a **flat rating**, not a fraction — ShieldOfMania ships 50.11
-  → 138.82 across ranks, ReflectingBash 110.67 → 181.56. §3 no longer needs a survey.
-* The `*Armor` spells' `damage_per_second` is **0.00 at every rank**. There is no
-  retaliation burn to model — they are pure absorb shields of 116-158. §1's "aura that
-  burns attackers" was my inference, and the data refutes it.
-* Neither the shields nor the dodge caps ship a `_duration`, so they get no timed
-  expiry: the pool lasts until consumed, and the round reset clears it.
-* `damage_reduction` DOES have a duration and I missed it: `_blockDuration` = 0.50 s.
-  ShieldOfMania and ReflectingBash are **block-window** buffs — press block and for half
-  a second incoming damage is cut by a flat 50-182. §3 is implemented.
-* §5's four piercing fields are also FLAT ratings despite two being named `*_percent`:
-  Skullcrusher ships `armor_piercing_percent` = 225.00 and `block_piercing_percent` =
-  60.00; PiercingStrikes ships 122.40 / 20.88. Do not read them as percentages.
+**Known remaining limits, none of them a dead field:**
+* Block piercing weakens a LATE block only. A connected OPTIMAL block still negates
+  physical outright, because that zero is capture-pinned; whether retail pierces an
+  optimal block is unpinned.
+* Storm armor is a flat absorb pool. `_damageAbsorptionPercent` and
+  `_vulnerableDamageTypes` mean retail absorbs a PERCENTAGE and opens an elemental
+  weakness, so this will not match retail exactly.
+* The weakness block (100-103) is transcribed but nothing is wired to it — the
+  propId5-vs-propId12 ambiguity is unresolved.
 
 **Why it matters:** the goal is to keep the game playable for players after shutdown.
 An ability that spends a resource and does nothing is worse than an ability that

@@ -159,6 +159,10 @@ pub struct BlockOutcome {
     pub blocking: bool,
     /// Block Rating in effect for this hit (already optimal-weighted).
     pub rating: f32,
+    /// Attacker's flat block piercing, subtracted from `rating` in
+    /// [`BlockOutcome::factor_for`] — physical and elemental respectively.
+    pub block_piercing: f32,
+    pub elem_block_piercing: f32,
 }
 
 /// The dump's `PvpDefaultSettings` LATE-block divisors, kept for provenance. The
@@ -180,10 +184,13 @@ impl BlockOutcome {
                 // The connected optimal block negates physical outright.
                 return 0.0;
             }
-            return 1.0 - tables::block_reduction(self.rating, true);
+            // Block piercing cuts the rating, exactly as armor piercing cuts armor.
+            let pierced = (self.rating - self.block_piercing).max(0.0);
+            return 1.0 - tables::block_reduction(pierced, true);
         }
         if is_elemental(ty) {
-            return 1.0 - tables::block_reduction(self.rating, false);
+            let pierced = (self.rating - self.elem_block_piercing).max(0.0);
+            return 1.0 - tables::block_reduction(pierced, false);
         }
         // Stamina/Magicka drains and raw Health are not blocked.
         1.0
@@ -194,9 +201,32 @@ impl BlockOutcome {
 ///
 /// OPTIMAL requires BOTH: the defender is in the `Optimal` phase AND the defending
 /// side matches the attacking side. Wrong-side in the Optimal phase is still LATE.
-pub fn block_outcome(target: &Fighter, active_side: ActiveSide, now: Instant) -> BlockOutcome {
+/// `attacker` supplies the flat block-piercing ratings. **Additive:** they are 0.0 on
+/// every loadout unless an ability sets them, so a hit with no piercing produces the
+/// same numbers as before this parameter existed — which the s506 block differentials
+/// prove.
+///
+/// STATED LIMIT: piercing reduces the RATING, so it weakens a LATE block. A connected
+/// OPTIMAL block still negates physical outright (`factor_for` returns 0.0 before the
+/// rating is consulted) — that zero is capture-pinned by
+/// `roundtrip_s506_damage::s506_optimal_block_negates_physical_halves_elemental`.
+/// Whether retail lets block piercing through an optimal block is NOT pinned by any
+/// capture we hold, so this leaves the pinned behaviour alone rather than guessing.
+pub fn block_outcome(
+    target: &Fighter,
+    attacker: &Loadout,
+    active_side: ActiveSide,
+    now: Instant,
+) -> BlockOutcome {
     use super::state::ActorStateType;
-    let none = BlockOutcome { flag: 0, optimal: false, blocking: false, rating: 0.0 };
+    let none = BlockOutcome {
+        flag: 0,
+        optimal: false,
+        blocking: false,
+        rating: 0.0,
+        block_piercing: 0.0,
+        elem_block_piercing: 0.0,
+    };
     if target.actor_state() != ActorStateType::Blocking || active_side == ActiveSide::None {
         return none;
     }
@@ -210,6 +240,8 @@ pub fn block_outcome(target: &Fighter, active_side: ActiveSide, now: Instant) ->
         optimal,
         blocking: true,
         rating: target.block_rating(optimal),
+        block_piercing: attacker.block_piercing_rating,
+        elem_block_piercing: attacker.elem_block_piercing_rating,
     }
 }
 
@@ -418,7 +450,7 @@ fn finish_resolved(
 
     // 1) BLOCK — a fraction from the defender's Block Rating. NOT de-rated against
     //    continuous damage (`continuousDamageBlockingEffectiveness == 1`).
-    let block = block_outcome(target, active_side, now);
+    let block = block_outcome(target, attacker, active_side, now);
     hit_flags |= block.flag;
     for (ty, v) in components.iter_mut() {
         *v *= block.factor_for(*ty);
