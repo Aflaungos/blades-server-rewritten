@@ -1,6 +1,34 @@
 # Plan: the ability effects the server still ignores
 
-**Status:** scoped and evidenced, not implemented. One field is done (see below).
+**Status:** §1, §2, §3, §4, §6 IMPLEMENTED. **Only §5 (piercing) remains.**
+
+The two blocking wire values were recovered from `dump.cs:609793-609832`
+(`StatusEffectType`, 34 members):
+* **`Blind` = 8** — and `ActorStateType.StateId` has NO blind state (all 29 read), so
+  the green fog is rendered client-side off the status. The server just sends it.
+* **`ElementalStormArmor` = 16** — ONE shared value for all three `*Armor` spells;
+  `StormArmorAbility` is a single class and the element lives on the ability.
+Neither is capture-confirmed (nobody cast them in the sessions we hold) but propId 5
+matched the dump enum 2,965/2,965 across three sessions. Fifteen further members were
+missing from `state.rs` and are now transcribed.
+`stun_duration` was done in the previous pass.
+
+**Two open questions in this plan are now answered by data, and one of my own
+assumptions was wrong:**
+* `damage_reduction` is a **flat rating**, not a fraction — ShieldOfMania ships 50.11
+  → 138.82 across ranks, ReflectingBash 110.67 → 181.56. §3 no longer needs a survey.
+* The `*Armor` spells' `damage_per_second` is **0.00 at every rank**. There is no
+  retaliation burn to model — they are pure absorb shields of 116-158. §1's "aura that
+  burns attackers" was my inference, and the data refutes it.
+* Neither the shields nor the dodge caps ship a `_duration`, so they get no timed
+  expiry: the pool lasts until consumed, and the round reset clears it.
+* `damage_reduction` DOES have a duration and I missed it: `_blockDuration` = 0.50 s.
+  ShieldOfMania and ReflectingBash are **block-window** buffs — press block and for half
+  a second incoming damage is cut by a flat 50-182. §3 is implemented.
+* §5's four piercing fields are also FLAT ratings despite two being named `*_percent`:
+  Skullcrusher ships `armor_piercing_percent` = 225.00 and `block_piercing_percent` =
+  60.00; PiercingStrikes ships 122.40 / 20.88. Do not read them as percentages.
+
 **Why it matters:** the goal is to keep the game playable for players after shutdown.
 An ability that spends a resource and does nothing is worse than an ability that
 doesn't exist — the player thinks the server is broken, because it is.
