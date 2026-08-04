@@ -19,9 +19,10 @@ propId 5 matched that enum 2,965/2,965 times, so the reading is well-founded.
 * Block piercing weakens a LATE block only. A connected OPTIMAL block still negates
   physical outright, because that zero is capture-pinned; whether retail pierces an
   optimal block is unpinned.
-* Storm armor is a flat absorb pool. `_damageAbsorptionPercent` and
-  `_vulnerableDamageTypes` mean retail absorbs a PERCENTAGE and opens an elemental
-  weakness, so this will not match retail exactly.
+* ~~Storm armor is a flat absorb pool.~~ **FIXED:** `_damageAbsorptionPercent` ships
+  **0.50 at every rank**, so the shield now eats HALF of each hit until its 116-158
+  pool drains. `_vulnerableDamageTypes` (the elemental weakness the shield opens) is
+  still unwired — it needs a per-type vulnerability on the fighter, which nothing has.
 * The weakness block (100-103) is transcribed but nothing is wired to it — the
   propId5-vs-propId12 ambiguity is unresolved.
 

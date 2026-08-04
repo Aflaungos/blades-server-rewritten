@@ -863,6 +863,16 @@ pub struct NegationPool {
     /// Absorb heals the caster by `negated × restoration_factor` (≈1.0 = "100% heal");
     /// 0 for Ward/Dodge (pure negation, no heal-back). [§4.1]
     pub restoration_factor: f32,
+    /// What FRACTION of each incoming hit this pool may eat, before its `remaining`
+    /// budget is considered. **1.0 for Ward / Absorb / Dodge** — they swallow a hit
+    /// whole until the pool is exhausted, which is what they did before this field
+    /// existed, so the default is behaviour-preserving.
+    ///
+    /// The storm-armor shields are the reason it exists: they ship
+    /// `_damageAbsorptionPercent` = **0.50 at every rank**, so they absorb HALF of each
+    /// hit until their 116-158 pool drains. Treating them as full absorbers made them
+    /// twice as strong per hit and drained them twice as fast.
+    pub absorb_fraction: f32,
 }
 
 /// The sliding damage-history window length (`ElementalStatusEffectData._duration` ≈ 5 s
@@ -1394,7 +1404,10 @@ impl Fighter {
                 if !super::damage::is_health_type(*ty) || *v <= 0.0 || pool.remaining <= 0.0 {
                     continue;
                 }
-                let eaten = v.min(pool.remaining);
+                // Only `absorb_fraction` of this component is eligible (1.0 for
+                // Ward/Absorb/Dodge), and never more than the pool has left.
+                let eligible = *v * pool.absorb_fraction.clamp(0.0, 1.0);
+                let eaten = eligible.min(pool.remaining);
                 *v -= eaten;
                 pool.remaining -= eaten;
                 heal += eaten * pool.restoration_factor;
@@ -2143,5 +2156,61 @@ mod stun_duration_tests {
         assert!(f.blocking_until.is_none(), "guard must drop");
         assert_eq!(f.combo_count, 0, "combo must break");
         assert_eq!(f.actor_state(), ActorStateType::Staggered);
+    }
+}
+
+#[cfg(test)]
+mod absorb_fraction_tests {
+    use super::*;
+    use crate::arena::combat::loadout;
+
+    fn pool(remaining: f32, fraction: f32) -> NegationPool {
+        NegationPool {
+            source: DamageNegationSource::Ward,
+            remaining,
+            expires_at: Instant::now() + std::time::Duration::from_secs(60),
+            restoration_factor: 0.0,
+            absorb_fraction: fraction,
+        }
+    }
+
+    /// A storm-armor shield eats HALF of each hit — the shipped
+    /// `_damageAbsorptionPercent` is 0.50 at every rank. Absorbing the whole hit made
+    /// it twice as strong and drained it twice as fast.
+    #[test]
+    fn a_half_absorbing_pool_lets_half_the_hit_through() {
+        let now = Instant::now();
+        let mut f = Fighter::new(0, 1, loadout::starter(), now);
+        f.negation_pools.push(pool(116.0, 0.5));
+        let mut c = vec![(DamageType::Slashing, 100.0)];
+        f.apply_negation_pools(&mut c);
+        assert_eq!(c[0].1, 50.0, "half the hit must land");
+        assert_eq!(f.negation_pools[0].remaining, 66.0, "and only half drains the pool");
+    }
+
+    /// Ward / Absorb / Dodge are unchanged: fraction 1.0 swallows the hit whole, which
+    /// is what they did before the field existed. This is the additivity proof.
+    #[test]
+    fn a_full_absorbing_pool_behaves_exactly_as_before() {
+        let now = Instant::now();
+        let mut f = Fighter::new(0, 1, loadout::starter(), now);
+        f.negation_pools.push(pool(120.0, 1.0));
+        let mut c = vec![(DamageType::Slashing, 100.0)];
+        let r = f.apply_negation_pools(&mut c);
+        assert_eq!(c[0].1, 0.0, "the whole hit is eaten");
+        assert!(r.negated, "and the hit reports as negated");
+        assert_eq!(f.negation_pools[0].remaining, 20.0);
+    }
+
+    /// The pool still caps at what it has left, fraction or not.
+    #[test]
+    fn a_nearly_empty_half_pool_cannot_overdraw() {
+        let now = Instant::now();
+        let mut f = Fighter::new(0, 1, loadout::starter(), now);
+        f.negation_pools.push(pool(10.0, 0.5));
+        let mut c = vec![(DamageType::Slashing, 100.0)];
+        f.apply_negation_pools(&mut c);
+        assert_eq!(c[0].1, 90.0, "only the 10 it had left is absorbed");
+        assert!(f.negation_pools.is_empty(), "an exhausted pool is dropped");
     }
 }
