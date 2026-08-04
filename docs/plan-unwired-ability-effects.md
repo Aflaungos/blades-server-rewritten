@@ -1,6 +1,17 @@
 # Plan: the ability effects the server still ignores
 
-**Status:** scoped and evidenced, not implemented. One field is done (see below).
+**Status:** §1, §2, §4 IMPLEMENTED; §3 and §5 remain; §6 unblocked-pending-research.
+`stun_duration` was done in the previous pass.
+
+**Two open questions in this plan are now answered by data, and one of my own
+assumptions was wrong:**
+* `damage_reduction` is a **flat rating**, not a fraction — ShieldOfMania ships 50.11
+  → 138.82 across ranks, ReflectingBash 110.67 → 181.56. §3 no longer needs a survey.
+* The `*Armor` spells' `damage_per_second` is **0.00 at every rank**. There is no
+  retaliation burn to model — they are pure absorb shields of 116-158. §1's "aura that
+  burns attackers" was my inference, and the data refutes it.
+* Neither the shields nor the dodge caps ship a `_duration`, so they get no timed
+  expiry: the pool lasts until consumed, and the round reset clears it.
 **Why it matters:** the goal is to keep the game playable for players after shutdown.
 An ability that spends a resource and does nothing is worse than an ability that
 doesn't exist — the player thinks the server is broken, because it is.

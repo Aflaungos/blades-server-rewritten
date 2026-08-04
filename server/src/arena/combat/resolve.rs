@@ -1087,6 +1087,109 @@ fn resolve_ability_cast(
             }
         }
     }
+
+    // Whatever DEFENSIVE or CONTROL fields this rank ships, applied from the data
+    // rather than from the ability's name. Seven abilities used to spend a resource
+    // and do nothing because these fields were read by no code.
+    out.extend(apply_shipped_effects(combat, sender, target_slot, &ea.ability_uuid, level, now));
+    out
+}
+
+/// Apply the effect fields a rank ships that are not direct damage.
+///
+/// Driven off the DATA, not the ability's editor name: a rank that carries
+/// `_shieldHealth` gets a shield whether it is called FirestormArmor or something
+/// added later. Every value here is the shipped number — none is invented.
+///
+/// Which field goes where, and why:
+///
+/// * `_maximumAmountDodged` → a **Dodge** negation pool on the CASTER, plus op51
+///   `Dodging` (12, already pinned). DodgingStrike / RenewingDodge / AdrenalineDodge /
+///   FocusingDodge ship 86-283 absolute points, so it is a flat pool, not a fraction.
+/// * `_shieldHealth` → an absorb pool on the CASTER. FirestormArmor / BlizzardArmor /
+///   TempestArmor ship 116-158. **No op51 is emitted for these** — the elemental-armor
+///   `StatusEffectType` value is not pinned by any capture we hold, and a guessed id is
+///   dropped silently by the client, which would look like a working fix that does
+///   nothing. The pool is server-authoritative and reduces real damage regardless, so
+///   the mechanic works today and the visual follows when the id is known.
+///   Their shipped `_damagePerSecond` is **0.00 at every rank**, so there is no
+///   retaliation burn to model — these are pure shields. (An earlier plan revision
+///   assumed an aura that burns attackers; the data says otherwise.)
+/// * `_freezeDuration` / `_paralyzeDuration` → control on the TARGET. FlashFreeze ships
+///   both, identical per rank (2.50 s @ R1 → 2.90 s @ R5), so it is one effect duration
+///   expressed twice. Emits op51 `Frozen` (5) and `Paralyzed` (9), both pinned, and
+///   locks the target's inputs through the existing paralysis path.
+///
+/// Neither the shield nor the dodge pool ships a `_duration`, so neither gets a timed
+/// expiry: the pool lasts until it is consumed. `reset_fighters_for_next_round` clears
+/// `negation_pools`, so it cannot outlive the round.
+fn apply_shipped_effects(
+    combat: &mut MatchCombat,
+    caster: usize,
+    target_slot: usize,
+    ability_uuid: &str,
+    level: u8,
+    now: Instant,
+) -> Vec<(usize, Vec<u8>)> {
+    use super::state::{DamageNegationSource, NegationPool, StatusEffectType};
+    let mut out = Vec::new();
+    let Some(r) = super::gamedata::ability_rank_clamped(ability_uuid, level.max(1) as u16) else {
+        return out;
+    };
+    let viewers = combat.fighters.len();
+    // No shipped duration → until consumed. Round reset clears the pools.
+    let until_consumed = now + Duration::from_secs(3600);
+
+    if let Some(cap) = r.maximum_damage_dodged() {
+        if cap > 0.0 && caster < viewers {
+            combat.fighters[caster].negation_pools.push(NegationPool {
+                source: DamageNegationSource::Dodge,
+                remaining: cap,
+                expires_at: until_consumed,
+                restoration_factor: 0.0,
+            });
+            let obj = combat.fighters[caster].net_object_id;
+            info!("combat: slot {caster} dodge pool +{cap:.1} ({ability_uuid})");
+            let frame = messages::change_combat_status_effect(
+                obj, true, StatusEffectType::Dodging, 0.0, 0,
+            );
+            for v in 0..viewers {
+                out.push((v, frame.clone()));
+            }
+        }
+    }
+
+    if let Some(shield) = r.shield_health() {
+        if shield > 0.0 && caster < viewers {
+            combat.fighters[caster].negation_pools.push(NegationPool {
+                source: DamageNegationSource::Ward,
+                remaining: shield,
+                expires_at: until_consumed,
+                restoration_factor: 0.0,
+            });
+            info!(
+                "combat: slot {caster} elemental-armor shield +{shield:.1} ({ability_uuid})                  — no op51 (status id not pinned)"
+            );
+        }
+    }
+
+    if let Some(secs) = r.freeze_duration().or_else(|| r.paralyze_duration()) {
+        if secs > 0.0 && target_slot < viewers && !combat.fighters[target_slot].is_dead() {
+            let f = &mut combat.fighters[target_slot];
+            f.paralyze_secs = secs;
+            f.set_actor_state(ActorStateType::Paralyzed, now);
+            f.clear_scheduled_states();
+            f.blocking_until = None;
+            let obj = f.net_object_id;
+            info!("combat: slot {target_slot} FROZEN + PARALYZED {secs:.2}s ({ability_uuid})");
+            for st in [StatusEffectType::Frozen, StatusEffectType::Paralyzed] {
+                let frame = messages::change_combat_status_effect(obj, true, st, secs, 0);
+                for v in 0..viewers {
+                    out.push((v, frame.clone()));
+                }
+            }
+        }
+    }
     out
 }
 
@@ -3358,5 +3461,85 @@ mod phase4_tests {
         assert_eq!(combat.draw_tiebreak_winner((900, 100)), 1);
         assert_eq!(combat.draw_tiebreak_winner((100, 900)), 0);
         assert_eq!(combat.draw_tiebreak_winner((500, 500)), 0, "fully tied → slot 0");
+    }
+}
+
+#[cfg(test)]
+mod shipped_effects_tests {
+    use super::*;
+    use super::super::state::{DamageNegationSource, Fighter};
+    use super::super::loadout;
+
+    fn combat2(now: Instant) -> MatchCombat {
+        let mut c = MatchCombat::new(2, 2, now);
+        for slot in 0..2 {
+            let obj = c.alloc_net_object_id();
+            c.fighters.push(Fighter::new(slot, obj, loadout::starter(), now));
+        }
+        c.phase = FlowState::StateTimeout;
+        c
+    }
+
+    /// Seven abilities used to spend a resource and produce nothing. These assert the
+    /// shipped numbers now land, by UUID lookup rather than hardcoded values, so the
+    /// test tracks the game data instead of restating it.
+    fn uuid_of(editor: &str) -> &'static str {
+        super::super::gamedata::ABILITIES
+            .iter()
+            .find(|a| a.editor_name == editor)
+            .map(|a| a.uuid)
+            .unwrap_or_else(|| panic!("{editor} missing from the shipped table"))
+    }
+
+    #[test]
+    fn a_dodge_ability_gives_the_caster_a_dodge_pool() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        let u = uuid_of("DodgingStrike");
+        let out = apply_shipped_effects(&mut c, 0, 1, u, 1, now);
+        let pools = &c.fighters[0].negation_pools;
+        assert_eq!(pools.len(), 1, "one dodge pool");
+        assert_eq!(pools[0].source, DamageNegationSource::Dodge);
+        assert!(pools[0].remaining > 0.0, "the shipped cap must be positive");
+        // Dodging (12) is a pinned status id, so this one DOES get an op51 — to both.
+        assert_eq!(out.len(), 2, "op51 Dodging to both viewers");
+    }
+
+    /// The three *Armor spells get a real shield. No op51: the elemental-armor status
+    /// id is not pinned, and a guessed id is dropped silently by the client.
+    #[test]
+    fn an_armor_spell_gives_a_shield_pool_but_no_guessed_status() {
+        let now = Instant::now();
+        for name in ["FirestormArmor", "BlizzardArmor", "TempestArmor"] {
+            let mut c = combat2(now);
+            let out = apply_shipped_effects(&mut c, 0, 1, uuid_of(name), 1, now);
+            assert_eq!(c.fighters[0].negation_pools.len(), 1, "{name}: a shield pool");
+            assert!(c.fighters[0].negation_pools[0].remaining >= 100.0, "{name}: shipped ~116");
+            assert!(out.is_empty(), "{name}: must NOT emit a guessed status id");
+        }
+    }
+
+    /// FlashFreeze locks the TARGET, not the caster, for the rank's own duration.
+    #[test]
+    fn flashfreeze_locks_the_target_for_its_shipped_duration() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        let out = apply_shipped_effects(&mut c, 0, 1, uuid_of("FlashFreeze"), 1, now);
+        assert!(c.fighters[1].is_paralyzed(), "the TARGET is locked");
+        assert!(!c.fighters[0].is_paralyzed(), "the caster is not");
+        assert!(c.fighters[1].paralyze_secs >= 2.0, "the rank's own duration, not the default");
+        // Frozen (5) and Paralyzed (9) are both pinned → 2 statuses × 2 viewers.
+        assert_eq!(out.len(), 4, "op51 Frozen + Paralyzed to both viewers");
+    }
+
+    /// A plain damage spell must not pick up any of this — the pass is additive.
+    #[test]
+    fn a_plain_damage_spell_gains_nothing() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        let out = apply_shipped_effects(&mut c, 0, 1, uuid_of("Fireball"), 1, now);
+        assert!(c.fighters[0].negation_pools.is_empty());
+        assert!(!c.fighters[1].is_paralyzed());
+        assert!(out.is_empty());
     }
 }
