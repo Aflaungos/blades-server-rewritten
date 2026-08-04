@@ -1173,6 +1173,39 @@ fn apply_shipped_effects(
         }
     }
 
+    // `_damageReduction` + `_blockDuration` → a flat reduction while the block window
+    // is open. ShieldOfMania ships 50.11 and ReflectingBash 110.67 at R1, each with
+    // `_blockDuration` 0.50 s: press block and for half a second incoming damage is cut
+    // by that much. The numbers are FLAT RATINGS, not fractions — they run 50→139 and
+    // 111→182 across ranks, so a fractional reading would be nonsense.
+    //
+    // Carried as transient resistances across every damage type, which is the existing
+    // machinery for a timed flat subtraction (Resist-Elements uses it) and needs no
+    // change to the damage pipeline. One entry per type because the store is keyed by
+    // type; a generic reduction is simply all of them.
+    if let Some(reduction) = r.damage_reduction() {
+        let window = r.block_duration().unwrap_or(0.0);
+        if reduction > 0.0 && window > 0.0 && caster < viewers {
+            use super::state::DamageType;
+            let until = now + Duration::from_secs_f32(window);
+            let f = &mut combat.fighters[caster];
+            for ty in [
+                DamageType::Slashing,
+                DamageType::Cleaving,
+                DamageType::Bashing,
+                DamageType::Fire,
+                DamageType::Frost,
+                DamageType::Shock,
+                DamageType::Poison,
+            ] {
+                f.transient_resistances.push((ty, reduction, until));
+            }
+            info!(
+                "combat: slot {caster} damage reduction {reduction:.1} for {window:.2}s                  ({ability_uuid})"
+            );
+        }
+    }
+
     if let Some(secs) = r.freeze_duration().or_else(|| r.paralyze_duration()) {
         if secs > 0.0 && target_slot < viewers && !combat.fighters[target_slot].is_dead() {
             let f = &mut combat.fighters[target_slot];
@@ -3530,6 +3563,25 @@ mod shipped_effects_tests {
         assert!(c.fighters[1].paralyze_secs >= 2.0, "the rank's own duration, not the default");
         // Frozen (5) and Paralyzed (9) are both pinned → 2 statuses × 2 viewers.
         assert_eq!(out.len(), 4, "op51 Frozen + Paralyzed to both viewers");
+    }
+
+    /// ShieldOfMania / ReflectingBash cut incoming damage by a FLAT rating for the
+    /// block window. The plan flagged fraction-vs-flat as undecidable from the field
+    /// name; the shipped ranges (50→139, 111→182) settle it, and `_blockDuration` 0.50 s
+    /// supplies the expiry I had thought was missing.
+    #[test]
+    fn a_block_buff_gives_a_timed_flat_reduction() {
+        let now = Instant::now();
+        for name in ["ShieldOfMania", "ReflectingBash"] {
+            let mut c = combat2(now);
+            apply_shipped_effects(&mut c, 0, 1, uuid_of(name), 1, now);
+            let tr = &c.fighters[0].transient_resistances;
+            assert!(!tr.is_empty(), "{name}: a reduction must land");
+            assert!(tr.iter().all(|(_, amt, _)| *amt >= 50.0), "{name}: flat rating, not a fraction");
+            // The window is short on purpose — half a second, not a standing buff.
+            let expiry = tr[0].2;
+            assert!(expiry > now && expiry <= now + Duration::from_secs(1), "{name}: ~0.5s window");
+        }
     }
 
     /// A plain damage spell must not pick up any of this — the pass is additive.

@@ -1,6 +1,6 @@
 # Plan: the ability effects the server still ignores
 
-**Status:** §1, §2, §4 IMPLEMENTED; §3 and §5 remain; §6 unblocked-pending-research.
+**Status:** §1, §2, §3, §4 IMPLEMENTED. §5 remains. §6 pending research.
 `stun_duration` was done in the previous pass.
 
 **Two open questions in this plan are now answered by data, and one of my own
@@ -12,6 +12,13 @@ assumptions was wrong:**
   burns attackers" was my inference, and the data refutes it.
 * Neither the shields nor the dodge caps ship a `_duration`, so they get no timed
   expiry: the pool lasts until consumed, and the round reset clears it.
+* `damage_reduction` DOES have a duration and I missed it: `_blockDuration` = 0.50 s.
+  ShieldOfMania and ReflectingBash are **block-window** buffs — press block and for half
+  a second incoming damage is cut by a flat 50-182. §3 is implemented.
+* §5's four piercing fields are also FLAT ratings despite two being named `*_percent`:
+  Skullcrusher ships `armor_piercing_percent` = 225.00 and `block_piercing_percent` =
+  60.00; PiercingStrikes ships 122.40 / 20.88. Do not read them as percentages.
+
 **Why it matters:** the goal is to keep the game playable for players after shutdown.
 An ability that spends a resource and does nothing is worse than an ability that
 doesn't exist — the player thinks the server is broken, because it is.
