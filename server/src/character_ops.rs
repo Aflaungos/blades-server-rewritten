@@ -312,10 +312,49 @@ pub async fn save_loadout_profile(
     .await
 }
 
+/// The client writes an EMPTY SLOT two different ways in `equipmentUpdates`:
+/// `null`, and the empty string `""`. Both mean "nothing is in this slot".
+///
+/// `Option<Uuid>` accepts the first and rejects the second, so a single `""`
+/// failed the whole request with
+/// `Json deserialize error: UUID parsing failed: invalid length: expected
+/// length 32 for simple format, found 0`, HTTP 400 — and because the client
+/// retries a failed loadout switch, the player got a loading loop they had to
+/// force-quit out of (tracker #22).
+///
+/// Reported by Swanne, whose saved "Vs Warrior" profile has 3 of 9 slots
+/// filled. The request carried the 6 empty ones as four `""` and two `null` —
+/// the same emptiness spelled two ways, one of which we refused.
+///
+/// Mapping `""` to `None` is safe rather than merely convenient: `None`
+/// already means unequip in `apply_equipment_updates`, which returns whatever
+/// occupies the slot to the backpack and puts nothing in it. So both spellings
+/// now do the one thing the client means by them.
+///
+/// A non-empty value that is not a uuid is still an error. The bug was that we
+/// rejected a legitimate encoding of "empty", not that we were too strict.
+fn deserialize_equipment_updates<'de, D>(de: D) -> Result<HashMap<Uuid, Option<Uuid>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    let raw: HashMap<Uuid, Option<String>> = HashMap::deserialize(de)?;
+    raw.into_iter()
+        .map(|(slot, target)| {
+            let item = match target.as_deref().map(str::trim) {
+                None | Some("") => None,
+                Some(s) => Some(Uuid::parse_str(s).map_err(D::Error::custom)?),
+            };
+            Ok((slot, item))
+        })
+        .collect()
+}
+
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LoadoutCurrentRequest {
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_equipment_updates")]
     equipment_updates: HashMap<Uuid, Option<Uuid>>,
     #[serde(default)]
     ability_updates: Value,
@@ -388,4 +427,73 @@ pub async fn update_loadout(
         .scope_boxed()
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Swanne's actual request body, tracker #22 (capture 261220). Nine slots:
+    /// three real items, four `""` and two `null`. Before the custom
+    /// deserializer this whole body failed with HTTP 400 on the first `""`,
+    /// and the client's retry turned that into a loading loop.
+    const SWANNE_VS_WARRIOR: &str = r#"{
+      "equipmentUpdates": {
+        "897a600c-91d6-4449-af09-173da88a907e": "933a1308-96c7-408d-a7e0-e6e0286f50a3",
+        "e273a4d7-fb87-4f7e-8f1e-398be59afbcb": "94d056cb-8462-47d1-8574-58956141cce6",
+        "58b6d121-2e23-4fa4-b892-c92ae2e2c4c5": "",
+        "48021ab1-a1a6-487b-80a4-ca472a4d0c77": "573dbf5f-ecd3-434c-bdf6-0e47dcff8c69",
+        "417e79de-c810-42f8-8273-f9759df6ae25": null,
+        "862605de-c67f-4bce-b527-4e5fb6f25162": null,
+        "36d141e4-7783-466c-9565-6f90f09de428": "",
+        "0d8f2023-4701-41e8-8bd5-92381d787456": "",
+        "959c1931-bf85-4587-92ec-8ecaa58b06d5": ""
+      }
+    }"#;
+
+    #[test]
+    fn a_loadout_with_empty_slots_is_accepted() {
+        let req: LoadoutCurrentRequest = serde_json::from_str(SWANNE_VS_WARRIOR)
+            .expect("the real request body must deserialize");
+        assert_eq!(req.equipment_updates.len(), 9, "all nine slots survive");
+        let filled = req.equipment_updates.values().filter(|v| v.is_some()).count();
+        assert_eq!(filled, 3, "exactly the three equipped items are Some");
+        assert_eq!(
+            req.equipment_updates.values().filter(|v| v.is_none()).count(),
+            6,
+            "the six empty slots are None, however they were spelled"
+        );
+    }
+
+    #[test]
+    fn empty_string_and_null_mean_the_same_thing() {
+        let slot_a = "58b6d121-2e23-4fa4-b892-c92ae2e2c4c5".parse::<Uuid>().unwrap();
+        let slot_b = "417e79de-c810-42f8-8273-f9759df6ae25".parse::<Uuid>().unwrap();
+        let req: LoadoutCurrentRequest = serde_json::from_str(SWANNE_VS_WARRIOR).unwrap();
+        assert_eq!(req.equipment_updates[&slot_a], None, "\"\" is an empty slot");
+        assert_eq!(req.equipment_updates[&slot_b], None, "null is an empty slot");
+    }
+
+    #[test]
+    fn whitespace_only_is_also_empty() {
+        let body = r#"{"equipmentUpdates":{"897a600c-91d6-4449-af09-173da88a907e":"   "}}"#;
+        let req: LoadoutCurrentRequest = serde_json::from_str(body).unwrap();
+        assert!(req.equipment_updates.values().all(Option::is_none));
+    }
+
+    /// The fix must not turn the endpoint into one that accepts anything. A
+    /// non-empty value that is not a uuid is still a client bug and still an
+    /// error — otherwise this test could not tell a working deserializer from
+    /// one that simply dropped every value on the floor.
+    #[test]
+    fn a_malformed_uuid_is_still_rejected() {
+        let body = r#"{"equipmentUpdates":{"897a600c-91d6-4449-af09-173da88a907e":"not-a-uuid"}}"#;
+        assert!(serde_json::from_str::<LoadoutCurrentRequest>(body).is_err());
+    }
+
+    #[test]
+    fn an_absent_field_is_still_an_empty_map() {
+        let req: LoadoutCurrentRequest = serde_json::from_str(r#"{}"#).unwrap();
+        assert!(req.equipment_updates.is_empty());
+    }
 }
