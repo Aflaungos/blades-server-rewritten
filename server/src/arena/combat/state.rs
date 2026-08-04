@@ -212,13 +212,25 @@ pub enum StatusEffectType {
     /// Poison conditioning DoT (2.52 / 4.89 / 5 s; 4.89 s = the Paralyze-spell poison). [§5.3]
     Poisoned = 7,
     /// `Paralyzed` — the un-breakable paralyse state (3.1 s = `ParalyzeAbility._duration`). [§5.4]
+    /// Green-fog blindness on the VICTIM. **8** (`dump.cs:609805`). There is no
+    /// blind ACTOR state — `ActorStateType.StateId` has none — so the fog is rendered
+    /// entirely client-side off this status; the server's whole job is to send it.
+    Blind = 8,
     Paralyzed = 9,
     StaggeredWeakness = 10,
+    RecklessFury = 11,
     Dodging = 12,
+    Firewall = 13,
     /// Ward negation buff (elemental-negation pool + armor). [§4.2]
     Ward = 15,
+    /// The shield the three `*Armor` spells apply. **16** (`dump.cs:609812`) — ONE
+    /// shared value: there is no per-element status, and `StormArmorAbility`
+    /// (dump.cs:607176) is the single class backing Firestorm/Blizzard/Tempest. The
+    /// element lives on the ability, not the status.
+    ElementalStormArmor = 16,
     /// Absorb negation buff (damage→heal pool). [§4.1]
     Absorb = 17,
+    Flying = 18,
     /// No HP regen while active (On Fire / conditioning). [status-resistance-spec §Mechanic-2]
     BlockHealthRegen = 50,
     BlockStaminaRegen = 51,
@@ -229,6 +241,21 @@ pub enum StatusEffectType {
     FrostResistance = 61,
     ShockResistance = 62,
     PoisonResistance = 63,
+    // The elemental WEAKNESS block. Wire-observed (58 op51 commands), but do NOT wire
+    // effects off these yet: they arrive in a 13-prop extended op51 shape where
+    // propId5 == propId8 and propId5 - propId12 == 96 in all 58 samples, so the
+    // captures cannot decide whether 100-103 is a second enum block or whether the
+    // extended shape moves the real type to propId 12. Both readings fit the data.
+    FireWeakness = 100,
+    FrostWeakness = 101,
+    ShockWeakness = 102,
+    PoisonWeakness = 103,
+    HealthRegenReduction = 120,
+    StaminaRegenReduction = 121,
+    MagickaRegenReduction = 122,
+    HealthRestoration = 170,
+    StaminaRestoration = 171,
+    MagickaRestoration = 172,
     // …
 }
 

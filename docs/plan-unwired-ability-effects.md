@@ -1,6 +1,16 @@
 # Plan: the ability effects the server still ignores
 
-**Status:** §1, §2, §3, §4 IMPLEMENTED. §5 remains. §6 pending research.
+**Status:** §1, §2, §3, §4, §6 IMPLEMENTED. **Only §5 (piercing) remains.**
+
+The two blocking wire values were recovered from `dump.cs:609793-609832`
+(`StatusEffectType`, 34 members):
+* **`Blind` = 8** — and `ActorStateType.StateId` has NO blind state (all 29 read), so
+  the green fog is rendered client-side off the status. The server just sends it.
+* **`ElementalStormArmor` = 16** — ONE shared value for all three `*Armor` spells;
+  `StormArmorAbility` is a single class and the element lives on the ability.
+Neither is capture-confirmed (nobody cast them in the sessions we hold) but propId 5
+matched the dump enum 2,965/2,965 across three sessions. Fifteen further members were
+missing from `state.rs` and are now transcribed.
 `stun_duration` was done in the previous pass.
 
 **Two open questions in this plan are now answered by data, and one of my own
