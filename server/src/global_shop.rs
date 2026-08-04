@@ -134,15 +134,58 @@ fn shift_to_now(overrides: &Value, now: i64) -> Value {
     serde_json::json!({ "globalShopOverrides": out })
 }
 
+/// Lay admin-authored windows over the replayed catalogue.
+///
+/// WHY THIS IS A SEPARATE FILE AND NOT A FEW MORE ENTRIES IN THE OTHER ONE
+///
+/// [`shift_to_now`] anchors on the LATEST `activeEndDate` in the catalogue and does
+/// nothing at all when that anchor is already past `now`. Write an authored window
+/// for next week into `global_shop_overrides.json` and it becomes the latest end —
+/// so the shift switches off, and all 547 retail offers snap back to their real
+/// (July 2026, expired) windows. Authoring one offer would empty the shop.
+///
+/// Applied here instead, after the shift, an authored entry means exactly the dates
+/// someone typed and nothing else moves. An id present in both wins here: authoring
+/// a window for an offer that is already on the rotation is the normal case, and the
+/// human's decision is the more recent fact.
+///
+/// An authored offer still needs a `global_shop_grants` entry or its purchase 404s;
+/// the generator that writes this file refuses to author without one, and
+/// `authored_offers_are_purchasable` guards the committed file.
+fn apply_authored(catalog: Value, authored: &Value) -> Value {
+    let Some(extra) = authored
+        .get("globalShopOverrides")
+        .and_then(|v| v.as_object())
+        .filter(|m| !m.is_empty())
+    else {
+        return catalog;
+    };
+    let mut out = catalog;
+    let Some(map) = out
+        .get_mut("globalShopOverrides")
+        .and_then(|v| v.as_object_mut())
+    else {
+        return out;
+    };
+    for (id, entry) in extra {
+        map.insert(id.clone(), entry.clone());
+    }
+    out
+}
+
 /// `GET /catalogoverrides/globalshop` — the override catalogue, shifted so retail's
-/// rotation covers the present. See [`shift_to_now`].
+/// rotation covers the present, then overlaid with anything an admin authored. See
+/// [`shift_to_now`] and [`apply_authored`].
 #[get("/blades.bgs.services/api/game/v1/public/catalogoverrides/globalshop")]
 pub async fn get_override(app_state: web::Data<Arc<ServerGlobal>>) -> Json<Value> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    Json(shift_to_now(&app_state.static_data.global_shop_overrides, now))
+    Json(apply_authored(
+        shift_to_now(&app_state.static_data.global_shop_overrides, now),
+        &app_state.static_data.global_shop_authored,
+    ))
 }
 
 /// `GET /catalogoverrides/iap` — real-money SKU catalogue, served verbatim (priced
@@ -447,5 +490,127 @@ mod replay_tests {
         let raw = catalog();
         let now = 1_780_000_000; // inside the captured range
         assert_eq!(shift_to_now(&raw, now), raw);
+    }
+
+    fn authored(id: &str, start: i64, end: i64) -> Value {
+        serde_json::json!({
+            "globalShopOverrides": {
+                id: {
+                    "activeStartDate": start,
+                    "activeEndDate": end,
+                    "isActive": true,
+                    "maxPurchaseLimits": [],
+                    "maxPurchases": 0,
+                    "prices": [{ "currencyId": "c64bcb53-41f4-41ba-892a-fe2cca423caa", "quantity": 5 }],
+                    "purchaseTrackingId": null,
+                }
+            }
+        })
+    }
+
+    /// The whole reason authored windows live in their own file: an authored future
+    /// window folded into the main catalogue would become the shift's anchor, the
+    /// shift would switch off, and every retail offer would revert to expired.
+    ///
+    /// This asserts the damage directly rather than asserting the plumbing.
+    #[test]
+    fn authoring_a_future_window_does_not_empty_the_shop() {
+        let raw = catalog();
+        let now = 1_783_000_000 + 365 * 86_400;
+
+        // The trap, spelled out: merged into the base file FIRST, the way the
+        // obvious implementation would have done it.
+        let mut merged = raw.clone();
+        merged["globalShopOverrides"]["11111111-1111-4111-8111-111111111111"] =
+            authored("x", now + 30 * 86_400, now + 37 * 86_400)["globalShopOverrides"]["x"].clone();
+        // Nothing at all is live: the authored window becomes the anchor, the shift
+        // switches off, every retail offer reverts to expired, and the authored one
+        // has not started yet either. An empty store, from adding one offer.
+        assert_eq!(
+            live_count(&shift_to_now(&merged, now), now),
+            0,
+            "precondition: merging first really does empty the shop",
+        );
+
+        // Applied after the shift, the rotation is untouched.
+        let served = apply_authored(
+            shift_to_now(&raw, now),
+            &authored("11111111-1111-4111-8111-111111111111", now + 30 * 86_400, now + 37 * 86_400),
+        );
+        assert!(
+            live_count(&served, now) > 1,
+            "the retail rotation must still be live alongside the authored offer",
+        );
+    }
+
+    /// An authored window means the dates someone typed — not those dates plus a
+    /// replay offset.
+    #[test]
+    fn an_authored_window_is_never_shifted() {
+        let now = 1_783_000_000 + 365 * 86_400;
+        let (start, end) = (now + 86_400, now + 3 * 86_400);
+        let served = apply_authored(
+            shift_to_now(&catalog(), now),
+            &authored("11111111-1111-4111-8111-111111111111", start, end),
+        );
+        let e = &served["globalShopOverrides"]["11111111-1111-4111-8111-111111111111"];
+        assert_eq!(e["activeStartDate"].as_i64(), Some(start));
+        assert_eq!(e["activeEndDate"].as_i64(), Some(end));
+    }
+
+    /// Authoring a window for an offer already on the rotation replaces its window
+    /// rather than adding a duplicate — the human's decision is the newer fact.
+    #[test]
+    fn an_authored_window_overrides_the_replayed_one() {
+        let raw = catalog();
+        let now = 1_783_000_000 + 365 * 86_400;
+        let id = raw["globalShopOverrides"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .next()
+            .unwrap()
+            .clone();
+        let before = shift_to_now(&raw, now);
+        let served = apply_authored(before.clone(), &authored(&id, 7, 9));
+        assert_eq!(
+            served["globalShopOverrides"].as_object().unwrap().len(),
+            before["globalShopOverrides"].as_object().unwrap().len(),
+            "no duplicate entry",
+        );
+        assert_eq!(served["globalShopOverrides"][&id]["activeEndDate"].as_i64(), Some(9));
+    }
+
+    /// The normal case — an empty authored file must change nothing at all.
+    #[test]
+    fn an_empty_authored_file_is_a_no_op() {
+        let now = 1_783_000_000 + 365 * 86_400;
+        let shifted = shift_to_now(&catalog(), now);
+        let empty = serde_json::json!({ "globalShopOverrides": {} });
+        assert_eq!(apply_authored(shifted.clone(), &empty), shifted);
+        assert_eq!(apply_authored(shifted.clone(), &Value::Null), shifted);
+    }
+
+    /// Every authored offer must have a reward definition, or buying it 404s and the
+    /// client prompts the player to reconnect to Bethesda. The generator refuses to
+    /// write one without; this is the guard on the committed file, and it starts
+    /// vacuous because the file starts empty.
+    #[test]
+    fn authored_offers_are_purchasable() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../deploy/static");
+        let sd = crate::static_loader::load(&dir);
+        let grants = &sd.global_shop_grants;
+        for id in sd.global_shop_authored["globalShopOverrides"]
+            .as_object()
+            .into_iter()
+            .flatten()
+            .map(|(k, _)| k)
+        {
+            let uuid: Uuid = id.parse().unwrap_or_else(|e| panic!("authored id {id}: {e}"));
+            assert!(
+                grants.contains_key(&uuid),
+                "authored offer {id} has no global_shop_grants entry — buying it would 404",
+            );
+        }
     }
 }

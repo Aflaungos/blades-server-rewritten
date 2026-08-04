@@ -46,6 +46,12 @@ pub fn load(dir: &Path) -> StaticData {
     if global_shop_overrides.is_null() {
         global_shop_overrides = json!({ "globalShopOverrides": {} });
     }
+    // Admin-authored windows. Its own file so the replay shift cannot touch it —
+    // see `StaticData::global_shop_authored`. Normally empty.
+    let mut global_shop_authored: Value = read_json(&dir.join("global_shop_authored.json"));
+    if global_shop_authored.is_null() {
+        global_shop_authored = json!({ "globalShopOverrides": {} });
+    }
     let mut iap: Value = read_json(&dir.join("iap.json"));
     if iap.is_null() {
         iap = json!({ "fulfillmentOverrides": {} });
@@ -78,6 +84,7 @@ pub fn load(dir: &Path) -> StaticData {
         gifts: gifts.into_iter().map(|g| (g.global_gift_id, g)).collect::<HashMap<_, _>>(),
         announcements,
         global_shop_overrides,
+        global_shop_authored,
         iap,
         global_shop_grants,
         challenge_templates,

@@ -525,6 +525,16 @@ pub struct StaticData {
     /// verbatim by `GET /catalogoverrides/globalshop`. Opaque JSON — special/limited
     /// offers with adjusted prices; the base catalog lives in the client's bundles.
     pub global_shop_overrides: Value,
+    /// Admin-authored global-shop windows (`{globalShopOverrides: {...}}`), applied
+    /// ON TOP of the replayed catalogue and never shifted.
+    ///
+    /// Separate from [`Self::global_shop_overrides`] on purpose. The replay shift
+    /// anchors on the latest `activeEndDate` in the catalogue, so folding an
+    /// authored future window into that file would make the anchor land past `now`
+    /// and switch the shift off for all 547 retail offers at once — emptying the
+    /// shop to author one entry. Kept apart, an authored window means exactly the
+    /// dates someone typed.
+    pub global_shop_authored: Value,
     /// The IAP fulfillment overrides (`{fulfillmentOverrides: {...}}`), served
     /// verbatim by `GET /catalogoverrides/iap`. Real-money SKUs — priced placeholders
     /// only (all `isActive:false` in captures); we never run a purchase flow.
