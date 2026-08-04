@@ -1129,6 +1129,12 @@ fn resolve_ability_cast(
                 if let Some(erp) = r.elemental_resistance_piercing() {
                     attacker_loadout.elem_resist_piercing_rating += erp;
                 }
+                if let Some(bp) = r.block_piercing_percent() {
+                    attacker_loadout.block_piercing_rating += bp;
+                }
+                if let Some(ebp) = r.elemental_block_piercing() {
+                    attacker_loadout.elem_block_piercing_rating += ebp;
+                }
             }
             // Middle is not part of a Left/Right chain, so it resets the combo — the
             // same rule `resolve_swing_with_side` applies to a Middle swing.
@@ -3938,6 +3944,66 @@ mod piercing_tests {
         let same = m.resolve_attack(&zero, &armored_target(now), DamageSource::Attack,
                                     ActiveSide::Middle, 1.0, 0, now).total;
         assert_eq!(base.to_bits(), same.to_bits(), "zero piercing must be bit-identical");
+    }
+
+    /// A LATE block must be weaker against a block-piercing attack. Skullcrusher ships
+    /// 60.00 physical block pierce, PiercingStrikes 122.40 elemental — both dead until
+    /// now, because `block_outcome` had no piercing input at all.
+    #[test]
+    fn block_piercing_weakens_a_late_block() {
+        use super::super::damage::block_outcome;
+        use super::super::state::{ActorStateType, BlockPhase, DamageType};
+        let now = Instant::now();
+        let mut d = Fighter::new(1, 2, loadout::starter(), now);
+        d.loadout.block_rating = 400.0;
+        d.set_actor_state(ActorStateType::Blocking, now);
+        d.blocking_side = ActiveSide::Right;
+        // LATE, not optimal: re-raised inside the recovery window.
+        d.last_block_dropped_at = Some(now);
+        d.block_raised_at = Some(now);
+        d.blocking_until = Some(now + Duration::from_secs(5));
+        assert_eq!(d.block_phase(now), Some(BlockPhase::Late), "precondition: LATE block");
+
+        let plain = block_outcome(&d, &loadout::starter(), ActiveSide::Right, now);
+        let mut pierce = loadout::starter();
+        pierce.block_piercing_rating = 60.0;
+        pierce.elem_block_piercing_rating = 122.40;
+        let pierced = block_outcome(&d, &pierce, ActiveSide::Right, now);
+
+        assert!(
+            pierced.factor_for(DamageType::Slashing) > plain.factor_for(DamageType::Slashing),
+            "physical block pierce must let MORE damage through a late block"
+        );
+        assert!(
+            pierced.factor_for(DamageType::Fire) > plain.factor_for(DamageType::Fire),
+            "elemental block pierce must let more elemental through"
+        );
+    }
+
+    /// ADDITIVE — the whole safety argument for touching the block stage. A hit with no
+    /// piercing must produce a bit-identical factor to before the parameter existed.
+    /// The s506 block differentials are the real proof; this pins it directly.
+    #[test]
+    fn zero_block_piercing_is_bit_identical() {
+        use super::super::damage::block_outcome;
+        use super::super::state::{ActorStateType, DamageType};
+        let now = Instant::now();
+        let mut d = Fighter::new(1, 2, loadout::starter(), now);
+        d.loadout.block_rating = 400.0;
+        d.set_actor_state(ActorStateType::Blocking, now);
+        d.blocking_side = ActiveSide::Right;
+        d.block_raised_at = Some(now);
+        d.blocking_until = Some(now + Duration::from_secs(5));
+
+        let b = block_outcome(&d, &loadout::starter(), ActiveSide::Right, now);
+        for ty in [DamageType::Slashing, DamageType::Fire, DamageType::Frost, DamageType::Stamina] {
+            let f = b.factor_for(ty);
+            // Re-deriving from the un-pierced rating must give the same bits.
+            let mut zero = b;
+            zero.block_piercing = 0.0;
+            zero.elem_block_piercing = 0.0;
+            assert_eq!(f.to_bits(), zero.factor_for(ty).to_bits(), "{ty:?} must be identical");
+        }
     }
 
     /// The piercing lives on a per-cast CLONE, so a maneuver cannot leak it into the
