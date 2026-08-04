@@ -243,8 +243,22 @@ pub const BLOCK_OPTIMAL_TIME_SECS: f32 = 2.0;
 /// (**1.4 s**), replacing the dump's `OPTIMAL_BLOCK_RECOVERY_TIME = 0.8 s`. The
 /// shipped player-combat asset is the authority for a *player* re-raising a guard;
 /// `PvpDefaultSettings` 0.8 was a server-cheat default.
-pub const OPTIMAL_BLOCK_RECOVERY_SECS: f32 =
-    super::gamedata::combat_params::POST_OPTIMAL_BLOCK_RESET_TIME;
+/// **PvP, not PvE.** This was `PlayerCombatParameters.postOptimalBlockResetTime`
+/// (1.4 s), with a comment arguing that `PvpDefaultSettings`' 0.8 s "was a
+/// server-cheat default". That was a considered choice, but it is inconsistent with
+/// what this module already does: `ARENA_HEALTH_MULTIPLIER` IS
+/// `PvpDefaultSettings.CHEAT_BASE_HEALTH_MULTIPLIER`, applied to every arena
+/// fighter. Taking that class's health value while refusing its block value is the
+/// position that needs defending. It is, by name and content, the PvP settings —
+/// and the arena is PvP.
+pub const OPTIMAL_BLOCK_RECOVERY_SECS: f32 = PVP_OPTIMAL_BLOCK_RECOVERY_TIME;
+
+/// `PvpDefaultSettings.OPTIMAL_BLOCK_RECOVERY_TIME` (`dump.cs:427015`).
+const PVP_OPTIMAL_BLOCK_RECOVERY_TIME: f32 = 0.8;
+
+/// `PvpDefaultSettings.BASE_STAGGER_DURATION` (`dump.cs:427016`). The PvE value in
+/// `CombatParameters` is 1.5 s; arena is PvP and staggers for longer.
+const PVP_BASE_STAGGER_DURATION: f32 = 2.5;
 
 /// The block phase for a defending fighter.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -829,7 +843,7 @@ pub const HEALTH_PERCENT_TO_CAUSE_STATUS: f32 =
 
 /// `CombatParameters.baseStaggerDuration` — how long a staggered actor is locked out.
 /// [Phase 3.13]
-pub const BASE_STAGGER_DURATION_SECS: f32 = super::gamedata::combat_params::BASE_STAGGER_DURATION;
+pub const BASE_STAGGER_DURATION_SECS: f32 = PVP_BASE_STAGGER_DURATION;
 
 /// `CombatParameters.criticalHealthThreshold` — health **percentage** (0..100) below
 /// which a fighter is "critical" (drives the potion prompt + `Fortify Health
@@ -1456,6 +1470,29 @@ pub struct MatchCombat {
     /// When the last stat-regen tick fired. Initialised to the match's `phase_entered`
     /// so the first tick fires 1s into the live round. [spec §2]
     pub last_regen_tick: std::time::Instant,
+    /// Swings committed but not yet landed — see [`PendingHit`].
+    pub pending_hits: Vec<PendingHit>,
+}
+
+/// A committed swing whose damage has not been applied yet.
+///
+/// WHY (tracker #21): the animation already walks AutoAttack → FollowThrough →
+/// Recovery on retail's measured delays, but the DAMAGE was applied inline at
+/// commit. So the wire said the hit lands 50 ms after the swing and the server
+/// applied it immediately — and the defender's only reaction window was network
+/// latency, which is what "the attack lands too early to make a high block" is.
+///
+/// Everything needed to resolve the hit is captured at commit, EXCEPT the
+/// defender's guard. That is read when the hit lands, which is the entire point:
+/// a block raised during the swing now counts.
+#[derive(Debug, Clone)]
+pub struct PendingHit {
+    pub sender: usize,
+    pub target: usize,
+    pub side: ActiveSide,
+    pub swing_factor: f32,
+    pub combo_count: u32,
+    pub due: Instant,
 }
 
 impl MatchCombat {
@@ -1478,6 +1515,7 @@ impl MatchCombat {
             matchend_step: 0,
             interround_step: 0,
             last_regen_tick: now,
+            pending_hits: Vec::new(),
         }
     }
 
@@ -1931,10 +1969,11 @@ mod tests {
         // (PlayerCombatParameters), NOT the dump's 0.8 s server-cheat default — so a
         // raise at 0.9 s is still LATE and only a raise past 1.4 s is OPTIMAL again.
         assert!(
-            (OPTIMAL_BLOCK_RECOVERY_SECS - 1.4).abs() < 1e-6,
-            "postOptimalBlockResetTime is 1.4 s, got {OPTIMAL_BLOCK_RECOVERY_SECS}"
+            (OPTIMAL_BLOCK_RECOVERY_SECS - 0.8).abs() < 1e-6,
+            "PvP OPTIMAL_BLOCK_RECOVERY_TIME is 0.8 s, got {OPTIMAL_BLOCK_RECOVERY_SECS}"
         );
-        let still_late = now + std::time::Duration::from_millis(900);
+        // 0.5 s is inside the 0.8 s PvP window; 0.9 s would now be OUTSIDE it.
+        let still_late = now + std::time::Duration::from_millis(500);
         f.block_raised_at = Some(still_late);
         f.blocking_until = Some(still_late + block_window);
         assert_eq!(f.block_phase(still_late), Some(BlockPhase::Late), "0.9 s < 1.4 s → still LATE");

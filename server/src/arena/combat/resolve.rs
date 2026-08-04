@@ -39,6 +39,7 @@ use super::messages;
 use super::messages_state::{self, StateFrame};
 use super::state::{
     ActiveSide, ActorStateType, DamageSource, FlowState, MatchCombat, MatchState, NetObjectType,
+    PendingHit,
 };
 use super::tables;
 
@@ -61,7 +62,7 @@ fn swing_cooldown_for(fighter: &super::state::Fighter) -> Duration {
 
 /// Held-charge crit swing multiplier for a **Light** weapon (dagger) — `×1.325`.
 /// From `docs/arena-combat-actions.md` / `tables::Weight::Light.crit_combo().0`.
-/// Applied when the server-measured attack hold ≥ `CRITICAL_HOLD_SECS`.
+/// Applied when the server-measured attack hold ≥ `CRIT_HOLD_HEAVY_SECS`.
 const CRIT_FACTOR_LIGHT: f32 = 1.325;
 
 /// Held-charge crit swing multiplier for a **Heavy** weapon — `×1.987`.
@@ -82,9 +83,36 @@ const CRIT_FACTOR_VERSATILE: f32 = 1.625;
 /// available; the threshold is also the `AttackChargeState.PreCritical → Critical`
 /// state transition in `dump.cs TypeDefIndex 13116`.
 ///
-/// **CALIBRATION FLAG** — set this const once `MinDamageTime`/`MaxDamageTime` are
-/// captured from the CDN WeaponTemplate assets.
-const CRITICAL_HOLD_SECS: f32 = 1.2;
+/// **CALIBRATION FLAG RESOLVED.** The flag asked for `MinDamageTime`/`MaxDamageTime`
+/// from the CDN WeaponTemplate assets. They are in hand, and 1.2 s was far too long:
+/// across 246 real swings the hold-at-release distribution is median **0.317 s**,
+/// p90 0.47-0.60 s, **maximum 1.73 s**. At a 1.2 s threshold a critical hit was very
+/// nearly unreachable, which is why nobody has ever reported landing one.
+///
+/// The real full-charge point is `WeaponTemplate._backswingTime`, the input to
+/// `AttackChargeState::DetermineState(chargeTime)` (`dump.cs` TypeDefIndex 13115):
+/// damage ramps from `minDamageFactor` (0) to `maxDamageFactor` over the backswing,
+/// holds for `_maxDamageTime` (0.035 s), then decays. 363 of 368 shipped weapon
+/// entries collapse onto three signatures — Light 0.1167 s, Versatile 0.2 s, Heavy
+/// 0.25 s. It also explains the 0.32 s clustering: players hold just past the sweet
+/// spot, exactly as the ramp rewards.
+///
+/// Per weight class rather than per weapon because `x_items.py` still discards the
+/// eleven `WeaponTemplate` timing fields.
+const CRIT_HOLD_LIGHT_SECS: f32 = 0.116_667;
+const CRIT_HOLD_VERSATILE_SECS: f32 = 0.2;
+const CRIT_HOLD_HEAVY_SECS: f32 = 0.25;
+
+/// The full-charge threshold for this fighter's weapon. An unknown class defaults to
+/// Light — the shortest threshold, so it errs toward letting a genuine charge count
+/// rather than silently swallowing it, which is the failure being replaced.
+fn critical_hold_secs(fighter: &super::state::Fighter) -> f32 {
+    match fighter.loadout.weapon.weight {
+        Some(tables::Weight::Heavy) => CRIT_HOLD_HEAVY_SECS,
+        Some(tables::Weight::Versatile) => CRIT_HOLD_VERSATILE_SECS,
+        _ => CRIT_HOLD_LIGHT_SECS,
+    }
+}
 
 /// Fallback ability cooldown for abilities without authoritative game-data.
 const ABILITY_COOLDOWN: Duration = Duration::from_millis(3000);
@@ -392,13 +420,13 @@ fn parse_op46_held(user_data: &[u8]) -> Option<bool> {
 
 /// Determine the swing crit factor for a fighter based on how long they held the
 /// attack button (server-measured). Returns the charge multiplier:
-///   - `CRIT_FACTOR_*` when `hold_secs >= CRITICAL_HOLD_SECS` (full charge / Critical
+///   - `CRIT_FACTOR_*` when `hold_secs >= CRIT_HOLD_HEAVY_SECS` (full charge / Critical
 ///     or PostCriticalDecay state — the server-side equivalent of op45 reporting ≥3).
 ///   - `1.0` for a partial hold (uncharged swing, no crit).
 ///
 /// Light/Heavy/Versatile multipliers come from `tables::Weight::crit_combo().0`.
 fn charge_crit_factor(fighter: &super::state::Fighter, hold_secs: f32) -> f32 {
-    if hold_secs < CRITICAL_HOLD_SECS {
+    if hold_secs < critical_hold_secs(fighter) {
         return 1.0;
     }
     // Full charge: pick multiplier by weapon class.
@@ -449,8 +477,8 @@ pub fn on_c2s_input(
     // The op46 frame signals a HOLD (button-DOWN, `_held=1`) or a COMMIT (button-UP,
     // `_held=0`). On DOWN we record the server timestamp; on UP we compute the
     // server-measured hold duration and apply the held-charge crit multiplier (bug 4):
-    //   - hold ≥ CRITICAL_HOLD_SECS → full charge → swing_factor = CRIT_FACTOR_* by weapon class
-    //   - hold < CRITICAL_HOLD_SECS → partial / uncharged → swing_factor = 1.0
+    //   - hold ≥ CRIT_HOLD_HEAVY_SECS → full charge → swing_factor = CRIT_FACTOR_* by weapon class
+    //   - hold < CRIT_HOLD_HEAVY_SECS → partial / uncharged → swing_factor = 1.0
     //
     // [arena-charge-decode.md §2-§5; decode-proven: _held bit0 of user_data[11]]
     if is_op46(user_data) {
@@ -493,13 +521,13 @@ pub fn on_c2s_input(
                 let is_crit = swing_factor > 1.0;
                 if is_crit {
                     info!(
-                        "combat: slot {sender} op46 UP — hold {hold_secs:.3}s ≥ {CRITICAL_HOLD_SECS}s threshold \
+                        "combat: slot {sender} op46 UP — hold {hold_secs:.3}s ≥ the weapon threshold threshold \
                          → CRIT ×{swing_factor:.3} (weapon {:?})",
                         combat.fighters[sender].loadout.weapon.weight,
                     );
                 } else {
                     debug!(
-                        "combat: slot {sender} op46 UP — hold {hold_secs:.3}s < {CRITICAL_HOLD_SECS}s \
+                        "combat: slot {sender} op46 UP — hold {hold_secs:.3}s < the weapon threshold \
                          → normal swing ×1.0",
                     );
                 }
@@ -798,7 +826,7 @@ pub fn on_c2s_input(
 /// `swing_factor` is the held-charge crit multiplier:
 ///   - `1.0` for a normal (partial / uncharged) swing via carrier-0x36 or bot swings.
 ///   - `CRIT_FACTOR_*` for a full-charge crit dispatched from the op46 (0x2e) path
-///     when the server-measured hold ≥ `CRITICAL_HOLD_SECS` (bug 4 fix).
+///     when the server-measured hold ≥ `CRIT_HOLD_HEAVY_SECS` (bug 4 fix).
 fn resolve_swing_with_side(
     combat: &mut MatchCombat,
     sender: usize,
@@ -853,22 +881,74 @@ fn resolve_swing_with_side(
     // before damage so the wind-up precedes the hit on the wire, as in retail.
     begin_swing_animation(combat, sender, now);
 
-    let attacker_loadout = combat.fighters[sender].loadout.clone();
-    let resolved = RetailDamageModel.resolve_attack(
-        &attacker_loadout,
-        &combat.fighters[target_slot],
-        DamageSource::Attack,
-        next_side,
+    // The hit lands with the FollowThrough beat, not now (tracker #21).
+    //
+    // The animation already used retail's measured 50 ms; the damage did not, so the
+    // wire said "hit at +50 ms" while the server applied it at 0. Scheduling it here
+    // makes the two agree, and — the actual point — means the defender's guard is
+    // read at IMPACT rather than at commit, so a block raised during the swing
+    // counts. That is the window Taheen was reporting the absence of.
+    //
+    // Reuses FOLLOW_THROUGH_DELAY rather than adding a second constant: there is one
+    // moment of impact and it should have one name.
+    combat.pending_hits.push(PendingHit {
+        sender,
+        target: target_slot,
+        side: next_side,
         swing_factor,
         combo_count,
-        now,
+        due: now + FOLLOW_THROUGH_DELAY,
+    });
+    debug!(
+        "combat: slot {sender} swing COMMITTED — lands in {FOLLOW_THROUGH_DELAY:?}"
     );
-    // A connected OPTIMAL block on the target RESETS the attacker's combo (§4.2: a block
-    // breaks the chain — the next swing starts fresh at ×1.0).
-    if resolved.flags & super::damage::flags::WAS_OPTIMAL_BLOCKING != 0 {
-        combat.fighters[sender].reset_combo();
+    Vec::new()
+}
+
+/// Apply every committed swing whose FollowThrough beat has arrived.
+///
+/// The defender's guard is sampled HERE, by `resolve_attack` reading the target's
+/// CURRENT state — which is what lets a guard raised during the windup block.
+fn land_due_hits(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8>)> {
+    if combat.pending_hits.is_empty() {
+        return Vec::new();
     }
-    emit_damage(combat, sender, target_slot, &resolved, now)
+    let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut combat.pending_hits)
+        .into_iter()
+        .partition(|h| now >= h.due);
+    combat.pending_hits = waiting;
+
+    let mut out = Vec::new();
+    for h in due {
+        if h.sender >= combat.fighters.len() || h.target >= combat.fighters.len() {
+            continue;
+        }
+        // A round can end while a swing is in the air; landing it afterwards would
+        // deal damage into the next round.
+        if !matches!(combat.phase, FlowState::StateTimeout) {
+            continue;
+        }
+        if combat.fighters[h.target].is_dead() || combat.fighters[h.sender].is_dead() {
+            continue;
+        }
+        let attacker_loadout = combat.fighters[h.sender].loadout.clone();
+        let resolved = RetailDamageModel.resolve_attack(
+            &attacker_loadout,
+            &combat.fighters[h.target],
+            DamageSource::Attack,
+            h.side,
+            h.swing_factor,
+            h.combo_count,
+            now,
+        );
+        // A connected OPTIMAL block on the target RESETS the attacker's combo (§4.2: a
+        // block breaks the chain — the next swing starts fresh at ×1.0).
+        if resolved.flags & super::damage::flags::WAS_OPTIMAL_BLOCKING != 0 {
+            combat.fighters[h.sender].reset_combo();
+        }
+        out.extend(emit_damage(combat, h.sender, h.target, &resolved, now));
+    }
+    out
 }
 
 /// Swing with the server-synthesised side (no decoded client geometry).
@@ -1910,7 +1990,7 @@ const BOT_CHARGE_WINDUP: Duration = Duration::from_millis(350);
 /// (43). **Capture-pinned**: the measured 52→43 gaps in retail are 49, 49, 49, 53 and
 /// 65 ms, and the 43 frame's own `_timeInPreviousState` is 0.050 — the message states
 /// its own delay, and the two agree.
-const FOLLOW_THROUGH_DELAY: Duration = Duration::from_millis(50);
+pub(super) const FOLLOW_THROUGH_DELAY: Duration = Duration::from_millis(50);
 
 /// Delay from `PlayerFollowThroughStateChange` (43) to `PlayerRecoveryStateChange`
 /// (44) — one 60 Hz frame. Measured retail gaps: 16, 17, 17, 20, 21 ms, against a
@@ -2073,6 +2153,15 @@ pub fn on_tick(combat: &mut MatchCombat, now: Instant, debug_hold: bool) -> Vec<
     }
     let mut out = Vec::new();
 
+    // Land any swings whose FollowThrough beat has arrived, BEFORE the DoT ticks and
+    // the bot's turn, so a swing thrown last tick resolves in the order it would have
+    // if it had landed instantly (tracker #21).
+    out.extend(land_due_hits(combat, now));
+    if matches!(combat.phase, FlowState::RoundEnd | FlowState::NextState) {
+        // A landing blow just ended the round.
+        return out;
+    }
+
     // DoT ticks — one tick per second per active condition instance, independent of
     // whether a bot or player is the source. Runs BEFORE bot swings so a DoT killing
     // blow is processed before the bot's turn. [§Mechanic-2]
@@ -2144,6 +2233,28 @@ pub fn on_tick(combat: &mut MatchCombat, now: Instant, debug_hold: bool) -> Vec<
 
 #[cfg(test)]
 mod tests {
+
+    /// Advance past the FollowThrough beat so a committed swing lands.
+    ///
+    /// Tracker #21 moved the moment of impact to match the animation. These tests
+    /// were updated to ADVANCE A CLOCK, not to relax assertions — every damage
+    /// number below is unchanged.
+    fn land(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8>)> {
+        super::land_due_hits(combat, now + super::FOLLOW_THROUGH_DELAY + Duration::from_millis(1))
+    }
+
+    /// Commit a swing and land it.
+    fn swing_and_land(
+        combat: &mut MatchCombat,
+        sender: usize,
+        target: usize,
+        factor: f32,
+        now: Instant,
+    ) -> Vec<(usize, Vec<u8>)> {
+        let mut out = super::resolve_swing(combat, sender, target, factor, now);
+        out.extend(land(combat, now));
+        out
+    }
     use super::*;
     use super::super::messages::{self, frame_for_test};
     use super::super::state::{EquippedAbility, AbilityTag, Fighter, FlowState, MatchCombat, DamageType};
@@ -2226,7 +2337,8 @@ mod tests {
         combat.fighters[0].stamina = 0; // completely empty
 
         let ability_frame = make_ability_frame(120, qs_uuid);
-        let out = on_c2s_input(&mut combat, 0, &ability_frame, now);
+        let mut out = on_c2s_input(&mut combat, 0, &ability_frame, now);
+        out.extend(land(&mut combat, now));
 
         assert!(
             out.is_empty(),
@@ -2258,7 +2370,8 @@ mod tests {
         assert!(stam_before >= 150, "fighter must have ≥ 150 stamina for this test");
 
         let ability_frame = make_ability_frame(120, qs_uuid);
-        let out = on_c2s_input(&mut combat, 0, &ability_frame, now);
+        let mut out = on_c2s_input(&mut combat, 0, &ability_frame, now);
+        out.extend(land(&mut combat, now));
 
         // Stamina must be deducted by the R1 cost (150).
         let stam_after = combat.fighters[0].stamina;
@@ -2481,7 +2594,7 @@ mod tests {
         combat
     }
 
-    /// Op46 UP after a FULL-CHARGE hold (≥ CRITICAL_HOLD_SECS) → crit ×1.325 on a Light weapon.
+    /// Op46 UP after a FULL-CHARGE hold (≥ CRIT_HOLD_HEAVY_SECS) → crit ×1.325 on a Light weapon.
     /// Damage must be GREATER than an uncharged swing (×1.0) on the same fighter.
     /// Ratio must be ≈×1.325 (within 1% — integer rounding tolerance on an exact formula).
     #[test]
@@ -2490,13 +2603,14 @@ mod tests {
         // No-enchant combat so the physical damage ratio is clean (not diluted by fixed enchant).
         let mut combat = make_live_combat_no_enchant(now, super::super::tables::Weight::Light);
 
-        // Simulate a full-charge hold: press at t=0, release at t = CRITICAL_HOLD_SECS + 0.5s.
+        // Simulate a full-charge hold: press at t=0, release at t = CRIT_HOLD_HEAVY_SECS + 0.5s.
         let press_time = now;
         combat.fighters[0].charge_press_at = Some(press_time);
-        let release_time = press_time + Duration::from_secs_f32(CRITICAL_HOLD_SECS + 0.5);
+        let release_time = press_time + Duration::from_secs_f32(CRIT_HOLD_HEAVY_SECS + 0.5);
 
         let up_frame = make_op46_frame(0x1234_5678, false);
-        let out = on_c2s_input(&mut combat, 0, &up_frame, release_time);
+        let mut out = on_c2s_input(&mut combat, 0, &up_frame, release_time);
+        out.extend(land(&mut combat, release_time));
 
         // Must emit ReceiveDamage frames (not empty).
         assert!(!out.is_empty(), "full-charge op46 UP must emit damage frames");
@@ -2511,7 +2625,7 @@ mod tests {
         // uncharged swing resolved directly via resolve_swing(×1.0).
         // The crit (×1.325 Light) must produce strictly MORE damage than ×1.0.
         let mut uncharged_combat = make_live_combat_no_enchant(now, super::super::tables::Weight::Light);
-        let _uncharged_out = resolve_swing(&mut uncharged_combat, 0, 1, 1.0, now);
+        let _uncharged_out = swing_and_land(&mut uncharged_combat, 0, 1, 1.0, now);
 
         // The charged combat emitted frames → the target (slot 1) received some HP reduction.
         let crit_hp_after = combat.fighters[1].health;
@@ -2543,16 +2657,17 @@ mod tests {
         let mut combat = make_live_combat_no_enchant(now, super::super::tables::Weight::Heavy);
 
         combat.fighters[0].charge_press_at =
-            Some(now - Duration::from_secs_f32(CRITICAL_HOLD_SECS + 0.3));
+            Some(now - Duration::from_secs_f32(CRIT_HOLD_HEAVY_SECS + 0.3));
 
         let up_frame = make_op46_frame(0x1234_5678, false);
-        let out = on_c2s_input(&mut combat, 0, &up_frame, now);
+        let mut out = on_c2s_input(&mut combat, 0, &up_frame, now);
+        out.extend(land(&mut combat, now));
 
         assert!(!out.is_empty(), "full-charge Heavy op46 UP must emit damage");
 
         // Compare against uncharged heavy.
         let mut uncharged = make_live_combat_no_enchant(now, super::super::tables::Weight::Heavy);
-        let _ = resolve_swing(&mut uncharged, 0, 1, 1.0, now);
+        let _ = swing_and_land(&mut uncharged, 0, 1, 1.0, now);
 
         let crit_dealt = combat.fighters[1].max_health.saturating_sub(combat.fighters[1].health);
         let norm_dealt = uncharged.fighters[1].max_health.saturating_sub(uncharged.fighters[1].health);
@@ -2564,7 +2679,36 @@ mod tests {
         );
     }
 
-    /// Op46 UP after a SHORT hold (< CRITICAL_HOLD_SECS) → normal swing ×1.0 (no crit).
+    /// A hold of the length players actually use must be able to CRIT.
+    ///
+    /// The old flat threshold was 1.2 s against a measured MAXIMUM hold of 1.73 s and
+    /// a median of 0.317 s, so a crit was very nearly unreachable. This fails if the
+    /// threshold is ever put back above what a human actually holds.
+    #[test]
+    fn a_typical_player_hold_can_crit() {
+        const MEASURED_MEDIAN_HOLD: f32 = 0.3167;
+        for (weight, name) in [
+            (super::super::tables::Weight::Light, "Light"),
+            (super::super::tables::Weight::Versatile, "Versatile"),
+            (super::super::tables::Weight::Heavy, "Heavy"),
+        ] {
+            let now = Instant::now();
+            let combat = make_live_combat_no_enchant(now, weight);
+            let factor = charge_crit_factor(&combat.fighters[0], MEASURED_MEDIAN_HOLD);
+            assert!(
+                factor > 1.0,
+                "{name}: a median-length hold ({MEASURED_MEDIAN_HOLD}s) must crit, got x{factor}"
+            );
+            let below = critical_hold_secs(&combat.fighters[0]) * 0.5;
+            assert_eq!(
+                charge_crit_factor(&combat.fighters[0], below),
+                1.0,
+                "{name}: a hold below the backswing must NOT crit"
+            );
+        }
+    }
+
+    /// Op46 UP after a SHORT hold (< CRIT_HOLD_HEAVY_SECS) → normal swing ×1.0 (no crit).
     /// Damage must equal an uncharged swing (no crit boost applied).
     #[test]
     fn op46_short_hold_partial_charge_no_crit() {
@@ -2572,17 +2716,18 @@ mod tests {
         // No-enchant so the comparison is exact (no rounding from fixed enchant contribution).
         let mut combat = make_live_combat_no_enchant(now, super::super::tables::Weight::Light);
 
-        // Press at t=0, release at t = CRITICAL_HOLD_SECS / 2 (definitely partial).
+        // Press at t=0, release at t = CRIT_HOLD_HEAVY_SECS / 2 (definitely partial).
         let press_time = now;
         combat.fighters[0].charge_press_at = Some(press_time);
-        let release_time = press_time + Duration::from_secs_f32(CRITICAL_HOLD_SECS / 2.0);
+        let release_time = press_time + Duration::from_secs_f32(CRIT_HOLD_LIGHT_SECS / 2.0);
 
         let up_frame = make_op46_frame(0x1234_5678, false);
         let _ = on_c2s_input(&mut combat, 0, &up_frame, release_time);
+        let _ = land(&mut combat, release_time);
 
         // Resolve an uncharged swing on a fresh combat at the same `release_time`.
         let mut uncharged = make_live_combat_no_enchant(now, super::super::tables::Weight::Light);
-        let _ = resolve_swing(&mut uncharged, 0, 1, 1.0, release_time);
+        let _ = swing_and_land(&mut uncharged, 0, 1, 1.0, release_time);
 
         let partial_dealt = combat.fighters[1].max_health.saturating_sub(combat.fighters[1].health);
         let normal_dealt = uncharged.fighters[1].max_health.saturating_sub(uncharged.fighters[1].health);
@@ -2590,7 +2735,7 @@ mod tests {
         // Partial charge must be equal to uncharged (×1.0, no crit boost).
         assert_eq!(
             partial_dealt, normal_dealt,
-            "partial hold (< {CRITICAL_HOLD_SECS}s) must NOT crit: partial dealt {partial_dealt}, \
+            "partial hold (below the weapon threshold) must NOT crit: partial dealt {partial_dealt}, \
              uncharged dealt {normal_dealt}"
         );
     }
@@ -2682,19 +2827,19 @@ mod tests {
         let interval = tables::fallback_swing_interval(Weight::Light); // 400 ms
 
         // First swing lands.
-        let out1 = resolve_swing(&mut combat, 0, 1, 1.0, now);
+        let out1 = swing_and_land(&mut combat, 0, 1, 1.0, now);
         assert!(!out1.is_empty(), "first swing lands (emits ReceiveDamage)");
         let hp_after_first = combat.fighters[1].health;
 
         // Second swing HALF an interval later → rejected, no additional damage.
         let too_soon = now + interval / 2;
-        let out2 = resolve_swing(&mut combat, 0, 1, 1.0, too_soon);
+        let out2 = swing_and_land(&mut combat, 0, 1, 1.0, too_soon);
         assert!(out2.is_empty(), "a swing before the weapon cadence elapses is rejected");
         assert_eq!(combat.fighters[1].health, hp_after_first, "rejected swing deals no damage");
 
         // A swing just past the interval lands again.
         let ok_time = now + interval + Duration::from_millis(1);
-        let out3 = resolve_swing(&mut combat, 0, 1, 1.0, ok_time);
+        let out3 = swing_and_land(&mut combat, 0, 1, 1.0, ok_time);
         assert!(!out3.is_empty(), "a swing after the cadence elapses lands");
         assert!(combat.fighters[1].health < hp_after_first, "the cadence-legal swing deals damage");
     }
@@ -2714,7 +2859,7 @@ mod tests {
         for i in 0..n {
             // 20 evenly-spaced inputs across the 1s window (~50 ms apart — spam).
             let t = now + window * i / n;
-            if !resolve_swing(&mut combat, 0, 1, 1.0, t).is_empty() {
+            if !swing_and_land(&mut combat, 0, 1, 1.0, t).is_empty() {
                 landed += 1;
             }
         }
@@ -2737,14 +2882,14 @@ mod tests {
         let mut light = make_live_combat_no_enchant(now, Weight::Light);
         let mut heavy = make_live_combat_no_enchant(now, Weight::Heavy);
         // First swing for both.
-        assert!(!resolve_swing(&mut light, 0, 1, 1.0, now).is_empty());
-        assert!(!resolve_swing(&mut heavy, 0, 1, 1.0, now).is_empty());
+        assert!(!swing_and_land(&mut light, 0, 1, 1.0, now).is_empty());
+        assert!(!swing_and_land(&mut heavy, 0, 1, 1.0, now).is_empty());
 
         // A time past the Light interval but before the Heavy interval.
         let t = now + tables::fallback_swing_interval(Weight::Light) + Duration::from_millis(1);
         assert!(t < now + tables::fallback_swing_interval(Weight::Heavy), "test time is inside the Heavy cadence");
-        assert!(!resolve_swing(&mut light, 0, 1, 1.0, t).is_empty(), "Light can swing again");
-        assert!(resolve_swing(&mut heavy, 0, 1, 1.0, t).is_empty(), "Heavy is still on cadence — rejected");
+        assert!(!swing_and_land(&mut light, 0, 1, 1.0, t).is_empty(), "Light can swing again");
+        assert!(swing_and_land(&mut heavy, 0, 1, 1.0, t).is_empty(), "Heavy is still on cadence — rejected");
     }
 
     /// The spell/ability cooldown gate: a second cast of the SAME ability before its
@@ -2867,6 +3012,28 @@ fn on_consume_consumable(
 
 #[cfg(test)]
 mod phase4_tests {
+
+    /// Advance past the FollowThrough beat so a committed swing lands.
+    ///
+    /// Tracker #21 moved the moment of impact to match the animation. These tests
+    /// were updated to ADVANCE A CLOCK, not to relax assertions — every damage
+    /// number below is unchanged.
+    fn land(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8>)> {
+        super::land_due_hits(combat, now + super::FOLLOW_THROUGH_DELAY + Duration::from_millis(1))
+    }
+
+    /// Commit a swing and land it.
+    fn swing_and_land(
+        combat: &mut MatchCombat,
+        sender: usize,
+        target: usize,
+        factor: f32,
+        now: Instant,
+    ) -> Vec<(usize, Vec<u8>)> {
+        let mut out = super::resolve_swing(combat, sender, target, factor, now);
+        out.extend(land(combat, now));
+        out
+    }
     use super::*;
     use crate::arena::combat::state::Fighter;
 
@@ -3060,8 +3227,16 @@ mod phase4_tests {
         let mut sides = Vec::new();
         for i in 1..=4u32 {
             // Bare unstructured carrier-54 swing — no geometry anywhere.
-            let out = on_c2s_input(&mut combat, 0, &[0x84, 0x36], now + step * i);
-            assert!(!out.is_empty(), "the fallback must still land a swing");
+            let _ = on_c2s_input(&mut combat, 0, &[0x84, 0x36], now + step * i);
+            // Commit no longer emits damage — it queues the hit. Assert on the queue,
+            // which is what "the swing was accepted" now means.
+            assert!(
+                !combat.pending_hits.is_empty(),
+                "the fallback must still commit a swing"
+            );
+            // The side is settled at commit, but land the hit so the combo advances
+            // exactly as it did before the impact moved.
+            land(&mut combat, now + step * i);
             sides.push(combat.fighters[0].last_combo_side);
         }
         assert_eq!(
@@ -3122,6 +3297,7 @@ mod phase4_tests {
         on_c2s_input(&mut honest, 0, &make_pos_frame(0.814, 0.5, 0.0), t);
         on_c2s_input(&mut honest, 0, &make_act_frame(true, 0.0, false), t);
         on_c2s_input(&mut honest, 0, &make_act_frame(false, 0.0, false), t);
+        land(&mut honest, t);
         let honest_dmg = honest.fighters[1].health;
 
         // Cheating: identical timing, but the client CLAIMS a 2.8 s charge.
@@ -3129,6 +3305,7 @@ mod phase4_tests {
         on_c2s_input(&mut liar, 0, &make_pos_frame(0.814, 0.5, 0.0), t);
         on_c2s_input(&mut liar, 0, &make_act_frame(true, 2.817, false), t);
         on_c2s_input(&mut liar, 0, &make_act_frame(false, 2.817, false), t);
+        land(&mut liar, t);
 
         assert_eq!(
             liar.fighters[1].health, honest_dmg,
@@ -3141,8 +3318,9 @@ mod phase4_tests {
         let mut real = live_combat(now);
         on_c2s_input(&mut real, 0, &make_pos_frame(0.814, 0.5, 0.0), t);
         on_c2s_input(&mut real, 0, &make_act_frame(true, 0.0, false), t);
-        let held_to = t + Duration::from_secs_f32(CRITICAL_HOLD_SECS + 0.1);
+        let held_to = t + Duration::from_secs_f32(CRIT_HOLD_HEAVY_SECS + 0.1);
         on_c2s_input(&mut real, 0, &make_act_frame(false, 1.3, false), held_to);
+        land(&mut real, held_to);
         assert!(
             real.fighters[1].health < honest_dmg,
             "a real server-measured full hold must crit for more than an uncharged swing"
@@ -3313,7 +3491,8 @@ mod phase4_tests {
     #[test]
     fn stagger_locks_inputs_for_the_shipped_duration() {
         use super::super::state::BASE_STAGGER_DURATION_SECS;
-        assert!((BASE_STAGGER_DURATION_SECS - 1.5).abs() < 1e-6);
+        // PvP value (PvpDefaultSettings.BASE_STAGGER_DURATION), not the PvE 1.5.
+        assert!((BASE_STAGGER_DURATION_SECS - 2.5).abs() < 1e-6);
         let now = Instant::now();
         let mut f = Fighter::new(0, 564, super::super::loadout::starter(), now);
         f.apply_stagger(now);
@@ -3321,9 +3500,9 @@ mod phase4_tests {
         assert_eq!(f.actor_state(), super::super::state::ActorStateType::Staggered);
         assert!(f.blocking_until.is_none(), "a stagger drops the guard");
         // Still locked just before the duration, recovered just after.
-        assert!(f.is_staggered(now + Duration::from_millis(1400)));
-        assert!(!f.is_staggered(now + Duration::from_millis(1600)));
-        assert!(f.reconcile_stagger(now + Duration::from_millis(1600)));
+        assert!(f.is_staggered(now + Duration::from_millis(2400)));
+        assert!(!f.is_staggered(now + Duration::from_millis(2600)));
+        assert!(f.reconcile_stagger(now + Duration::from_millis(2600)));
         assert_eq!(f.actor_state(), super::super::state::ActorStateType::Idle);
     }
 
