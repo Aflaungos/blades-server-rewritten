@@ -1,6 +1,20 @@
 # Plan: the ability effects the server still ignores
 
-**Status:** §1, §2, §3, §4, §6 IMPLEMENTED. **Only §5 (piercing) remains.**
+**Status: ALL SECTIONS DONE except block piercing (2 of §5's 4 fields).**
+
+§5 turned out far smaller than this plan feared. `armor_piercing_rating` and
+`elem_resist_piercing_rating` were **already consumed** by the damage pipeline —
+subtracted from the defender's armor, and fed into `resistance_rating_against`. Nothing
+ever SET them from an ability, so Skullcrusher's 225.00 and PiercingStrikes' 20.88 did
+nothing. Wiring them needed no pipeline change at all, so the "must be provably
+additive against the s506 differentials" worry never applied — there was nothing to
+thread.
+
+**Still open, and it is the genuinely invasive half:** `block_piercing_percent` (60.00,
+Skullcrusher) and `elemental_block_piercing` (122.40, PiercingStrikes). `block_outcome`
+takes no piercing parameter, so these two DO need the pipeline change the plan
+describes: a piercing argument threaded to the block stage, defaulting to 0.0 at every
+existing call site, with the s506 differentials as the proof it is additive.
 
 The two blocking wire values were recovered from `dump.cs:609793-609832`
 (`StatusEffectType`, 34 members):

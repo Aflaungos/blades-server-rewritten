@@ -1108,7 +1108,28 @@ fn resolve_ability_cast(
         // NO damage field at any rank, so `unwrap_or(0.0)` made both cost a third of
         // the stamina bar and do literally nothing. 87 of 160 casts that day dealt 0.0.
         AbilityTag::Maneuver => {
-            let attacker_loadout = combat.fighters[sender].loadout.clone();
+            let mut attacker_loadout = combat.fighters[sender].loadout.clone();
+            // §5 PIERCING. Both of these ratings are ALREADY consumed by the damage
+            // pipeline — `armor_piercing_rating` is subtracted from the defender's armor
+            // (`damage.rs`, the armor stage) and `elem_resist_piercing_rating` feeds
+            // `resistance_rating_against`. Nothing ever SET them from an ability, so
+            // Skullcrusher's 225.00 armor pierce and PiercingStrikes' 20.88 elemental
+            // pierce did nothing at all.
+            //
+            // Applied to a CLONE for this one cast: no persistent state on the fighter,
+            // so a maneuver cannot leak its piercing into the next auto-attack.
+            //
+            // These are FLAT RATINGS despite `armor_piercing_percent`'s name — the
+            // shipped values are 225.00 and 60.00, and a percentage reading would make
+            // Skullcrusher pierce 22,500% of armor.
+            if let Some(r) = super::gamedata::ability_rank_clamped(&ea.ability_uuid, level as u16) {
+                if let Some(ap) = r.armor_piercing_percent() {
+                    attacker_loadout.armor_piercing_rating += ap;
+                }
+                if let Some(erp) = r.elemental_resistance_piercing() {
+                    attacker_loadout.elem_resist_piercing_rating += erp;
+                }
+            }
             // Middle is not part of a Left/Right chain, so it resets the combo — the
             // same rule `resolve_swing_with_side` applies to a Middle swing.
             combat.fighters[sender].reset_combo();
@@ -3863,5 +3884,72 @@ mod shipped_effects_tests {
         assert!(c.fighters[0].negation_pools.is_empty());
         assert!(!c.fighters[1].is_paralyzed());
         assert!(out.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod piercing_tests {
+    use super::*;
+    use super::super::damage::{DamageModel, RetailDamageModel};
+    use super::super::state::{ActiveSide, DamageSource, Fighter};
+    use super::super::loadout;
+
+    fn armored_target(now: Instant) -> Fighter {
+        let mut f = Fighter::new(1, 2, loadout::starter(), now);
+        f.loadout.armor_rating = 300.0;
+        f
+    }
+
+    /// Skullcrusher's 225.00 armor pierce must actually cut through armor. The rating
+    /// was already consumed by the damage pipeline; nothing set it from the ability,
+    /// so the field did nothing.
+    #[test]
+    fn armor_piercing_increases_damage_through_armor() {
+        let now = Instant::now();
+        let m = RetailDamageModel;
+        let mut lo = loadout::starter();
+        lo.weapon.base_by_type = vec![(super::super::state::DamageType::Slashing, 200.0)];
+
+        let plain = m.resolve_attack(&lo, &armored_target(now), DamageSource::Attack,
+                                     ActiveSide::Middle, 1.0, 0, now).total;
+        let mut pierce = lo.clone();
+        pierce.armor_piercing_rating += 225.0;
+        let pierced = m.resolve_attack(&pierce, &armored_target(now), DamageSource::Attack,
+                                       ActiveSide::Middle, 1.0, 0, now).total;
+        assert!(
+            pierced > plain,
+            "225 armor pierce must beat 300 armor: {pierced:.1} should exceed {plain:.1}"
+        );
+    }
+
+    /// ADDITIVE, which is the whole safety argument for touching this pipeline: zero
+    /// piercing must reproduce today's numbers exactly. The s506 differentials are the
+    /// real proof; this pins it directly.
+    #[test]
+    fn zero_piercing_changes_nothing() {
+        let now = Instant::now();
+        let m = RetailDamageModel;
+        let lo = loadout::starter();
+        let base = m.resolve_attack(&lo, &armored_target(now), DamageSource::Attack,
+                                    ActiveSide::Middle, 1.0, 0, now).total;
+        let mut zero = lo.clone();
+        zero.armor_piercing_rating += 0.0;
+        zero.elem_resist_piercing_rating += 0.0;
+        let same = m.resolve_attack(&zero, &armored_target(now), DamageSource::Attack,
+                                    ActiveSide::Middle, 1.0, 0, now).total;
+        assert_eq!(base.to_bits(), same.to_bits(), "zero piercing must be bit-identical");
+    }
+
+    /// The piercing lives on a per-cast CLONE, so a maneuver cannot leak it into the
+    /// fighter's later auto-attacks.
+    #[test]
+    fn piercing_does_not_persist_on_the_fighter() {
+        let now = Instant::now();
+        let f = Fighter::new(0, 1, loadout::starter(), now);
+        let before = f.loadout.armor_piercing_rating;
+        let mut cast = f.loadout.clone();
+        cast.armor_piercing_rating += 225.0;
+        assert_eq!(f.loadout.armor_piercing_rating, before, "the fighter is untouched");
+        assert!(cast.armor_piercing_rating > before, "only the cast's clone pierces");
     }
 }
