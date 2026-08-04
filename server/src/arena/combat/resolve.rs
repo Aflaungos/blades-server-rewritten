@@ -1264,6 +1264,7 @@ fn apply_shipped_effects(
                 remaining: cap,
                 expires_at: until_consumed,
                 restoration_factor: 0.0,
+                absorb_fraction: 1.0,
             });
             let obj = combat.fighters[caster].net_object_id;
             info!("combat: slot {caster} dodge pool +{cap:.1} ({ability_uuid})");
@@ -1278,11 +1279,20 @@ fn apply_shipped_effects(
 
     if let Some(shield) = r.shield_health() {
         if shield > 0.0 && caster < viewers {
+            // `_damageAbsorptionPercent` = 0.50 at EVERY rank on all three storm
+            // armors: the shield eats HALF of each hit until its 116-158 pool drains,
+            // not the whole hit. Treating it as a full absorber made it twice as strong
+            // per hit and drained it twice as fast — the gap this plan recorded as
+            // "will not match retail exactly".
+            let absorb = r
+                .get(super::gamedata::AbilityField::DamageAbsorptionPercent)
+                .unwrap_or(1.0);
             combat.fighters[caster].negation_pools.push(NegationPool {
                 source: DamageNegationSource::Ward,
                 remaining: shield,
                 expires_at: until_consumed,
                 restoration_factor: 0.0,
+                absorb_fraction: absorb,
             });
             let obj = combat.fighters[caster].net_object_id;
             info!("combat: slot {caster} storm-armor shield +{shield:.1} ({ability_uuid})");
@@ -1867,6 +1877,7 @@ fn apply_ward(
         remaining: ward_health,
         expires_at: ward_expires,
         restoration_factor: 0.0, // Ward: pure negation, no heal-back
+        absorb_fraction: 1.0,    // Ward swallows a hit whole until exhausted
     });
     // Add transient flat physical armor (subtracted from incoming physical as a
     // transient resistance on the caster — `DamageType::Health` is NOT physical;
@@ -1918,6 +1929,7 @@ fn apply_absorb(
         remaining: amount,
         expires_at: now + Duration::from_secs_f32(duration),
         restoration_factor: restoration,
+                absorb_fraction: 1.0,
     });
     let obj = f.net_object_id;
     info!("combat: slot {caster_slot} ABSORB r{rank} applied (pool {amount:.2}, heal ×{restoration}, {duration}s)");

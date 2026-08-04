@@ -740,6 +740,7 @@ mod tests {
             remaining: 10_000.0,
             expires_at: now + Duration::from_secs(5),
             restoration_factor: 1.0,
+                absorb_fraction: 1.0,
         });
         let mut components = vec![(DamageType::Slashing, 200.0), (DamageType::Poison, 137.3), (DamageType::Magicka, 137.3)];
         let res = tgt.apply_negation_pools(&mut components);
