@@ -120,6 +120,13 @@ mod tests {
         assert!(!sd.global_shop_grants.is_empty(), "global_shop_grants.json");
         assert!(!sd.challenge_templates.is_empty(), "challenges.json");
         assert!(!sd.daily_rewards.is_empty(), "daily_rewards.json");
+        // Retail's daily reward is weekday-keyed (Tuesday is always Clay), so the
+        // committed pool must claim all seven days exactly once. Without this the
+        // pool silently falls back to position rotation and every reward lands on
+        // the wrong day — which is what it did before the weekday field existed.
+        let mut days: Vec<u8> = sd.daily_rewards.iter().filter_map(|d| d.weekday).collect();
+        days.sort_unstable();
+        assert_eq!(days, (0u8..7).collect::<Vec<_>>(), "daily_rewards.json weekdays");
         assert!(!sd.chest_loots.is_empty(), "chest_loots.json (Item.properties default)");
         assert!(!sd.game_events.is_empty(), "game_events.json");
         assert!(!sd.salvage_recipes.is_empty(), "salvage_recipes.json");
