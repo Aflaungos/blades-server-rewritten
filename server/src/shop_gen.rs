@@ -25,6 +25,7 @@
 
 use std::collections::HashMap;
 
+use blades_lib::features::merchant::MerchantGoldBand;
 use blades_lib::static_data::ShopBundleRef;
 use serde::Deserialize;
 use uuid::Uuid;
@@ -45,9 +46,17 @@ pub struct BuildingGeneration {
     #[serde(default, rename = "itemPool")]
     pub item_pool: Vec<PoolEntry>,
     /// Per-level generation parameters, keyed by the level number as a string
-    /// (`"1"`..`"9"`, matching the JSON object keys).
+    /// (`"0"`..`"9"`, matching the JSON object keys).
     #[serde(default)]
     pub levels: HashMap<String, LevelParams>,
+    /// The merchant's GOLD BUDGET band per building level — how much it can spend
+    /// buying the player's items during one 10-hour window. Measured from retail
+    /// `catalog.wallet`; per-cell provenance (MEASURED / INTERPOLATED / AUTHORED,
+    /// plus observation counts) sits next to the numbers in `shop_stock.json`.
+    /// Absent → the merchant has no budget and pays nothing, which is exactly the
+    /// behaviour tracker #30 reported.
+    #[serde(default, rename = "merchantGold")]
+    pub merchant_gold: HashMap<String, MerchantGoldBand>,
 }
 
 /// One weighted bundle in a shop's draw pool.
@@ -116,6 +125,16 @@ impl ShopStockConfig {
         self.level_params(type_id, level)
             .map(|p| p.refresh_seconds)
             .filter(|s| *s > 0)
+    }
+
+    /// The merchant's gold band for a `(buildingTypeId, level)`. `None` when the
+    /// config does not cover it — the caller then serves a merchant with no
+    /// budget, and says so rather than inventing a number.
+    pub fn merchant_gold(&self, type_id: &Uuid, level: u64) -> Option<&MerchantGoldBand> {
+        self.generation
+            .get(type_id)?
+            .merchant_gold
+            .get(&level.to_string())
     }
 }
 
@@ -264,7 +283,34 @@ mod tests {
         ] {
             let b = cfg.generation.get(&ty(s)).expect("building present");
             assert!(!b.item_pool.is_empty(), "{s} pool non-empty");
-            assert_eq!(b.levels.len(), 9, "{s} has levels 1..9");
+            // Levels 0..9 — retail served level-0 vendors too, measured for all
+            // four shop types, so the config covers 10 levels not 9.
+            assert_eq!(b.levels.len(), 10, "{s} has levels 0..9");
+            // Every level must carry the merchant's gold band, or that vendor pays
+            // nothing for the player's items — the tracker #30 defect.
+            assert_eq!(b.merchant_gold.len(), 10, "{s} has merchantGold for 0..9");
+            for lvl in 0..=9u64 {
+                let band = b
+                    .merchant_gold
+                    .get(&lvl.to_string())
+                    .unwrap_or_else(|| panic!("{s} level {lvl} has no merchantGold"));
+                assert!(band.base_gold > 0, "{s} level {lvl} merchant gold is 0");
+                assert!(
+                    band.band_min > 0 && band.band_max >= band.band_min,
+                    "{s} level {lvl} has a nonsense gold band"
+                );
+            }
+            // The budget must grow with the shop level — a level-9 vendor holding
+            // less than a level-0 one would be a bad interpolation.
+            let mut prev = 0u64;
+            for lvl in 0..=9u64 {
+                let base = b.merchant_gold[&lvl.to_string()].base_gold;
+                assert!(
+                    base > prev,
+                    "{s} merchant gold is not increasing at level {lvl}: {base} <= {prev}"
+                );
+                prev = base;
+            }
         }
     }
 
@@ -404,7 +450,14 @@ mod tests {
             LevelParams { max_items: 2, tier_cap: 1, refresh_seconds: 3600 },
         );
         let mut generation = HashMap::new();
-        generation.insert(type_id, BuildingGeneration { item_pool: pool, levels });
+        generation.insert(
+            type_id,
+            BuildingGeneration {
+                item_pool: pool,
+                levels,
+                merchant_gold: HashMap::new(),
+            },
+        );
         let cfg = ShopStockConfig { generation };
 
         let out = generate_catalog(&cfg, &type_id, 1, &Uuid::new_v4(), 0);
