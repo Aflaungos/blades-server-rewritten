@@ -209,18 +209,56 @@ impl PrePvpState {
 /// ```
 /// Round 0 SKIPS 8/9/10 (it goes 5→6→7→11→12→13, see [`MATCH_STATE_ROUND0_PROGRESSION`]);
 /// the between-rounds walk ADDS the loadout re-choice 8→9→10 in front of the shared
-/// 11→12→13 tail. The holds mirror the round-0 cadence for the shared states (11:+3s,
-/// 12:+12s, 13:+5s) and use the captured PostRound→ChooseLoadout gap (~3s) for 8 and a
-/// short stagger for the 9/10 sync acks; the timeouts reuse the round-0 propId6 values.
-/// At the final `InRound`(13) the engine resets both fighters to full HP and re-enters
-/// `StateTimeout` (the live round), bumping `combat.round`.
+/// 11→12→13 tail.
+///
+/// ## The durations below are DECODED, not mirrored (fixed 2026-08-17, report #24)
+///
+/// Every hold and every timeout in this table used to be a guess: the shared-tail holds
+/// were copied from the round-0 cadence and the timeouts were "reuse the round-0 propId6
+/// values". Byte-decoding s506's own between-rounds op55 stream (obj 123, propId5 state +
+/// propId6 stateTimeoutSeconds, with the inter-frame gaps as the holds) shows that almost
+/// none of them matched retail. The worst by far:
+///
+/// ```text
+///                    hold_before        propId6 timeout
+///                    ours    retail     ours    retail
+///   ChooseLoadout      3s      3s       30.0    20.0
+///   Awaiting           1s     20s       10.0    10.0     ← ChooseLoadout was held 1s, not 20s
+///   Synchronizing      1s      1s       10.0    15.0
+///   OpponentShowcase   1s      3s       12.0     5.0
+///   PreRound          12s      5s        4.0     4.0
+///   InRound            5s      4s      120.0   120.0
+/// ```
+///
+/// Because `hold_before` is the wait BEFORE emitting a state, the *dwell* in
+/// `ChooseLoadout` is the NEXT row's hold — so a 1 s `Awaiting` hold meant the
+/// between-rounds loadout screen existed for exactly one second while we simultaneously
+/// told the client it had 30 s to use it. Report #24 described the same event from both
+/// ends: "my character replayed the loadout selection just before the fight" (the screen
+/// did appear) and "there was no chance for anything between rounds" (it was gone before
+/// he could touch it). Prod log from that match, three consecutive seconds:
+///
+/// ```text
+///   17:19:47  round-ending death → LOOPING
+///   17:19:50  → ChooseLoadout(8)
+///   17:19:51  → AwaitingClientBackendSynchronization(9)
+/// ```
+///
+/// A 20 s dwell is a long gap to sit through when a player is ready early, which is
+/// exactly what retail's c2s `SkipCurrentState`(57) is for — see
+/// [`MatchInstance::on_c2s_resolved`].
+///
+/// At the final `InRound`(13) the engine resets both fighters to full HP, re-broadcasts
+/// their op65 stat words (so the HUD bars open the round full rather than showing the
+/// dead fighter's last frame) and re-enters `StateTimeout` (the live round), bumping
+/// `combat.round`.
 const MATCH_STATE_INTERROUND_PROGRESSION: &[(MatchState, Duration, f32)] = &[
-    (MatchState::ChooseLoadout, Duration::from_secs(3), 30.0),
-    (MatchState::AwaitingClientBackendSynchronization, Duration::from_secs(1), 10.0),
-    (MatchState::SynchronizingLoadout, Duration::from_secs(1), 10.0),
-    (MatchState::OpponentShowcase, Duration::from_secs(1), 12.0),
-    (MatchState::PreRound, Duration::from_secs(12), 4.0),
-    (MatchState::InRound, Duration::from_secs(5), 120.0),
+    (MatchState::ChooseLoadout, Duration::from_secs(3), 20.0),
+    (MatchState::AwaitingClientBackendSynchronization, Duration::from_secs(20), 10.0),
+    (MatchState::SynchronizingLoadout, Duration::from_secs(1), 15.0),
+    (MatchState::OpponentShowcase, Duration::from_secs(3), 5.0),
+    (MatchState::PreRound, Duration::from_secs(5), 4.0),
+    (MatchState::InRound, Duration::from_secs(4), 120.0),
 ];
 
 pub struct MatchInstance {
@@ -243,6 +281,23 @@ pub struct MatchInstance {
     /// `StateTimeout` (the live combat round). Reset implicitly per match (one
     /// `MatchInstance` per match).
     setup_step: usize,
+    /// A c2s `SkipCurrentState`(57) — the client's **"Ready"** press — has been
+    /// received and not yet consumed. Set by [`Self::on_c2s_resolved`], consumed by
+    /// the next `on_tick` in whichever hold-driven MatchState walk is running: the
+    /// pending state is emitted immediately instead of waiting out its `hold_before`.
+    ///
+    /// Only the two LOADOUT-CHOICE walks honour it — the round-0 setup walk
+    /// ([`MATCH_STATE_ROUND0_PROGRESSION`]) and the between-rounds walk
+    /// ([`MATCH_STATE_INTERROUND_PROGRESSION`]). The match-end walk deliberately does
+    /// NOT: the victory card is on a timer and nothing in the captures shows a player
+    /// skipping it.
+    ///
+    /// Before this existed, op57 was dropped on the floor — the only mention of
+    /// `SkipCurrentState` anywhere in the tree was a doc-comment listing it as a
+    /// non-combat GameMessageId. Report #24's author pressed Ready during the
+    /// between-rounds window (session 835, gmid 57 at 17:19:32) and the server did
+    /// nothing with it.
+    skip_state_requested: bool,
 }
 
 impl MatchInstance {
@@ -281,6 +336,7 @@ impl MatchInstance {
             // env var is unset — i.e. in every test and all normal operation.
             debug_hold: super::debug_hold_enabled(),
             setup_step: 0,
+            skip_state_requested: false,
         }
     }
 
@@ -408,6 +464,66 @@ impl MatchInstance {
         // mis-resolved as a combat swing. [docs/arena-journey-log.md §7]
         if messages::is_loadout_backend_synchronized(user_data) {
             debug!("combat c2s: slot {sender} op61 LoadoutClientBackendSynchronized — handshake, no reply");
+            return out;
+        }
+
+        // op57 SkipCurrentState (c2s) — the "READY" press. The client is done with the
+        // state it is parked in (the loadout screen, the opponent showcase) and wants the
+        // match to move on rather than sit out the remaining hold.
+        //
+        // This used to be dropped silently. Nothing in the tree handled GameMessageId 57;
+        // it was only ever *listed* as non-combat, so it fell through to `resolve`, got
+        // classified as handshake, and returned nothing. With the between-rounds
+        // `ChooseLoadout` dwell now a retail-faithful 20 s (see
+        // [`MATCH_STATE_INTERROUND_PROGRESSION`]) that silence is the difference between a
+        // responsive round transition and half a minute of staring at a screen you have
+        // already finished with.
+        //
+        // Latch it; the next `on_tick` emits the pending MatchState immediately. Latching
+        // rather than acting here keeps ONE emit path per state (the walk branches in
+        // `on_tick`), so a skipped state is byte-identical to a timed-out one — the client
+        // cannot tell which fired it, and no state can be emitted twice.
+        if messages::is_skip_current_state(user_data) {
+            if matches!(
+                self.combat.phase,
+                FlowState::BackendMatchCreated | FlowState::NextState
+            ) {
+                info!(
+                    "combat c2s: slot {sender} op57 SkipCurrentState (Ready) in {} — advancing the pending MatchState on the next tick",
+                    self.combat.phase_name(),
+                );
+                self.skip_state_requested = true;
+            } else {
+                debug!(
+                    "combat c2s: slot {sender} op57 SkipCurrentState ignored in {} (no hold-driven walk running)",
+                    self.combat.phase_name(),
+                );
+            }
+            return out;
+        }
+
+        // op36 PlayerLoadoutReady (c2s) — the client reports that its loadout selection is
+        // committed. During the BETWEEN-ROUNDS walk this is the frame that follows a
+        // loadout change on the `ChooseLoadout` screen, and it used to be dropped: the
+        // opponent's client was never re-sent the op54 PROFILE, so it kept rendering (and
+        // the local HUD kept describing) the gear from round 1. `broadcast_profiles` ran
+        // from exactly one place — the round-start `Spawning` branch — so nothing could
+        // refresh it mid-match.
+        //
+        // Re-broadcast the sender's profile to its opponent so the opponent actor is
+        // rebuilt for the new round. **This propagates whatever loadout the SERVER holds**;
+        // it does not adopt gear the client declares. Making a between-round change alter
+        // the fighter's actual combat numbers needs a server-authoritative re-read of the
+        // character row, which the engine has no handle for — see the PR body.
+        if messages::is_player_loadout_ready(user_data)
+            && matches!(self.combat.phase, FlowState::NextState)
+        {
+            let before = out.len();
+            self.broadcast_profile_of(&mut out, sender);
+            info!(
+                "combat c2s: slot {sender} op36 PlayerLoadoutReady between rounds → {} op54 PROFILE re-broadcast",
+                out.len() - before,
+            );
             return out;
         }
 
@@ -674,7 +790,7 @@ impl MatchInstance {
                 if let Some(&(state, hold_before, timeout)) =
                     MATCH_STATE_ROUND0_PROGRESSION.get(self.setup_step)
                 {
-                    if now.duration_since(self.combat.phase_entered) >= hold_before {
+                    if self.take_skip_request(now.duration_since(self.combat.phase_entered) >= hold_before) {
                         info!(
                             "combat FSM: MatchState → {:?}({}) [round-0 setup step {}/{}]",
                             state,
@@ -766,7 +882,7 @@ impl MatchInstance {
                 if let Some(&(state, hold_before, timeout)) =
                     MATCH_STATE_INTERROUND_PROGRESSION.get(self.combat.interround_step)
                 {
-                    if now.duration_since(self.combat.phase_entered) >= hold_before {
+                    if self.take_skip_request(now.duration_since(self.combat.phase_entered) >= hold_before) {
                         // Bump the round when the LIVE round actually starts — i.e. at
                         // InRound(13), the LAST between-rounds step — not at the first.
                         //
@@ -794,6 +910,36 @@ impl MatchInstance {
                             self.combat.round,
                         );
                         self.broadcast_match_state(&mut out, state, timeout);
+                        // Every inter-round op55 is PAIRED with an op79
+                        // `MatchStateChangeRequest` in retail — 866 frames across 44
+                        // captured sessions, 1:1, never one without the other. We sent only
+                        // the 0x35 half: `broadcast_flow` was reachable with exactly two
+                        // triggers, `BackendMatchCreated` and `StateTimeout`, so
+                        // `FlowState::NextState` had a `wire_name()` ("NextState") that no
+                        // code path could ever put on the wire.
+                        //
+                        // The op79 trigger STRING is what drives the client's own PvpState
+                        // machine (the 9→10 promotion is documented as trigger-driven, see
+                        // `messages::match_state_change_request`); the op55 only updates the
+                        // replicated Match object. Sending one without the other leaves the
+                        // client's state machine to infer the transition.
+                        //
+                        // At the InRound step the pairing is satisfied by the op79
+                        // "StateTimeout" emitted below (the live round it hands over to), so
+                        // it is skipped here rather than doubled.
+                        if !is_inround {
+                            self.broadcast_flow(&mut out, FlowState::NextState);
+                        }
+                        // Entering SynchronizingLoadout(10) is retail's loadout-sync beat —
+                        // the between-rounds analogue of the round-start profile burst that
+                        // follows InitialPlayerSetup(4). Re-send the op54 PROFILEs here so
+                        // each client rebuilds its opponent actor for the new round instead
+                        // of carrying round 1's body forward. Before this,
+                        // `broadcast_profiles` had exactly one caller (the `Spawning`
+                        // branch), so no profile could ever be refreshed mid-match.
+                        if matches!(state, MatchState::SynchronizingLoadout) {
+                            self.broadcast_profiles(&mut out);
+                        }
                         self.combat.interround_step += 1;
                         self.combat.phase_entered = now;
                         // Reaching InRound(13) re-enters the live combat round: reset both
@@ -809,6 +955,12 @@ impl MatchInstance {
                                 "combat FSM: NextState → StateTimeout (round {} live — both fighters reset to full HP, score {:?})",
                                 self.combat.round, self.combat.rounds_won,
                             );
+                            // …and TELL the clients about the reset. `reset_fighters_for_next_round`
+                            // restored both pools and bumped each fighter's stats_seq, but emitted
+                            // nothing, so the HUD bars still showed the end of round 1 — including
+                            // the dead fighter at zero — until the first hit of round 2 happened to
+                            // move them. op65 is the frame that carries the pools.
+                            self.broadcast_current_stats(&mut out);
                             self.broadcast_flow(&mut out, FlowState::StateTimeout);
                         }
                     }
@@ -842,6 +994,25 @@ impl MatchInstance {
         for slot in 0..self.combat.fighters.len() {
             out.push((slot, messages::clock(ticks, ticks)));
         }
+    }
+
+    /// Should the pending MatchState be emitted NOW? `hold_elapsed` is the walk's own
+    /// timer verdict; a latched c2s `SkipCurrentState`(57) forces a yes and is consumed.
+    ///
+    /// Consuming the latch here — at the one place a walk decides to emit — is what keeps
+    /// a Ready press from banking: one op57 advances exactly one state, and an op57 that
+    /// arrives in the same tick the hold expires is not "spent" on a state that was going
+    /// to fire anyway (the latch is only cleared when it was the deciding vote).
+    fn take_skip_request(&mut self, hold_elapsed: bool) -> bool {
+        if hold_elapsed {
+            return true;
+        }
+        if self.skip_state_requested {
+            self.skip_state_requested = false;
+            info!("combat FSM: skipping the remaining hold — a client pressed Ready (op57)");
+            return true;
+        }
+        false
     }
 
     fn broadcast_flow(&self, out: &mut Vec<(usize, Vec<u8>)>, state: FlowState) {
@@ -1195,22 +1366,51 @@ impl MatchInstance {
     /// was never applied → the match sat at "Connecting…", never "Setting up…" (the
     /// 2026-06-17 paired-match stall). [docs/arena-journey-log.md §7]
     fn broadcast_profiles(&self, out: &mut Vec<(usize, Vec<u8>)>) {
+        for actor in 0..self.combat.fighters.len() {
+            self.broadcast_profile_of(out, actor);
+        }
+    }
+
+    /// Send ONE fighter's op54 PROFILE to every OTHER fighter — the per-actor half of
+    /// [`Self::broadcast_profiles`], split out so the between-rounds
+    /// `PlayerLoadoutReady`(op36) path can refresh a single player's profile without
+    /// re-sending both. Same opponent-only rule and same empty-profile skip: a client is
+    /// never sent its own profile, and a fighter with no profile JSON (bot / starter
+    /// loadout) is skipped.
+    fn broadcast_profile_of(&self, out: &mut Vec<(usize, Vec<u8>)>, actor_slot: usize) {
+        let Some(actor) = self.combat.fighters.get(actor_slot) else {
+            return;
+        };
+        if actor.loadout.profile_character_json.is_empty() {
+            return;
+        }
+        let frame = messages::player_profile(
+            actor.player_net_object_id,
+            &actor.loadout.profile_equipped_json,
+            &actor.loadout.profile_character_json,
+        );
         for viewer in 0..self.combat.fighters.len() {
-            for actor in &self.combat.fighters {
-                if actor.slot == viewer {
-                    continue; // never send a client its OWN profile (retail: opponent-only)
-                }
-                if actor.loadout.profile_character_json.is_empty() {
-                    continue;
-                }
-                out.push((
-                    viewer,
-                    messages::player_profile(
-                        actor.player_net_object_id,
-                        &actor.loadout.profile_equipped_json,
-                        &actor.loadout.profile_character_json,
-                    ),
-                ));
+            if viewer == actor_slot {
+                continue; // never send a client its OWN profile (retail: opponent-only)
+            }
+            out.push((viewer, frame.clone()));
+        }
+    }
+
+    /// Broadcast each fighter's CURRENT op65 `PlayerStatsUpdate` (packed
+    /// Health/Stamina/Magicka + seq) to every viewer.
+    ///
+    /// Unlike [`Self::broadcast_stat_updates`] — which sends the hard-coded full-pool
+    /// round-start word — this reads the live `Fighter` pools, so it is safe to call at
+    /// any point in a match. It exists for the between-rounds HP reset: the reset
+    /// restored both fighters to full server-side but told the client nothing, so round 2
+    /// opened with the health bars still showing the last frame of round 1 (one fighter
+    /// at zero). The op65 pair is the only frame that moves those bars.
+    fn broadcast_current_stats(&self, out: &mut Vec<(usize, Vec<u8>)>) {
+        for actor in &self.combat.fighters {
+            let frame = messages::player_stats_update(actor.net_object_id, actor.packed_stats());
+            for viewer in 0..self.combat.fighters.len() {
+                out.push((viewer, frame.clone()));
             }
         }
     }
@@ -1854,6 +2054,400 @@ pub(in crate::arena::combat) mod tests {
             }
         }
         panic!("attacker {attacker} never killed the opponent within 40 swings");
+    }
+
+    // -----------------------------------------------------------------------
+    // Report #24 — the inter-round phase. Helpers shared by the tests below.
+    // -----------------------------------------------------------------------
+
+    /// One recorded s2c frame from a between-rounds walk, with the time it went out.
+    #[derive(Debug, Clone)]
+    enum InterRoundFrame {
+        /// op55 Match net-object update: `(MatchState propId5, stateTimeoutSeconds propId6)`.
+        MatchState(u8, f32),
+        /// op79 `MatchStateChangeRequest`: the trigger STRING.
+        Flow(String),
+        /// op65 `PlayerStatsUpdate`: `(avatar net-object id, health fraction bits)`.
+        Stats(i64, u64),
+        /// op54 PROFILE (GameMessageId 35): the Player net-object id it describes.
+        Profile(i64),
+    }
+
+    /// Classify one s2c frame, if it is one of the four the inter-round tests care about.
+    fn classify_interround(b: &[u8]) -> Option<InterRoundFrame> {
+        if b.len() <= 2 {
+            return None;
+        }
+        let nd = arena_proto::parse_netdata(&b[2..]);
+        match b[1] {
+            0x35 => {
+                let state = nd.int(5)? as u8;
+                let timeout = match nd.props.get(&6) {
+                    Some(NetDataValue::Float(v)) => *v,
+                    _ => return None,
+                };
+                Some(InterRoundFrame::MatchState(state, timeout))
+            }
+            0x36 => match nd.int(3) {
+                Some(79) => Some(InterRoundFrame::Flow(nd.string(4)?.to_string())),
+                Some(65) => {
+                    let packed = match nd.props.get(&4) {
+                        Some(NetDataValue::ULong(v)) => *v,
+                        _ => return None,
+                    };
+                    let hp = (packed >> super::super::state::PackedStats::HEALTH_SHIFT) & 0x3ff;
+                    Some(InterRoundFrame::Stats(nd.int(0)?, hp))
+                }
+                Some(35) => Some(InterRoundFrame::Profile(nd.int(0)?)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// Tick the between-rounds walk at 100 ms until the live round re-opens, recording
+    /// every classified frame as `(viewer, frame, elapsed since the walk started)`.
+    /// A 100 ms step keeps the dwell measurements tight enough to distinguish a 1 s
+    /// window from a 20 s one without argument.
+    fn record_interround(
+        m: &mut MatchInstance,
+        t: Instant,
+    ) -> Vec<(usize, InterRoundFrame, Duration)> {
+        let budget: Duration = MATCH_STATE_INTERROUND_PROGRESSION
+            .iter()
+            .map(|(_, h, _)| *h)
+            .sum::<Duration>()
+            + Duration::from_secs(5);
+        let step = Duration::from_millis(100);
+        let mut log = Vec::new();
+        for i in 1..=(budget.as_millis() / step.as_millis()) as u32 {
+            let elapsed = step * i;
+            for (viewer, b) in m.on_tick(2, t + elapsed) {
+                if let Some(f) = classify_interround(&b) {
+                    log.push((viewer, f, elapsed));
+                }
+            }
+            if m.phase() == FlowState::StateTimeout {
+                return log;
+            }
+        }
+        panic!("between-rounds walk did not re-enter the live round within {budget:?}");
+    }
+
+    /// First time a given `MatchState` was announced (to any viewer), and the
+    /// `stateTimeoutSeconds` it announced.
+    fn first_state(
+        log: &[(usize, InterRoundFrame, Duration)],
+        state: MatchState,
+    ) -> (Duration, f32) {
+        log.iter()
+            .find_map(|(_, f, at)| match f {
+                InterRoundFrame::MatchState(s, to) if *s == state as u8 => Some((*at, *to)),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{state:?} was never announced in the between-rounds walk"))
+    }
+
+    /// A two-fighter match, driven to the live round, whose fighters each carry a
+    /// NON-EMPTY op54 PROFILE — required by anything asserting on profile re-broadcast
+    /// (`broadcast_profile_of` skips fighters with no profile JSON, so the default
+    /// starter-loadout instance would emit nothing and the assertion would be vacuous).
+    fn profiled_live_inst() -> (MatchInstance, Instant) {
+        let now = Instant::now();
+        let mk = |name: &str, uuid: &str| {
+            let mut l = crate::arena::combat::loadout::starter();
+            l.display_name = name.into();
+            l.character_uuid = uuid.into();
+            l.profile_equipped_json = r#"{"equippedItems":{}}"#.to_string();
+            l.profile_character_json = format!(r#"{{"id":"{uuid}","name":"{name}"}}"#);
+            l
+        };
+        let mut m = MatchInstance::new(
+            2,
+            2,
+            vec![
+                mk("Flappety", "38c987fd-c42b-4ea6-b869-c8d4c03055f9"),
+                mk("Blank", "1131a037-716c-49cc-b165-32d8ddc14f49"),
+            ],
+            now,
+        );
+        let live = drive_to_live(&mut m, 2, now);
+        (m, live)
+    }
+
+    /// Build a c2s carrier-0x36 handshake frame with `gmid` at propId 3 on `player_obj`.
+    fn c2s_handshake(player_obj: i32, gmid: u8) -> Vec<u8> {
+        let mut w = arena_proto::NetDataWriter::new();
+        w.int(0, player_obj).byte(1, 55).byte(2, 3).byte(3, gmid);
+        let mut f = messages::frame_for_test(w.finish());
+        f[0] = 0x84; // c2s marker
+        f
+    }
+
+    /// **Report #24, part 1 — the decoded retail between-rounds table.**
+    ///
+    /// Pinned as literals, because the failure mode this guards is not "the walk is
+    /// broken" (it ran fine) but "the numbers are invented". Every one of these twelve
+    /// values used to be a guess mirrored off the round-0 cadence, and ten of them were
+    /// wrong. A test that only drove the state machine passed the whole time.
+    #[test]
+    fn interround_table_is_the_decoded_retail_table() {
+        let want: &[(MatchState, u64, f32)] = &[
+            (MatchState::ChooseLoadout, 3, 20.0),
+            (MatchState::AwaitingClientBackendSynchronization, 20, 10.0),
+            (MatchState::SynchronizingLoadout, 1, 15.0),
+            (MatchState::OpponentShowcase, 3, 5.0),
+            (MatchState::PreRound, 5, 4.0),
+            (MatchState::InRound, 4, 120.0),
+        ];
+        let got: Vec<(MatchState, u64, f32)> = MATCH_STATE_INTERROUND_PROGRESSION
+            .iter()
+            .map(|&(s, h, t)| (s, h.as_secs(), t))
+            .collect();
+        assert_eq!(got.as_slice(), want, "s506-decoded between-rounds (state, hold_secs, timeout)");
+    }
+
+    /// **Report #24, part 1 (behaviour) — the loadout window is really 20 s wide, and
+    /// the timeout we announce matches the window we give.**
+    ///
+    /// The tester's complaint had two halves that were the same event: "my character
+    /// replayed the loadout selection just before the fight" and "there was no chance for
+    /// anything between rounds". We announced a 30 s `ChooseLoadout` timeout and then
+    /// moved on after 1 s — prod log, his match: `→ ChooseLoadout(8)` at 17:19:50,
+    /// `→ AwaitingClientBackendSynchronization(9)` at 17:19:51.
+    ///
+    /// So this asserts the DWELL (state 8 → state 9), not just that state 8 appeared, and
+    /// asserts that the announced timeout is not longer than the dwell — the specific
+    /// incoherence of the old table, which promised the client thirty seconds of a screen
+    /// it was about to take away.
+    #[test]
+    fn between_rounds_loadout_window_is_twenty_seconds_wide() {
+        let (mut m, t0) = live_inst(2);
+        let (_death, t) = swing_until_death(&mut m, 0, t0);
+        assert_eq!(m.phase(), FlowState::NextState);
+
+        let log = record_interround(&mut m, t);
+        let (chose_at, chose_timeout) = first_state(&log, MatchState::ChooseLoadout);
+        let (awaiting_at, _) = first_state(&log, MatchState::AwaitingClientBackendSynchronization);
+        let dwell = awaiting_at - chose_at;
+
+        assert_eq!(chose_timeout, 20.0, "ChooseLoadout announces retail's 20.0 s timeout (was 30.0)");
+        assert!(
+            dwell >= Duration::from_millis(19_500),
+            "the between-rounds loadout screen must stay up ~20s, not flash past: dwell was {dwell:?}"
+        );
+        assert!(
+            dwell <= Duration::from_secs(21),
+            "…and must not overshoot retail's 20s either: dwell was {dwell:?}"
+        );
+        assert!(
+            dwell.as_secs_f32() >= chose_timeout - 1.0,
+            "we must not announce a {chose_timeout}s timeout and then take the screen away \
+             after {dwell:?} — that mismatch IS the reported bug"
+        );
+    }
+
+    /// **Report #24, part 3 — every inter-round op55 is paired 1:1 with an op79.**
+    ///
+    /// Retail pairs them in all 866 captured inter-round frames across 44 sessions. We
+    /// sent only the 0x35 half: `broadcast_flow` had exactly two reachable triggers
+    /// (`BackendMatchCreated`, `StateTimeout`), so `FlowState::NextState` had a wire name
+    /// no code path could emit.
+    #[test]
+    fn every_interround_op55_is_paired_with_an_op79() {
+        let (mut m, t0) = live_inst(2);
+        let (_death, t) = swing_until_death(&mut m, 0, t0);
+        let log = record_interround(&mut m, t);
+
+        for viewer in 0..2 {
+            let op55 = log
+                .iter()
+                .filter(|(v, f, _)| *v == viewer && matches!(f, InterRoundFrame::MatchState(..)))
+                .count();
+            let op79 = log
+                .iter()
+                .filter(|(v, f, _)| *v == viewer && matches!(f, InterRoundFrame::Flow(_)))
+                .count();
+            assert_eq!(
+                op55, MATCH_STATE_INTERROUND_PROGRESSION.len(),
+                "viewer {viewer} gets one op55 per between-rounds state"
+            );
+            assert_eq!(
+                op79, op55,
+                "viewer {viewer}: retail pairs EVERY inter-round op55 with an op79 (got {op55} op55, {op79} op79)"
+            );
+        }
+        // …and the trigger is the "NextState" one that was previously unreachable. The
+        // last pair hands over to the live round, so that one reads "StateTimeout".
+        let triggers: Vec<&str> = log
+            .iter()
+            .filter(|(v, _, _)| *v == 0)
+            .filter_map(|(_, f, _)| match f {
+                InterRoundFrame::Flow(s) => Some(s.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            triggers,
+            vec!["NextState", "NextState", "NextState", "NextState", "NextState", "StateTimeout"],
+            "five op79 \"NextState\" triggers then the live-round handover"
+        );
+    }
+
+    /// **Report #24, part 2 — c2s op57 `SkipCurrentState` (the "Ready" press) advances
+    /// the state instead of vanishing.**
+    ///
+    /// The tester pressed Ready during the between-rounds window (session 835, gmid 57 at
+    /// 17:19:32). Nothing in the tree read GameMessageId 57 — its single occurrence was a
+    /// doc-comment listing it as non-combat — so the press did nothing at all.
+    ///
+    /// The control half matters as much as the test half: the same tick, at the same
+    /// instant, WITHOUT the op57 must emit nothing. Otherwise this would pass on a server
+    /// that ignored op57 and simply had a short hold.
+    #[test]
+    fn op57_skip_current_state_advances_the_pending_state() {
+        let (mut m, t0) = live_inst(2);
+        let (_death, t) = swing_until_death(&mut m, 0, t0);
+        assert_eq!(m.phase(), FlowState::NextState);
+
+        // Walk to ChooseLoadout(8) — 3 s in — then park mid-way through its 20 s dwell.
+        let mut now = t;
+        for _ in 0..40 {
+            now += Duration::from_millis(100);
+            m.on_tick(2, now);
+            if m.match_state_for_test() == MatchState::ChooseLoadout {
+                break;
+            }
+        }
+        assert_eq!(
+            m.match_state_for_test(),
+            MatchState::ChooseLoadout,
+            "the walk reached the loadout screen"
+        );
+        now += Duration::from_secs(5); // 5 s into a 20 s dwell — nowhere near the hold
+
+        // CONTROL: without a Ready press this tick is silent (the hold has 15 s to run).
+        let idle = m.on_tick(2, now);
+        assert!(
+            !idle.iter().any(|(_, b)| matches!(
+                classify_interround(b),
+                Some(InterRoundFrame::MatchState(..))
+            )),
+            "control: mid-dwell, nothing advances on its own — so this test can fail"
+        );
+        assert_eq!(m.match_state_for_test(), MatchState::ChooseLoadout);
+
+        // The Ready press. It is a handshake frame: no s2c of its own, no damage.
+        // (Slot 1 is still at 0 HP here — it lost round 1; the reset lands at InRound —
+        //  so the assertion is that op57 changed nothing, not that anyone is healthy.)
+        let hp_before = (m.fighter_health(0), m.fighter_health(1));
+        let op57 = c2s_handshake(m.combat.fighters[0].player_net_object_id, 57);
+        assert!(m.on_c2s(0, &op57, now).is_empty(), "op57 itself emits nothing");
+        assert_eq!(
+            (m.fighter_health(0), m.fighter_health(1)),
+            hp_before,
+            "op57 is a handshake frame, not a swing — it must not touch either fighter's HP"
+        );
+
+        // …and the very next tick advances the state, mid-hold.
+        now += Duration::from_millis(100);
+        let out = m.on_tick(2, now);
+        let advanced: Vec<u8> = out
+            .iter()
+            .filter_map(|(_, b)| match classify_interround(b) {
+                Some(InterRoundFrame::MatchState(s, _)) => Some(s),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            m.match_state_for_test(),
+            MatchState::AwaitingClientBackendSynchronization,
+            "the Ready press skipped the remaining hold: {advanced:?}"
+        );
+        // One press advances exactly ONE state — it does not bank and unwind the walk.
+        now += Duration::from_millis(100);
+        m.on_tick(2, now);
+        assert_eq!(
+            m.match_state_for_test(),
+            MatchState::AwaitingClientBackendSynchronization,
+            "one op57 = one state; the latch is consumed, not banked"
+        );
+    }
+
+    /// **Report #24, part 4 — round 2 opens with a fresh op65, not round 1's last frame.**
+    ///
+    /// `reset_fighters_for_next_round` restored both pools server-side and bumped each
+    /// `stats_seq`, but emitted nothing. The client's health bars therefore still showed
+    /// the end of round 1 — one fighter flat at zero — until some later hit happened to
+    /// move them.
+    #[test]
+    fn next_round_opens_with_a_full_health_op65_rebroadcast() {
+        let (mut m, t0) = live_inst(2);
+        let (_death, t) = swing_until_death(&mut m, 0, t0);
+        let log = record_interround(&mut m, t);
+
+        let (inround_at, _) = first_state(&log, MatchState::InRound);
+        let full = crate::arena::combat::state::STAT_MAX as u64;
+        for viewer in 0..2 {
+            for slot in 0..2 {
+                let obj = m.combat.fighters[slot].net_object_id as i64;
+                assert!(
+                    log.iter().any(|(v, f, at)| *v == viewer
+                        && *at >= inround_at
+                        && matches!(f, InterRoundFrame::Stats(o, hp) if *o == obj && *hp == full)),
+                    "viewer {viewer} must be told slot {slot} (obj {obj}) is back to FULL health \
+                     when round 2 opens — the HP reset used to be silent"
+                );
+            }
+        }
+    }
+
+    /// **Report #24, part 5 (propagation half) — a between-rounds `PlayerLoadoutReady`
+    /// re-broadcasts the profile, and `SynchronizingLoadout`(10) refreshes both.**
+    ///
+    /// `broadcast_profiles` had exactly ONE caller — the round-start `Spawning` branch —
+    /// so no op54 PROFILE could ever be refreshed mid-match: whatever the opponent's body
+    /// looked like in round 1, it looked like in round 3. op36 was dropped on the floor
+    /// alongside op57.
+    ///
+    /// This covers the PROPAGATION path only. Making a between-round change alter the
+    /// fighter's combat NUMBERS needs a server-authoritative re-read of the character row
+    /// (see the PR body) — deliberately not attempted from client-declared gear.
+    #[test]
+    fn between_rounds_loadout_ready_rebroadcasts_the_opponent_profile() {
+        let (mut m, t) = profiled_live_inst();
+        let (_death, t) = swing_until_death(&mut m, 0, t);
+        assert_eq!(m.phase(), FlowState::NextState);
+
+        // op36 from slot 0 → slot 1 is re-sent slot 0's profile, and slot 0 is NOT sent
+        // its own (retail's opponent-only rule, the one that used to stall "Setting up…").
+        let own_obj = m.combat.fighters[0].player_net_object_id as i64;
+        let out = m.on_c2s(0, &c2s_handshake(m.combat.fighters[0].player_net_object_id, 36), t);
+        let profiles: Vec<(usize, i64)> = out
+            .iter()
+            .filter_map(|(v, b)| match classify_interround(b) {
+                Some(InterRoundFrame::Profile(o)) => Some((*v, o)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            profiles,
+            vec![(1, own_obj)],
+            "op36 between rounds → exactly one op54 PROFILE, slot 0's, to slot 1 only"
+        );
+
+        // …and the walk itself refreshes both profiles at SynchronizingLoadout(10).
+        let log = record_interround(&mut m, t);
+        let (sync_at, _) = first_state(&log, MatchState::SynchronizingLoadout);
+        for viewer in 0..2 {
+            let opp_obj = m.combat.fighters[1 - viewer].player_net_object_id as i64;
+            assert!(
+                log.iter().any(|(v, f, at)| *v == viewer
+                    && *at >= sync_at
+                    && matches!(f, InterRoundFrame::Profile(o) if *o == opp_obj)),
+                "viewer {viewer} must be re-sent its opponent's profile at SynchronizingLoadout(10)"
+            );
+        }
     }
 
     /// Drive a between-rounds (NextState) walk to completion: tick at 250 ms until the

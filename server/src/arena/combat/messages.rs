@@ -157,6 +157,27 @@ pub fn is_loadout_backend_synchronized(user_data: &[u8]) -> bool {
     user_message_gmid(user_data) == Some(GameMessageId::LoadoutClientBackendSynchronized as u8)
 }
 
+/// True iff a carrier-`0x36` c2s frame is `SkipCurrentState` (op57) — the client's
+/// **"Ready"** press on a state it is done with (the loadout screen, the opponent
+/// showcase). `dump.cs` `SkipCurrentStateMessage`; capture-proven c2s-only (it is in
+/// the handshake set at [`is_noncombat_user_message`], and prod session 835 carries
+/// one at 17:19:32 during a between-rounds `ChooseLoadout`).
+///
+/// The engine's answer is to emit the pending MatchState immediately instead of
+/// waiting out its `hold_before` — see `MatchInstance::on_c2s_resolved`. Until
+/// 2026-08-17 nothing read this GameMessageId at all.
+pub fn is_skip_current_state(user_data: &[u8]) -> bool {
+    user_message_gmid(user_data) == Some(GameMessageId::SkipCurrentState as u8)
+}
+
+/// True iff a carrier-`0x36` c2s frame is `PlayerLoadoutReady` (op36) — the client
+/// reporting that its loadout selection is committed. Sent during round-start setup
+/// AND after a between-rounds loadout change on the `ChooseLoadout` screen; the
+/// between-rounds one is what makes the server re-broadcast the op54 PROFILE.
+pub fn is_player_loadout_ready(user_data: &[u8]) -> bool {
+    user_message_gmid(user_data) == Some(GameMessageId::PlayerLoadoutReady as u8)
+}
+
 /// The retail **ENet channel** a given decrypted `user_data` (`marker ‖ MessageType
 /// ‖ body`) must be sent on, matching session 506 byte-for-byte. Blades' client
 /// binds different NetTransport message classes to different ENet channels; if the
