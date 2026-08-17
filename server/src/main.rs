@@ -98,12 +98,16 @@ pub struct ServerGlobal {
     /// startup from JSON files in the `--static-data` directory. Empty parts
     /// degrade gracefully (see [`static_loader`]).
     pub static_data: StaticData,
-    /// Full ("max") durability per `(itemTemplateId, temperingLevel)`, derived
-    /// from the captures (`item_durability.json`) since `GameData` carries no
-    /// durability. Used by the repair endpoint to restore an item to full.
-    /// Keyed by lowercase UUID string -> tempering-level string -> max durability.
-    /// Empty if the file is missing/invalid (repair then leaves durability as-is).
-    pub item_max_durability: std::collections::HashMap<String, std::collections::HashMap<String, f64>>,
+    /// Full ("max") durability per `(itemTemplateId, temperingLevel)` plus the
+    /// gold price of a repair — `item_durability.json` + `repair_costs.json`, both
+    /// generated from the APK by `script/extract_item_repair_data.py`.
+    /// `GameData` (`parsed.json`) carries no durability, and the previous
+    /// capture-derived table covered only 218 of 1113 templates at an average of
+    /// 1.44 of the 11 temper levels, which made "Repair all" silently skip most
+    /// items (tracker #30). Missing/invalid files load empty and repair falls back
+    /// to [`blades_lib::features::repair::DEFAULT_DURABILITY`] rather than leaving
+    /// gear damaged.
+    pub repair_data: blades_lib::features::repair::RepairData,
     /// Faithful town game-data extracted from the APK bundles (server/data/static/):
     /// building upgrade cost/time/material tables, town job-pool definitions, and the
     /// appearance-change currency cost. Raw JSON parsed by the town/quest/character
@@ -162,30 +166,37 @@ async fn main() -> Result<()> {
                 serde_json::from_reader(&mut game_data_file).unwrap()
             };
 
-            // Repair needs each item's full durability, which `parsed.json` does
-            // not carry — load the captures-derived lookup. Tolerate a missing or
-            // invalid file (empty map → repair leaves durability unchanged rather
-            // than panicking the server at startup).
-            let item_max_durability: std::collections::HashMap<
-                String,
-                std::collections::HashMap<String, f64>,
-            > = {
-                let p = static_data.join("item_durability.json");
-                match File::open(&p) {
-                    Ok(f) => serde_json::from_reader(std::io::BufReader::new(f))
-                        .unwrap_or_else(|e| {
-                            log::warn!(
-                                "[durability] invalid {p:?}: {e}; repair will leave durability unchanged"
-                            );
-                            Default::default()
-                        }),
-                    Err(e) => {
-                        log::warn!(
-                            "[durability] no {p:?}: {e}; repair will leave durability unchanged"
-                        );
-                        Default::default()
+            // Repair needs each item's full durability and gold price, neither of
+            // which `parsed.json` carries. Both tables are generated from the APK
+            // by `script/extract_item_repair_data.py`. A missing or invalid file
+            // loads as an empty table rather than panicking at startup; repair then
+            // falls back to the game's own DEFAULT_DURABILITY, so gear is still
+            // restored to full instead of being silently left damaged.
+            let repair_data = {
+                let load = |name: &str| -> serde_json::Value {
+                    let p = static_data.join(name);
+                    match File::open(&p) {
+                        Ok(f) => serde_json::from_reader(std::io::BufReader::new(f))
+                            .unwrap_or_else(|e| {
+                                log::warn!("[repair] invalid {p:?}: {e}; falling back to defaults");
+                                serde_json::Value::Null
+                            }),
+                        Err(e) => {
+                            log::warn!("[repair] no {p:?}: {e}; falling back to defaults");
+                            serde_json::Value::Null
+                        }
                     }
-                }
+                };
+                let data = blades_lib::features::repair::RepairData::from_json(
+                    &load("item_durability.json"),
+                    &load("repair_costs.json"),
+                );
+                log::info!(
+                    "[repair] durability table: {} templates; repair-cost table: {} templates",
+                    data.template_count(),
+                    data.cost_template_count()
+                );
+                data
             };
 
             // Faithful town game-data extracted from the APK (building upgrade costs,
@@ -261,7 +272,7 @@ async fn main() -> Result<()> {
                 static_data_path: static_data.clone(),
                 game_data,
                 static_data: static_data_defs,
-                item_max_durability,
+                repair_data,
                 building_upgrades,
                 job_pools,
                 appearance_change_cost,
