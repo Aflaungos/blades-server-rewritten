@@ -16,6 +16,7 @@ use uuid::Uuid;
 
 use crate::features::challenges::ChallengeState;
 use crate::features::daily_reward::DailyRewardState;
+use crate::features::merchant::MerchantWindow;
 
 /// One floor entry in an active abyss run. Mirrors the client wire shape exactly so
 /// the server can reconstruct the full `abyss.slices` list on `/current` and `/start`.
@@ -88,4 +89,17 @@ pub struct ServerState {
     /// updated by `/update`, cleared by `/end`.
     #[serde(default)]
     pub abyss: Option<AbyssRun>,
+    /// Town-merchant state per shop (building instance) id: the rolled 10-hour
+    /// catalog, the merchant's gold budget for that window, what the player has
+    /// bought from it, and live buyback slots. Without this a merchant had no money
+    /// at all and its stock re-rolled off the wall clock instead of from the
+    /// player's first visit (tracker #30). `#[serde(default)]` so rows written
+    /// before this field deserialize as an empty map.
+    ///
+    /// Keyed by shop id on the VISITING character, so browsing another player's
+    /// vendor tracks a window here rather than on its owner — adequate for the
+    /// buy/sell endpoints we serve, and a noted divergence from retail, which held
+    /// the catalog against the shop itself.
+    #[serde(default)]
+    pub shops: HashMap<Uuid, MerchantWindow>,
 }

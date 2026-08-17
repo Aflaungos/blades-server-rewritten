@@ -22,6 +22,35 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+/// Read a JSON file into a UUID-keyed map, skipping the `_meta` provenance block
+/// the APK extractors write and any single row that fails to parse. Without this a
+/// `_meta` key makes the WHOLE map fail to deserialize, which silently empties the
+/// table — for `shop_bundles.json` that means the merchant lists stock it will not
+/// sell, so it is worth being explicit about.
+fn read_uuid_map<T: DeserializeOwned>(path: &Path) -> HashMap<Uuid, T> {
+    let raw: Value = read_json(path);
+    let Some(obj) = raw.as_object() else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::new();
+    let mut skipped = 0usize;
+    for (key, value) in obj {
+        let Ok(id) = Uuid::parse_str(key) else {
+            continue; // `_meta` and anything else that is not an id
+        };
+        match serde_json::from_value::<T>(value.clone()) {
+            Ok(parsed) => {
+                out.insert(id, parsed);
+            }
+            Err(_) => skipped += 1,
+        }
+    }
+    if skipped > 0 {
+        warn!("[static] {path:?}: skipped {skipped} unparseable row(s)");
+    }
+    out
+}
+
 /// Read a JSON file into `T`, falling back to `T::default()` (with a warning) if the
 /// file is missing or invalid.
 fn read_json<T: DeserializeOwned + Default>(path: &Path) -> T {
@@ -65,7 +94,7 @@ pub fn load(dir: &Path) -> StaticData {
     let salvage_recipes: HashMap<Uuid, HashMap<Uuid, u64>> =
         read_json(&dir.join("salvage_recipes.json"));
     let shop_data: ShopData = read_json(&dir.join("shops.json"));
-    let shop_bundles: HashMap<Uuid, ShopBundle> = read_json(&dir.join("shop_bundles.json"));
+    let shop_bundles: HashMap<Uuid, ShopBundle> = read_uuid_map(&dir.join("shop_bundles.json"));
     let recipes: HashMap<Uuid, Recipe> = read_json(&dir.join("recipes.json"));
     let item_mod_recipes: HashMap<Uuid, ItemModRecipe> =
         read_json(&dir.join("item_mod_recipes.json"));

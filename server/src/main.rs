@@ -122,6 +122,13 @@ pub struct ServerGlobal {
     /// config; the shop endpoint then falls back to the capture-derived templates
     /// (never empty). Pure data — a future admin route can hot-reload it.
     pub shop_stock: shop_gen::ShopStockConfig,
+    /// What a town merchant pays for the player's items — APK `ItemTemplate.
+    /// _sellValue` scaled by the temper multiplier, plus enchantment tier values
+    /// (`item_sell_values.json` + `enchant_values.json`, both built by
+    /// `script/extract_shop_economy_data.py`). Replaces a flat 50-gold-per-item
+    /// placeholder that was ~75x below the retail median (tracker #30). Missing
+    /// files load empty and the merchant offers 0, logged at startup.
+    pub sell_prices: blades_lib::features::merchant::SellPrices,
     pub arena: Arc<arena::matchmaker::ArenaGlobal>,
     /// Static dev token for the `/api/dev/v1/import-character` endpoint, read
     /// from `ARENA_IMPORT_TOKEN` at startup. `None` (unset) disables the
@@ -241,6 +248,28 @@ async fn main() -> Result<()> {
                 }
             };
 
+            // What a town merchant pays for the player's items. Missing/invalid →
+            // empty tables and the merchant offers 0 (logged), rather than a panic.
+            let sell_prices = {
+                let data = blades_lib::features::merchant::SellPrices::from_json(
+                    &load_static_json("item_sell_values.json"),
+                    &load_static_json("enchant_values.json"),
+                );
+                if data.is_empty() {
+                    log::warn!(
+                        "[shop] no sell-price table; town merchants will offer 0 gold for \
+                         the player's items"
+                    );
+                } else {
+                    log::info!(
+                        "[shop] sell prices: {} templates, {} enchantment properties",
+                        data.template_count(),
+                        data.enchant_property_count()
+                    );
+                }
+                data
+            };
+
             // Capture-derived static definitions (gifts, announcements, …). Missing
             // files degrade gracefully (empty → endpoint returns an empty list).
             let static_data_defs = static_loader::load(&static_data);
@@ -277,6 +306,7 @@ async fn main() -> Result<()> {
                 job_pools,
                 appearance_change_cost,
                 shop_stock,
+                sell_prices,
                 arena,
                 arena_import_token,
                 arena_debug_token,

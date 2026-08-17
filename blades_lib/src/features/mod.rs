@@ -11,5 +11,6 @@ pub mod daily_reward;
 pub mod game_events;
 pub mod gifts;
 pub mod global_shop;
+pub mod merchant;
 pub mod repair;
 pub mod salvage;

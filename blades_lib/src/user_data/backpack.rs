@@ -64,14 +64,14 @@ impl StackableItems {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct ItemSingleProperty {
     pub id: Uuid,
     pub tier: u64,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Default)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 #[serde(rename_all = "UPPERCASE")]
 pub struct ItemPropertiesAll {
     // Defaulted so an item carrying only one of the two property kinds (common in
@@ -82,7 +82,9 @@ pub struct ItemPropertiesAll {
     pub grading: Vec<ItemSingleProperty>,
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone)]
+// `PartialEq` so a buyback slot (which stores the sold item verbatim) can be
+// compared in tests and round-tripped; `f64` durability means PartialEq, not Eq.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Item {
     pub item_template_id: Uuid,

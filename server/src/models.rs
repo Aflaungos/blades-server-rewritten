@@ -114,6 +114,32 @@ impl CharacterHolder for CharacterDbEntryEconomy {
     }
 }
 
+/// Town-vendor handlers (`/shops/{id}`, `/purchase`, `/sell`). Opening a vendor
+/// needs the `town` JSONB (to resolve the shop instance id to its
+/// `(buildingTypeId, level)`) AND `server_state` (to persist the merchant's rolled
+/// 10-hour window: gold budget, stock, sales, buybacks), while buying and selling
+/// also move the wallet and the inventory. One `AsChangeset` covering all of it
+/// keeps a whole vendor interaction inside a single locked read-modify-write, so
+/// two concurrent sells cannot both spend the merchant's last gold.
+#[derive(Queryable, Selectable, AsChangeset)]
+#[diesel(table_name = crate::schema::characters)]
+#[diesel(check_for_backend(diesel::pg::Pg))]
+pub struct CharacterDbEntryShop {
+    pub id: Uuid,
+    pub user_id: Uuid,
+    pub character: JsonDbWrapper<CompleteCharacter>,
+    pub wallet: JsonDbWrapper<CompleteWallet>,
+    pub inventory: JsonDbWrapper<CompleteInventory>,
+    pub town: Option<JsonDbWrapper<Value>>,
+    pub server_state: JsonDbWrapper<ServerState>,
+}
+
+impl CharacterHolder for CharacterDbEntryShop {
+    fn get_user_id(&self) -> &Uuid {
+        &self.user_id
+    }
+}
+
 /// Read-only thin select for endpoints that only need the server-managed state
 /// (e.g. the claimed-gifts list) plus the ownership check.
 #[derive(Queryable, Selectable)]
