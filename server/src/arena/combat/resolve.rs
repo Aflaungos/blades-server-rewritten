@@ -1171,33 +1171,10 @@ fn resolve_ability_cast(
             if tag == AbilityTag::Paralyze {
                 out.extend(try_paralyze(combat, sender, target_slot, level, now));
             }
-            // A maneuver rank that defines `_damageToCauseStagger` staggers the
-            // target when the hit lands hard enough. [Phase 3.13]
-            if let Some(threshold) = super::gamedata::ability_rank_clamped(&ea.ability_uuid, level as u16)
-                .and_then(|r| r.damage_to_cause_stagger())
-            {
-                if resolved.total >= threshold && !combat.fighters[target_slot].is_dead() {
-                    // Prefer the ability's OWN `_stunDuration` when it ships one —
-                    // IceSpike 1.20 s, StaggeringBash, Guardbreaker. That field was read
-                    // by nothing, so all three produced the generic
-                    // `baseStaggerDuration` regardless of what the game data said.
-                    let secs = super::gamedata::ability_rank_clamped(&ea.ability_uuid, level as u16)
-                        .and_then(|r| r.stun_duration())
-                        .unwrap_or(super::state::BASE_STAGGER_DURATION_SECS);
-                    combat.fighters[target_slot].apply_stagger_for(now, secs);
-                    let obj = combat.fighters[target_slot].net_object_id;
-                    let frame = messages::change_combat_status_effect(
-                        obj,
-                        true,
-                        super::state::StatusEffectType::Staggered,
-                        secs,
-                        0,
-                    );
-                    for slot in 0..combat.fighters.len() {
-                        out.push((slot, frame.clone()));
-                    }
-                }
-            }
+            // `_damageToCauseStagger` used to be handled HERE, inside this arm. It is
+            // now in `apply_shipped_effects` below, which every arm reaches — the two
+            // abilities that actually ship the field are maneuvers and could never
+            // get here. See the note there.
         }
     }
 
@@ -1362,6 +1339,57 @@ fn apply_shipped_effects(
             info!("combat: slot {target_slot} BLINDED {secs:.2}s (hit {last_hit_total:.1} >= {threshold:.1})");
             let frame = messages::change_combat_status_effect(
                 obj, true, StatusEffectType::Blind, secs, 0,
+            );
+            for v in 0..viewers {
+                out.push((v, frame.clone()));
+            }
+        }
+    }
+
+    // `_damageToCauseStagger` → stagger the VICTIM when the hit lands hard enough.
+    // Structurally identical to the `_damageToCauseBlind` gate directly above, and
+    // it lives HERE for a reason (tracker #24).
+    //
+    // It used to sit inside `resolve_ability_cast`'s `Paralyze | Damage | Generic`
+    // arm, whose own comment named "IceSpike, StaggeringBash, Guardbreaker". But
+    // only ONE of those three is a spell: `StaggeringBash` and `Guardbreaker` are
+    // `AbilityKind::Maneuver` → `AbilityTag::Maneuver`, and the Maneuver arm ends
+    // just before that block. So the stun fix of 2026-08-04 landed in the one arm
+    // the two bashes cannot reach, and no maneuver could ever stagger anything.
+    // Captured proof: gmid 51 fired 4x and 21x across the reporter's two sessions,
+    // every instance targeting him, and `Staggered` was never sent once in either
+    // direction in either session.
+    //
+    // Data (all 706 shipped ability ranks): exactly three abilities carry
+    // `_damageToCauseStagger` — StaggeringBash (Maneuver, threshold 1.0 at every
+    // one of its 13 ranks, `_stunDuration` 1.30…2.50 s), Guardbreaker (Maneuver,
+    // same shape), and IceSpike (Spell, threshold 70.19…227.06). The first two are
+    // what this move unblocks; IceSpike behaves exactly as before.
+    //
+    // `last_hit_total > 0.0` as well as the threshold: a threshold of 1.0 already
+    // implies a landed hit, but a buff arm (Ward / Absorb / ResistElements / Perk)
+    // sets `last_hit_total = 0.0`, and a future rank shipping threshold 0.0 must
+    // not be able to stagger from a self-buff that never touched the target.
+    if let Some(threshold) = r.damage_to_cause_stagger() {
+        if last_hit_total > 0.0
+            && last_hit_total >= threshold
+            && target_slot < viewers
+            && !combat.fighters[target_slot].is_dead()
+        {
+            // Prefer the rank's OWN `_stunDuration` over the generic
+            // `baseStaggerDuration` — StaggeringBash/Guardbreaker 1.30 s @ R1 rising
+            // to 2.50 s, IceSpike 1.20 s.
+            let secs = r
+                .stun_duration()
+                .unwrap_or(super::state::BASE_STAGGER_DURATION_SECS);
+            combat.fighters[target_slot].apply_stagger_for(now, secs);
+            let obj = combat.fighters[target_slot].net_object_id;
+            info!(
+                "combat: slot {target_slot} STAGGERED {secs:.2}s \
+                 (hit {last_hit_total:.1} >= {threshold:.1}, {ability_uuid})"
+            );
+            let frame = messages::change_combat_status_effect(
+                obj, true, StatusEffectType::Staggered, secs, 0,
             );
             for v in 0..viewers {
                 out.push((v, frame.clone()));
@@ -3902,6 +3930,154 @@ mod shipped_effects_tests {
         assert!(c.fighters[0].negation_pools.is_empty());
         assert!(!c.fighters[1].is_paralyzed());
         assert!(out.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // tracker #24: maneuvers could not stagger
+    // -----------------------------------------------------------------------
+
+    /// How many op51 `ChangeCombatStatusEffect` frames in `out` carry `status`.
+    /// gmid is propId 3, the `StatusEffectType` is propId 5.
+    fn status_frames(out: &[(usize, Vec<u8>)], status: super::super::state::StatusEffectType) -> usize {
+        out.iter()
+            .filter(|(_, f)| {
+                if f.len() <= 2 || f[1] != 0x36 {
+                    return false;
+                }
+                let nd = arena_proto::parse_netdata(&f[2..]);
+                nd.int(3) == Some(51) && nd.int(5) == Some(status as u16 as i64)
+            })
+            .count()
+    }
+
+    /// The routing fact the old placement got wrong, asserted from the shipped data
+    /// so it cannot drift: of the 706 ability ranks, exactly three abilities carry
+    /// `_damageToCauseStagger`, and TWO of them are maneuvers — which is why a gate
+    /// living in the `Paralyze | Damage | Generic` arm was unreachable for them.
+    #[test]
+    fn the_stagger_field_is_carried_mostly_by_maneuvers() {
+        use super::super::gamedata::{ABILITIES, AbilityKind, ability_rank_clamped};
+        let carriers: Vec<(&str, AbilityKind)> = ABILITIES
+            .iter()
+            .filter(|a| {
+                (1..=a.maximum_level).any(|lvl| {
+                    ability_rank_clamped(a.uuid, lvl)
+                        .and_then(|r| r.damage_to_cause_stagger())
+                        .is_some()
+                })
+            })
+            .map(|a| (a.editor_name, a.kind))
+            .collect();
+        assert_eq!(
+            carriers.len(),
+            3,
+            "expected StaggeringBash + Guardbreaker + IceSpike, got {carriers:?}",
+        );
+        let maneuvers: Vec<&str> = carriers
+            .iter()
+            .filter(|(_, k)| *k == AbilityKind::Maneuver)
+            .map(|(n, _)| *n)
+            .collect();
+        assert_eq!(maneuvers.len(), 2, "two of the three are maneuvers: {maneuvers:?}");
+        for name in &maneuvers {
+            assert_eq!(
+                super::super::loadout::ability_tag_for_template(uuid_of(name)),
+                super::super::state::AbilityTag::Maneuver,
+                "{name} routes to the Maneuver arm, which the old gate sat after",
+            );
+        }
+    }
+
+    /// A maneuver that ships `_damageToCauseStagger` staggers its target, for the
+    /// rank's own `_stunDuration`, and tells both viewers.
+    ///
+    /// This is what the reporter never saw: gmid 51 fired 4x and 21x across his two
+    /// sessions and `Staggered` was never sent once in either direction.
+    #[test]
+    fn a_maneuver_that_ships_a_stagger_threshold_staggers_the_target() {
+        use super::super::state::StatusEffectType;
+        for name in ["StaggeringBash", "Guardbreaker"] {
+            let now = Instant::now();
+            let mut c = combat2(now);
+            let u = uuid_of(name);
+            let threshold = super::super::gamedata::ability_rank_clamped(u, 1)
+                .and_then(|r| r.damage_to_cause_stagger())
+                .unwrap_or_else(|| panic!("{name} R1 ships _damageToCauseStagger"));
+            let stun = super::super::gamedata::ability_rank_clamped(u, 1)
+                .and_then(|r| r.stun_duration())
+                .unwrap_or_else(|| panic!("{name} R1 ships _stunDuration"));
+
+            let out = apply_shipped_effects(&mut c, 0, 1, u, 1, threshold, now);
+            assert!(c.fighters[1].is_staggered(now), "{name}: the TARGET is staggered");
+            assert!(!c.fighters[0].is_staggered(now), "{name}: the caster is not");
+            assert_eq!(
+                c.fighters[1].actor_state(),
+                ActorStateType::Staggered,
+                "{name}: the actor state follows",
+            );
+            // The rank's OWN duration, not the generic baseStaggerDuration.
+            assert!(
+                c.fighters[1].is_staggered(now + Duration::from_secs_f32(stun * 0.9)),
+                "{name}: still staggered at 90% of its own {stun}s",
+            );
+            assert!(
+                !c.fighters[1].is_staggered(now + Duration::from_secs_f32(stun * 1.1)),
+                "{name}: over by 110% of its own {stun}s",
+            );
+            assert_eq!(
+                status_frames(&out, StatusEffectType::Staggered),
+                c.fighters.len(),
+                "{name}: op51 Staggered to both viewers",
+            );
+        }
+    }
+
+    /// IceSpike is the one SPELL that ships the field. It reached the old gate and
+    /// must still work — the move must not trade one arm for the other. Its
+    /// threshold is real (70.19 @ R1), so a weak hit still must not stagger.
+    #[test]
+    fn icespike_still_staggers_and_still_respects_its_threshold() {
+        use super::super::state::StatusEffectType;
+        let u = uuid_of("IceSpike");
+        let threshold = super::super::gamedata::ability_rank_clamped(u, 1)
+            .and_then(|r| r.damage_to_cause_stagger())
+            .expect("IceSpike R1 ships _damageToCauseStagger");
+        assert!(threshold > 1.0, "IceSpike's threshold is a real damage figure, got {threshold}");
+
+        let now = Instant::now();
+        let mut hard = combat2(now);
+        let out = apply_shipped_effects(&mut hard, 0, 1, u, 1, threshold, now);
+        assert!(hard.fighters[1].is_staggered(now), "a hit at the threshold staggers");
+        assert_eq!(status_frames(&out, StatusEffectType::Staggered), hard.fighters.len());
+
+        let mut soft = combat2(now);
+        let out = apply_shipped_effects(&mut soft, 0, 1, u, 1, threshold - 0.1, now);
+        assert!(!soft.fighters[1].is_staggered(now), "a hit under the threshold does not");
+        assert_eq!(status_frames(&out, StatusEffectType::Staggered), 0);
+    }
+
+    /// A self-buff arm sets `last_hit_total = 0.0`. StaggeringBash's threshold is
+    /// 1.0 at every rank, so without the extra `> 0.0` gate a cast that never
+    /// touched the target could still stagger it once the block moved out of the
+    /// damage-only arm.
+    #[test]
+    fn a_cast_that_dealt_no_damage_cannot_stagger() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        let out = apply_shipped_effects(&mut c, 0, 1, uuid_of("StaggeringBash"), 1, 0.0, now);
+        assert!(!c.fighters[1].is_staggered(now), "no damage → no stagger");
+        assert_eq!(status_frames(&out, super::super::state::StatusEffectType::Staggered), 0);
+    }
+
+    /// And a dead target is not staggered — the pre-existing guard, kept.
+    #[test]
+    fn a_dead_target_is_not_staggered() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        c.fighters[1].health = 0;
+        let out = apply_shipped_effects(&mut c, 0, 1, uuid_of("StaggeringBash"), 1, 500.0, now);
+        assert!(!c.fighters[1].is_staggered(now));
+        assert_eq!(status_frames(&out, super::super::state::StatusEffectType::Staggered), 0);
     }
 }
 
