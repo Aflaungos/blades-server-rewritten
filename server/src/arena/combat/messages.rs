@@ -376,15 +376,29 @@ pub fn stat_update(avatar_net_object_id: i32) -> Vec<u8> {
 /// HIGH 32 bits, `seq` in the LOW 32 bits). Emitted after a regen tick, an ability
 /// cost deduction, or a DoT/potion stat change so the HUD bars update. [s506 ch1]
 ///
-/// `packed` is the result of `Fighter::packed_stats()`.
-pub fn player_stats_update(avatar_net_object_id: i32, packed: u64) -> Vec<u8> {
+/// `packed` is `Fighter::packed_stats()` for the avatar named at propId 0
+/// (`_pvpThisActorStats`); `other_packed` is the same for that avatar's OPPONENT
+/// (`_pvpOtherActorStats`, propId 5 — see the prop table in
+/// [`super::messages_state`]).
+///
+/// propId 5 used to be the literal `1`. Because `PackedStats` puts the stat word in
+/// the HIGH 32 bits and the sequence id in the LOW 32, `1` decodes to
+/// `health 0 / stamina 0 / magicka 0, seq 1` — i.e. every op65 told both clients the
+/// *other* fighter was at zero on all three pools. That is the same propId 4/5 pair
+/// `receive_damage` and `player_channeling_state_change` already fill correctly, so
+/// this was the one emitter in the family that shipped a placeholder.
+pub fn player_stats_update(
+    avatar_net_object_id: i32,
+    packed: u64,
+    other_packed: u64,
+) -> Vec<u8> {
     let mut w = NetDataWriter::new();
     w.int(0, avatar_net_object_id)
         .byte(1, super::state::NetObjectType::Avatar as u8)
         .byte(2, 1) // role byte (Authority=1 — same as stat_update round-start)
         .byte(3, 65)
         .ulong(4, packed)
-        .ulong(5, 1);
+        .ulong(5, other_packed);
     frame(MSGTYPE_USERMESSAGE, w.finish())
 }
 

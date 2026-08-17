@@ -231,6 +231,15 @@ fn apply_enchant(lo: &mut Loadout, id: &Uuid, tier: u8) {
         }
 
         // ---- block rating -------------------------------------------------
+        // `magnitude`, not the raw `value`: the shared `_value` curve runs
+        // 268…7591, while an item's own `block_base` is ~50 (a shield) to ~276
+        // (the whole starter set) — and `tables::block_reduction` divides by
+        // BLOCK_RATING_SCALE (100) × REDUCTION_PER_BLOCK_RATING (0.1), so it caps
+        // at MAXIMUM_BLOCK_REDUCTION (0.95) from rating 950 up. Adding the raw
+        // 7591 put a single tier-10 block enchant 8× past the cap on its own,
+        // pinning block_reduction at 0.95 and making a guard eat 95 % of every
+        // hit. Every sibling arm here scales by ENCHANT_DAMAGE_PER_VALUE first;
+        // this one did not.
         "BlockReductionFirePropertyLogic"
         | "BlockReductionFrostPropertyLogic"
         | "BlockReductionShockPropertyLogic"
@@ -239,7 +248,7 @@ fn apply_enchant(lo: &mut Loadout, id: &Uuid, tier: u8) {
         | "BlockReductionCleavingPropertyLogic"
         | "BlockReductionBashingPropertyLogic"
         | "BlockReductionTemplarPropertyLogic"
-        | "PowerfulBlockPropertyLogic" => lo.block_rating += value,
+        | "PowerfulBlockPropertyLogic" => lo.block_rating += magnitude,
 
         // ---- piercing ------------------------------------------------------
         "ResistancePiercingElementalPropertyLogic" => lo.elem_resist_piercing_rating += magnitude,
@@ -377,6 +386,12 @@ mod tests {
     const WEAPON_POISON_DAMAGE: &str = "08ea75d0-5cf1-44a9-9816-d3c6740c4191";
     const RESIST_FIRE: &str = "464bedb7-a631-43b6-a2df-f65f089d39da";
     const ELEM_PIERCE: &str = "98757a01-33b8-40ea-bb45-6acd89811ae3";
+    /// `Powerful Block` — `PowerfulBlockPropertyLogic`. The ONLY one of the nine
+    /// logic classes in the block-rating arm whose shipped curve is non-zero
+    /// (tiers 1/3/5/7/9/10 → `268 … 7591`); the eight `Material Block Bonus Vs …`
+    /// families and `Templar Set Block Bonus` all ship 0.0 at every tier, so this
+    /// is the family that carries the defect.
+    const POWERFUL_BLOCK: &str = "f8e9dec5-c6e7-4976-b24b-2155f1921692";
 
     fn lo() -> Loadout {
         Loadout { status_dur_mult: 1.0, shield_optimal_block_boost: 1.0, ..Default::default() }
@@ -410,6 +425,92 @@ mod tests {
         apply_enchant(&mut p, &Uuid::parse_str(ELEM_PIERCE).unwrap(), 10);
         assert!(p.elem_resist_piercing_rating > 0.0);
         assert_eq!(p.elem_resist_piercing, 0.0, "the fractional field is ability-side only");
+    }
+
+    /// tracker #24: a block enchant is scaled like every one of its siblings.
+    ///
+    /// The block-rating arm added the family's RAW `_value` (the shared 268…7591
+    /// curve) while the resist / piercing / fortify arms all multiply by
+    /// [`tables::ENCHANT_DAMAGE_PER_VALUE`] first. Since
+    /// [`tables::block_reduction`] saturates at `MAXIMUM_BLOCK_REDUCTION` from a
+    /// rating of `BLOCK_RATING_SCALE / REDUCTION_PER_BLOCK_RATING` = 950 up, a
+    /// single tier-10 `Powerful Block` on its own pinned every guard at the 0.95 cap.
+    #[test]
+    fn a_block_enchant_is_scaled_like_its_siblings_not_raw() {
+        let family = gamedata::enchant_family(POWERFUL_BLOCK).unwrap();
+        assert_eq!(family.logic, "PowerfulBlockPropertyLogic");
+        let top = family.tiers().last().unwrap().tier;
+        let raw = family.value(top).unwrap();
+        assert!(raw > 7000.0, "Powerful Block t{top} ships the 7591 curve top, got {raw}");
+
+        let mut l = lo();
+        apply_enchant(&mut l, &Uuid::parse_str(POWERFUL_BLOCK).unwrap(), top);
+
+        // The rating is the SCALED magnitude, not the raw curve value.
+        let want = raw * tables::ENCHANT_DAMAGE_PER_VALUE;
+        assert!(
+            (l.block_rating - want).abs() < 1e-3,
+            "block rating {} should be the scaled magnitude {want} (raw curve {raw})",
+            l.block_rating,
+        );
+        assert!(
+            l.block_rating < raw / 10.0,
+            "the raw curve value {raw} is ~55x the magnitude — adding it raw is the bug",
+        );
+
+        // And the consequence the tester felt: the raw value alone saturates
+        // block_reduction at its cap; the scaled one does not.
+        let cap = gamedata::combat_params::MAXIMUM_BLOCK_REDUCTION;
+        assert!(
+            (tables::block_reduction(raw, true) - cap).abs() < 1e-6,
+            "the raw curve value pins block_reduction at the {cap} cap",
+        );
+        assert!(
+            tables::block_reduction(l.block_rating, true) < cap,
+            "the scaled magnitude leaves block_reduction below the cap, got {}",
+            tables::block_reduction(l.block_rating, true),
+        );
+
+        // A full starter set PLUS a top-tier block enchant still must not cap out —
+        // 276 + 137 = 413 → 0.413, well under 0.95.
+        let mut s = starter();
+        apply_enchant(&mut s, &Uuid::parse_str(POWERFUL_BLOCK).unwrap(), top);
+        assert!(
+            tables::block_reduction(s.block_rating, true) < cap,
+            "starter gear + one Powerful Block capped out at {}",
+            tables::block_reduction(s.block_rating, true),
+        );
+    }
+
+    /// The seven `Material Block Bonus Vs <type>` families and `Templar Set Block
+    /// Bonus` route through the same arm but ship 0.0 at every tier, so they are
+    /// unaffected either way. Asserted so a future data regeneration that gives
+    /// them a real curve shows up here instead of silently widening the blast
+    /// radius of the arm above.
+    #[test]
+    fn the_material_block_families_ship_a_zero_curve() {
+        let zeroed: Vec<&str> = gamedata::ENCHANT_FAMILIES
+            .iter()
+            .filter(|f| {
+                f.logic.starts_with("BlockReduction")
+                    && f.tiers().iter().all(|t| t.value == 0.0)
+            })
+            .map(|f| f.logic)
+            .collect();
+        assert_eq!(
+            zeroed.len(),
+            8,
+            "expected the 7 Material + 1 Templar block families to be all-zero, got {zeroed:?}",
+        );
+        // …and Powerful Block is NOT among them: it is the one that matters.
+        assert!(
+            gamedata::enchant_family(POWERFUL_BLOCK)
+                .unwrap()
+                .tiers()
+                .iter()
+                .any(|t| t.value > 0.0),
+            "Powerful Block must carry a real curve — it is the family under test above",
+        );
     }
 
     /// The full ability table drives routing — not one hardcoded prefix.
