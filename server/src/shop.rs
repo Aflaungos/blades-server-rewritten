@@ -361,9 +361,12 @@ async fn open_or_refresh(
 /// Forget windows that expired long enough ago that no buyback can still be live,
 /// so `server_state.shops` cannot grow without bound as a player wanders a town.
 fn prune_stale_shops(shops: &mut HashMap<Uuid, MerchantWindow>, now: i64) {
-    shops.retain(|_, w| {
-        w.expiration_ms + merchant::BUYBACK_MS > now || !w.buybacks.is_empty()
-    });
+    for w in shops.values_mut() {
+        // Drop dead buyback slots FIRST, or a window whose only remaining slots
+        // have expired would be kept forever by the check below.
+        w.expire_buybacks(now);
+    }
+    shops.retain(|_, w| w.expiration_ms > now || !w.buybacks.is_empty());
 }
 
 /// `POST /shops/{id}` — open a vendor (returns its current catalog).
@@ -844,9 +847,38 @@ mod tests {
                 ..Default::default()
             },
         );
+        // ...and one whose window AND buyback are both dead: it must not be kept
+        // alive by a slot that has already expired, or the map grows forever as a
+        // player wanders a town.
+        let stale_with_dead_buyback = Uuid::from_u128(4);
+        shops.insert(
+            stale_with_dead_buyback,
+            MerchantWindow {
+                expiration_ms: now - merchant::BUYBACK_MS - 1,
+                buybacks: vec![Buyback {
+                    id: Uuid::from_u128(10),
+                    shop_id: stale_with_dead_buyback,
+                    item: None,
+                    stackable_item: None,
+                    expiration: now - 1,
+                    price: 5,
+                }],
+                ..Default::default()
+            },
+        );
+
         prune_stale_shops(&mut shops, now);
         assert!(shops.contains_key(&live));
         assert!(shops.contains_key(&stale_with_buyback));
         assert!(!shops.contains_key(&stale), "expired, buyback-free windows are dropped");
+        assert!(
+            !shops.contains_key(&stale_with_dead_buyback),
+            "an expired buyback must not keep a dead window alive"
+        );
+        assert_eq!(
+            shops[&stale_with_buyback].buybacks.len(),
+            1,
+            "the live buyback survives"
+        );
     }
 }
