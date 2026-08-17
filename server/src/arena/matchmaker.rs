@@ -144,11 +144,28 @@ pub struct Skill {
 /// Returns `(max level gap, max trophy gap)`. `None` means unlimited.
 pub fn bracket_for(waited: Duration) -> Option<(i32, i64)> {
     match waited.as_secs() {
-        0..=9 => Some((5, 150)),
-        10..=19 => Some((10, 300)),
-        20..=29 => Some((20, 600)),
+        0..=9 => Some(BRACKET_STEPS[0]),
+        10..=19 => Some(BRACKET_STEPS[1]),
+        20..=29 => Some(BRACKET_STEPS[2]),
         _ => None,
     }
+}
+
+/// The bounded widening steps of the bracket, TIGHTEST FIRST — `(max level gap,
+/// max trophy gap)`.
+///
+/// [`bracket_for`] walks these by how long a human has waited. [`pick_bot_index`]
+/// walks the same table by *preference*, because a bot draw has no arrival time to
+/// wait out: the whole candidate pool is visible at once, so it takes the tightest
+/// step that has anybody in it. Sharing one table is the point — a bot must not be
+/// allowed to be a worse match than a human would have been.
+pub const BRACKET_STEPS: [(i32, i64); 3] = [(5, 150), (10, 300), (20, 600)];
+
+/// Are these two inside one specific bracket step? The single level/trophy
+/// comparison in this module — [`compatible`] and [`pick_bot_index`] both go
+/// through it so the human and bot paths cannot drift apart.
+fn within_step(a: Skill, b: Skill, step: (i32, i64)) -> bool {
+    (a.level - b.level).abs() <= step.0 && (a.trophies - b.trophies).abs() <= step.1
 }
 
 /// May these two be paired right now?
@@ -157,14 +174,11 @@ pub fn bracket_for(waited: Duration) -> Option<(i32, i64)> {
 /// player in the queue forever. The bracket is a preference we enforce while we
 /// can, not a gate that can deadlock the arena.
 pub fn compatible(a: Option<Skill>, b: Option<Skill>, waited: Duration) -> bool {
-    let Some((max_level, max_trophies)) = bracket_for(waited) else {
+    let Some(step) = bracket_for(waited) else {
         return true;
     };
     match (a, b) {
-        (Some(x), Some(y)) => {
-            (x.level - y.level).abs() <= max_level
-                && (x.trophies - y.trophies).abs() <= max_trophies
-        }
+        (Some(x), Some(y)) => within_step(x, y, step),
         _ => true,
     }
 }
@@ -422,18 +436,66 @@ fn row_has_customization(r: &CharacterDbEntryCharacterWalletInventory) -> bool {
         .unwrap_or(false)
 }
 
-/// Pure selection: from `(character_uuid, is_complete)` candidates, choose a bot that is
-/// COMPLETE (renders) AND distinct from the human (not a self-match), rotated by the
-/// match's `gsid` for variety. Returns the chosen index, or `None` if none qualifies.
+/// The strength of a loaded `characters` row, for the bot draw's bracket.
+///
+/// Reads the SAME two fields `load_skill` reads for a queueing human —
+/// `character.level` and `character.matchmakingPvpTrophies` — but off the already
+/// loaded row rather than a second query, since `pick_bot_loadout` has the whole
+/// pool in hand. `None` is impossible today (both are non-optional on
+/// `CompleteCharacter`) and is kept as the shape so a future nullable column
+/// degrades to "unknown, don't block" rather than to a level of 0.
+fn skill_of_row(r: &CharacterDbEntryCharacterWalletInventory) -> Option<Skill> {
+    Some(Skill {
+        level: r.character.0.level as i32,
+        trophies: r.character.0.matchmaking_pvp_trophies,
+    })
+}
+
+/// One row of the bot pool, as [`pick_bot_index`] sees it: the candidate's
+/// character UUID, whether its profile is COMPLETE enough to render, and its
+/// strength (`None` when the row's level/trophies could not be read).
+pub type BotCandidate = (String, bool, Option<Skill>);
+
+/// Pure selection: from the candidate pool, choose a bot that is COMPLETE (renders),
+/// distinct from the human (not a self-match), and AS CLOSE TO THE HUMAN'S STRENGTH
+/// as the pool allows. Returns the chosen index, or `None` if none qualifies.
+///
+/// WHY THE STRENGTH TIER EXISTS (tracker #24)
+///
+/// The 30-second widening bracket at [`bracket_for`] governs HUMAN pairing only.
+/// Bots bypassed it entirely: selection filtered on complete + non-self and then
+/// rotated by gsid, so the pool's *level* never entered the decision. The reporter
+/// is level 43 and drew bots at levels 89, 93, 66 and 89 — every one of his six
+/// matches was a solo bot fallback — taking 30-48 % of his health per hit and dying
+/// in two or three. tracker #19 had already fixed exactly this for humans; the bot
+/// path was simply never wired to the same rule.
+///
+/// The band is [`BRACKET_STEPS`] — the human bracket's own numbers. We hold NO
+/// retail matchmaking capture and no shipped matchmaking table, so there is no
+/// retail-derived band to use; the human bracket is the closest in-repo precedent
+/// and reusing its table by construction means a bot can never be a worse match
+/// than a human would have been allowed to be.
+///
+/// A bot draw has no arrival time to wait out (the whole pool is visible at once
+/// and the human has ALREADY waited out the solo-fallback timer to get here), so
+/// the steps are walked as a preference ladder, tightest first, and the first
+/// non-empty tier wins. Within a tier the gsid rotation is preserved, so variety
+/// across matches survives.
+///
+/// It is a PREFERENCE, never a gate: if no tier has anybody — or the human's or the
+/// candidates' skill could not be read — it falls back to the full eligible set
+/// rather than refuse to start a match. An unfair bot beats no opponent at all,
+/// which is the same call `compatible` makes for humans.
 fn pick_bot_index(
-    candidates: &[(String, bool)],
+    candidates: &[BotCandidate],
     human_char_uuid: &str,
+    human: Option<Skill>,
     gsid: Uuid,
 ) -> Option<usize> {
     let eligible: Vec<usize> = candidates
         .iter()
         .enumerate()
-        .filter(|(_, (uuid, complete))| *complete && !is_self_match(human_char_uuid, uuid))
+        .filter(|(_, (uuid, complete, _))| *complete && !is_self_match(human_char_uuid, uuid))
         .map(|(i, _)| i)
         .collect();
     if eligible.is_empty() {
@@ -442,7 +504,22 @@ fn pick_bot_index(
     // Rotate by the (random) gsid's first byte → variety across matches, deterministic
     // for a given match. No RNG (Date/rand are unavailable/undesired in this actor).
     let seed = gsid.as_bytes()[0] as usize;
-    Some(eligible[seed % eligible.len()])
+    let rotate = |pool: &[usize]| pool[seed % pool.len()];
+
+    let Some(h) = human else {
+        return Some(rotate(&eligible));
+    };
+    for step in BRACKET_STEPS {
+        let tier: Vec<usize> = eligible
+            .iter()
+            .copied()
+            .filter(|&i| candidates[i].2.is_some_and(|c| within_step(h, c, step)))
+            .collect();
+        if !tier.is_empty() {
+            return Some(rotate(&tier));
+        }
+    }
+    Some(rotate(&eligible))
 }
 
 /// Load a SOLO-match bot opponent: a real, COMPLETE, distinct character so the bot has a
@@ -508,10 +585,11 @@ fn mark_loadout_as_bot(lo: &mut crate::arena::combat::Loadout) {
 async fn load_bot_loadout(
     db: &Option<DbPool>,
     human_char_uuid: &str,
+    human: Option<Skill>,
     config: &ArenaConfig,
     gsid: Uuid,
 ) -> crate::arena::combat::Loadout {
-    let mut lo = pick_bot_loadout(db, human_char_uuid, config, gsid).await;
+    let mut lo = pick_bot_loadout(db, human_char_uuid, human, config, gsid).await;
     mark_loadout_as_bot(&mut lo);
     lo
 }
@@ -519,6 +597,7 @@ async fn load_bot_loadout(
 async fn pick_bot_loadout(
     db: &Option<DbPool>,
     human_char_uuid: &str,
+    human: Option<Skill>,
     config: &ArenaConfig,
     gsid: Uuid,
 ) -> crate::arena::combat::Loadout {
@@ -550,12 +629,27 @@ async fn pick_bot_loadout(
         q.load(&mut conn).await.unwrap_or_default()
     };
 
-    let candidates: Vec<(String, bool)> = rows
+    let candidates: Vec<BotCandidate> = rows
         .iter()
-        .map(|r| (r.id.to_string(), row_has_customization(r)))
+        .map(|r| (r.id.to_string(), row_has_customization(r), skill_of_row(r)))
         .collect();
-    match pick_bot_index(&candidates, human_char_uuid, gsid) {
-        Some(i) => loadout_from_row(&rows[i]),
+    match pick_bot_index(&candidates, human_char_uuid, human, gsid) {
+        Some(i) => {
+            if let (Some(h), Some(b)) = (human, candidates[i].2) {
+                info!(
+                    "matchmaker: bot drawn at level {} / {} trophies vs the player's {} / {} \
+                     (level gap {}, trophy gap {}) from a pool of {}",
+                    b.level,
+                    b.trophies,
+                    h.level,
+                    h.trophies,
+                    (b.level - h.level).abs(),
+                    (b.trophies - h.trophies).abs(),
+                    candidates.len(),
+                );
+            }
+            loadout_from_row(&rows[i])
+        }
         None => {
             warn!(
                 "matchmaker: no COMPLETE distinct bot character available (pool {}) — bot falls \
@@ -742,6 +836,7 @@ mod bot_pick_tests {
             .block_on(load_bot_loadout(
                 &None,
                 "00000000-0000-0000-0000-000000000000",
+                None,
                 &config,
                 Uuid::nil(),
             ));
@@ -798,26 +893,178 @@ mod bot_pick_tests {
         Uuid::from_bytes(bytes)
     }
 
+    /// A candidate whose strength is unknown — the shape these tests used before the
+    /// bot bracket existed, so they keep asserting exactly what they asserted then.
+    fn cand(uuid: &str, complete: bool) -> BotCandidate {
+        (uuid.to_string(), complete, None)
+    }
+
+    /// A candidate at a known level / trophy count.
+    fn cand_at(uuid: &str, level: i32, trophies: i64) -> BotCandidate {
+        (uuid.to_string(), true, Some(Skill { level, trophies }))
+    }
+
     #[test]
     fn pick_bot_index_prefers_complete_and_distinct() {
         let human = "aaaaaaaa-0000-0000-0000-000000000001";
         let cands = vec![
-            (human.to_string(), true),                              // self-match → excluded
-            ("bbbbbbbb-0000-0000-0000-000000000002".into(), false), // incomplete → excluded
-            ("cccccccc-0000-0000-0000-000000000003".into(), true),  // the only eligible
+            cand(human, true),                                            // self-match → excluded
+            cand("bbbbbbbb-0000-0000-0000-000000000002", false),          // incomplete → excluded
+            cand("cccccccc-0000-0000-0000-000000000003", true),           // the only eligible
         ];
-        assert_eq!(pick_bot_index(&cands, human, gsid_with_first_byte(0)), Some(2));
-        assert_eq!(pick_bot_index(&cands, human, gsid_with_first_byte(123)), Some(2));
+        assert_eq!(pick_bot_index(&cands, human, None, gsid_with_first_byte(0)), Some(2));
+        assert_eq!(pick_bot_index(&cands, human, None, gsid_with_first_byte(123)), Some(2));
     }
 
     #[test]
     fn pick_bot_index_none_when_no_complete_distinct() {
         let human = "aaaaaaaa-0000-0000-0000-000000000001";
         let cands = vec![
-            (human.to_string(), true),                              // self
-            ("dddddddd-0000-0000-0000-000000000004".into(), false), // incomplete
+            cand(human, true),                                   // self
+            cand("dddddddd-0000-0000-0000-000000000004", false), // incomplete
         ];
-        assert_eq!(pick_bot_index(&cands, human, gsid_with_first_byte(0)), None);
+        assert_eq!(pick_bot_index(&cands, human, None, gsid_with_first_byte(0)), None);
+    }
+
+    // -------------------------------------------------------------------
+    // tracker #24: the bot draw goes through the human bracket
+    // -------------------------------------------------------------------
+
+    const NOBODY: &str = "zzzzzzzz-0000-0000-0000-000000000009";
+
+    /// THE reported case. Level 43, and the pool holds the four bot levels he
+    /// actually drew (89, 93, 66, 89) plus one bot near him. The near one must win
+    /// regardless of the gsid rotation — before this, every seed was equally likely
+    /// to hand him the level 93.
+    #[test]
+    fn a_level_43_player_draws_the_bot_near_his_level() {
+        let taheen = Some(Skill { level: 43, trophies: 240 });
+        let cands = vec![
+            cand_at("11111111-0000-0000-0000-000000000001", 89, 700),
+            cand_at("22222222-0000-0000-0000-000000000002", 93, 810),
+            cand_at("33333333-0000-0000-0000-000000000003", 66, 520),
+            cand_at("44444444-0000-0000-0000-000000000004", 89, 690),
+            cand_at("55555555-0000-0000-0000-000000000005", 45, 300), // the fair one
+        ];
+        for seed in 0u8..=255 {
+            assert_eq!(
+                pick_bot_index(&cands, NOBODY, taheen, gsid_with_first_byte(seed)),
+                Some(4),
+                "seed {seed} must still draw the level-45 bot, not one of the 66-93s",
+            );
+        }
+        // And the old behaviour really did hand him the far ones: with no skill on
+        // either side the rotation walks the whole pool.
+        let blind: Vec<Option<usize>> = (0u8..5)
+            .map(|s| pick_bot_index(&cands, NOBODY, None, gsid_with_first_byte(s)))
+            .collect();
+        assert_eq!(blind, vec![Some(0), Some(1), Some(2), Some(3), Some(4)]);
+    }
+
+    /// The ladder is walked TIGHTEST FIRST, and it is the human bracket's own table.
+    /// A bot inside step 0 beats a bot that only makes step 1, which beats step 2.
+    #[test]
+    fn the_bot_ladder_takes_the_tightest_step_that_has_anyone() {
+        let me = Some(Skill { level: 50, trophies: 400 });
+        // One candidate per step, plus one outside every step.
+        let cands = vec![
+            cand_at("00000000-0000-0000-0000-00000000000f", 90, 2000), // outside all
+            cand_at("00000000-0000-0000-0000-000000000003", 68, 970),  // outside all (level 18 ok, trophies 570 → step 2)
+            cand_at("00000000-0000-0000-0000-000000000002", 59, 690),  // step 1 (9 / 290)
+            cand_at("00000000-0000-0000-0000-000000000001", 53, 500),  // step 0 (3 / 100)
+        ];
+        for seed in [0u8, 1, 7, 128, 255] {
+            assert_eq!(
+                pick_bot_index(&cands, NOBODY, me, gsid_with_first_byte(seed)),
+                Some(3),
+                "the step-0 candidate wins outright",
+            );
+        }
+        // Drop it → the step-1 candidate. Then the step-2 one. Then anyone.
+        let mut pool = cands.clone();
+        pool.remove(3);
+        assert_eq!(pick_bot_index(&pool, NOBODY, me, gsid_with_first_byte(0)), Some(2));
+        pool.remove(2);
+        assert_eq!(pick_bot_index(&pool, NOBODY, me, gsid_with_first_byte(0)), Some(1));
+        pool.remove(1);
+        // Only the far one is left: a bad match beats no match.
+        assert_eq!(pick_bot_index(&pool, NOBODY, me, gsid_with_first_byte(0)), Some(0));
+    }
+
+    /// The bracket is a PREFERENCE, never a gate. An unusable pool must still yield
+    /// an opponent rather than strand the player at "determining server".
+    #[test]
+    fn the_bot_bracket_never_refuses_to_start_a_match() {
+        let me = Some(Skill { level: 5, trophies: 10 });
+        let far = vec![cand_at("00000000-0000-0000-0000-000000000001", 100, 5000)];
+        assert_eq!(
+            pick_bot_index(&far, NOBODY, me, gsid_with_first_byte(0)),
+            Some(0),
+            "nobody in any step → still pick the far bot",
+        );
+        // Unknown human skill (a failed `load_skill`) → the pre-#24 rotation.
+        assert_eq!(pick_bot_index(&far, NOBODY, None, gsid_with_first_byte(0)), Some(0));
+        // Unknown CANDIDATE skill → it cannot satisfy a step, but it can still be drawn.
+        let unknown = vec![cand("00000000-0000-0000-0000-000000000002", true)];
+        assert_eq!(pick_bot_index(&unknown, NOBODY, me, gsid_with_first_byte(0)), Some(0));
+        // And an INCOMPLETE candidate is still excluded — the render guard outranks
+        // the bracket, because an invisible opponent hangs the client at "Connecting".
+        let incomplete = vec![("00000000-0000-0000-0000-000000000003".to_string(), false, Some(Skill { level: 5, trophies: 10 }))];
+        assert_eq!(pick_bot_index(&incomplete, NOBODY, me, gsid_with_first_byte(0)), None);
+    }
+
+    /// Variety across matches must survive inside a tier: two bots equally close to
+    /// the player still rotate by gsid, as they did before the bracket existed.
+    #[test]
+    fn the_gsid_rotation_still_varies_within_a_tier() {
+        let me = Some(Skill { level: 50, trophies: 400 });
+        let cands = vec![
+            cand_at("00000000-0000-0000-0000-000000000001", 48, 350),
+            cand_at("00000000-0000-0000-0000-000000000002", 52, 450),
+            cand_at("00000000-0000-0000-0000-000000000003", 95, 3000), // outside every step
+        ];
+        assert_eq!(pick_bot_index(&cands, NOBODY, me, gsid_with_first_byte(0)), Some(0));
+        assert_eq!(pick_bot_index(&cands, NOBODY, me, gsid_with_first_byte(1)), Some(1));
+        assert_eq!(
+            pick_bot_index(&cands, NOBODY, me, gsid_with_first_byte(2)),
+            Some(0),
+            "the rotation wraps within the tier and never reaches the level-95 bot",
+        );
+    }
+
+    /// A self-match is excluded before the bracket is consulted — it is the
+    /// "opponent actor never instantiates" hang, not a fairness question.
+    #[test]
+    fn a_perfectly_matched_self_is_still_refused() {
+        let human = "aaaaaaaa-0000-0000-0000-000000000001";
+        let me = Some(Skill { level: 50, trophies: 400 });
+        let cands = vec![
+            (human.to_string(), true, Some(Skill { level: 50, trophies: 400 })),
+            cand_at("00000000-0000-0000-0000-000000000002", 95, 3000),
+        ];
+        assert_eq!(
+            pick_bot_index(&cands, human, me, gsid_with_first_byte(0)),
+            Some(1),
+            "the far bot beats fighting yourself",
+        );
+    }
+
+    /// The human and bot paths must share one table. If `bracket_for` and
+    /// `BRACKET_STEPS` ever diverge, a bot could be a worse match than a human
+    /// would have been allowed to be — the exact defect this fixes.
+    #[test]
+    fn the_human_bracket_and_the_bot_ladder_are_the_same_table() {
+        for (i, secs) in [0u64, 10, 20].iter().enumerate() {
+            assert_eq!(
+                bracket_for(Duration::from_secs(*secs)),
+                Some(BRACKET_STEPS[i]),
+                "bracket step {i} must be BRACKET_STEPS[{i}]",
+            );
+        }
+        // Tightest first, and monotonically widening.
+        for w in BRACKET_STEPS.windows(2) {
+            assert!(w[1].0 >= w[0].0 && w[1].1 >= w[0].1, "the ladder must not narrow");
+        }
     }
 
     /// The pairing that produced tracker #19: Taheen at level 43 against a level
@@ -894,14 +1141,14 @@ mod bot_pick_tests {
     fn pick_bot_index_rotates_across_matches() {
         let human = "zzzzzzzz-0000-0000-0000-000000000009";
         let cands = vec![
-            ("11111111-0000-0000-0000-000000000001".into(), true),
-            ("22222222-0000-0000-0000-000000000002".into(), true),
-            ("33333333-0000-0000-0000-000000000003".into(), true),
+            cand("11111111-0000-0000-0000-000000000001", true),
+            cand("22222222-0000-0000-0000-000000000002", true),
+            cand("33333333-0000-0000-0000-000000000003", true),
         ];
         // Three eligible → gsid first-byte selects eligible[b % 3]; distinct seeds differ.
-        assert_eq!(pick_bot_index(&cands, human, gsid_with_first_byte(0)), Some(0));
-        assert_eq!(pick_bot_index(&cands, human, gsid_with_first_byte(1)), Some(1));
-        assert_eq!(pick_bot_index(&cands, human, gsid_with_first_byte(2)), Some(2));
+        assert_eq!(pick_bot_index(&cands, human, None, gsid_with_first_byte(0)), Some(0));
+        assert_eq!(pick_bot_index(&cands, human, None, gsid_with_first_byte(1)), Some(1));
+        assert_eq!(pick_bot_index(&cands, human, None, gsid_with_first_byte(2)), Some(2));
     }
 }
 
@@ -1458,10 +1705,15 @@ async fn resolve(
             .get(0)
             .map(|l| l.character_uuid.clone())
             .unwrap_or_default();
+        // The lone human's strength, so the bot is drawn from the same bracket a
+        // human opponent would have had to satisfy (tracker #24). Read at enqueue by
+        // `load_skill`; `None` when that lookup failed, which `pick_bot_index`
+        // degrades to "any eligible bot" rather than refusing to start a match.
+        let human_skill = tickets.first().and_then(|t| t.skill);
         while loadouts.len() < tickets.len() + bots {
             let bot = match tokio::time::timeout(
                 std::time::Duration::from_millis(1500),
-                load_bot_loadout(db, &human_char_uuid, config, game_session_id),
+                load_bot_loadout(db, &human_char_uuid, human_skill, config, game_session_id),
             )
             .await
             {
