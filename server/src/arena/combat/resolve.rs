@@ -1039,7 +1039,10 @@ fn resolve_ability_cast(
         );
         let packed = combat.fighters[sender].packed_stats();
         let obj_id = combat.fighters[sender].net_object_id;
-        let frame = messages::player_stats_update(obj_id, packed);
+        // propId 5 is `_pvpOtherActorStats` — the OPPONENT of the avatar at propId 0.
+        // It used to be a hardcoded `1`, which decodes to all-pools-zero.
+        let other_packed = combat.fighters[target_slot].packed_stats();
+        let frame = messages::player_stats_update(obj_id, packed, other_packed);
         (0..combat.fighters.len()).map(|s| (s, frame.clone())).collect()
     } else {
         Vec::new()
@@ -2179,7 +2182,18 @@ fn apply_regen_tick(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u
             f.stats_seq = f.stats_seq.wrapping_add(1);
             let packed = f.packed_stats();
             let obj_id = f.net_object_id;
-            let frame = messages::player_stats_update(obj_id, packed);
+            // propId 5 is `_pvpOtherActorStats` — the OPPONENT of the avatar at
+            // propId 0. It used to be a hardcoded `1`, which decodes to
+            // all-pools-zero, and this tick fires ~1/s per fighter for the whole
+            // fight. `packed_stats()` is a pure read: it does not bump the
+            // opponent's own `stats_seq`.
+            let opp_slot = combat.fighters[slot].arena_target;
+            let other_packed = combat
+                .fighters
+                .get(opp_slot)
+                .map(|o| o.packed_stats())
+                .unwrap_or(packed);
+            let frame = messages::player_stats_update(obj_id, packed, other_packed);
             debug!(
                 "combat regen: slot {slot} stam {before_s}→{}/{} mag {before_m}→{}/{}",
                 combat.fighters[slot].stamina, combat.fighters[slot].max_stamina,
@@ -2707,6 +2721,54 @@ mod tests {
         );
         // The tick may still emit op65 if stamina/magicka changed, but HP must be static.
         let _ = out;
+    }
+
+    /// tracker #24: op65 propId 5 is `_pvpOtherActorStats` — the OPPONENT of the
+    /// avatar named at propId 0, exactly as `receive_damage` and
+    /// `player_channeling_state_change` already fill it.
+    ///
+    /// It shipped as the literal `1`. `PackedStats` puts the stat word in the HIGH
+    /// 32 bits and the sequence id in the LOW 32, so `1` decodes to
+    /// `health 0 / stamina 0 / magicka 0, seq 1` — every op65 told both clients the
+    /// other fighter's three bars were empty. The regen tick emits one ~1/s per
+    /// fighter with a moved pool, i.e. for essentially the whole fight.
+    #[test]
+    fn regen_tick_op65_carries_the_opponents_real_stats_not_a_placeholder() {
+        use super::super::state::PackedStats;
+        let now = Instant::now();
+        let mut combat = make_live_combat(now);
+
+        // Only slot 0's pool moves, so the single op65 is named on slot 0's avatar
+        // and its propId 5 must therefore describe slot 1.
+        combat.fighters[0].stamina = combat.fighters[0].max_stamina / 2;
+        combat.last_regen_tick = now;
+        let out = apply_regen_tick(&mut combat, now + REGEN_TICK_INTERVAL);
+
+        let (_, frame) = out
+            .iter()
+            .find(|(_, f)| messages::user_message_gmid(f) == Some(65))
+            .expect("the regen tick emits an op65 PlayerStatsUpdate");
+        let nd = arena_proto::parse_netdata(&frame[2..]);
+        assert_eq!(
+            nd.int(0),
+            Some(combat.fighters[0].net_object_id as i64),
+            "propId 0 names slot 0's avatar, so propId 5 is slot 1's",
+        );
+        let other = match nd.get(5) {
+            Some(arena_proto::NetDataValue::ULong(v)) => *v,
+            got => panic!("propId 5 must be a ULong, got {got:?}"),
+        };
+        assert_eq!(
+            other,
+            combat.fighters[1].packed_stats(),
+            "propId 5 must be the OPPONENT's packed_stats()",
+        );
+        let (h, s, m, _) = PackedStats::unpack(other);
+        assert!(
+            h > 0 && s > 0 && m > 0,
+            "an untouched opponent must read as full, not empty — got h={h} s={s} m={m} \
+             (the old hardcoded `1` decoded to 0/0/0)",
+        );
     }
 
     // -----------------------------------------------------------------------

@@ -1408,7 +1408,24 @@ impl MatchInstance {
     /// at zero). The op65 pair is the only frame that moves those bars.
     fn broadcast_current_stats(&self, out: &mut Vec<(usize, Vec<u8>)>) {
         for actor in &self.combat.fighters {
-            let frame = messages::player_stats_update(actor.net_object_id, actor.packed_stats());
+            // propId 5 is `_pvpOtherActorStats` — the OPPONENT of the avatar named at
+            // propId 0, the same pairing `receive_damage` and the regen tick use. It
+            // must NOT be the placeholder `1`: that decodes to health 0 / stamina 0 /
+            // magicka 0, which would make this between-rounds reset announce the
+            // opponent's bars as EMPTY at the top of round 2 — the very symptom this
+            // broadcast exists to clear. `packed_stats()` is a pure read and does not
+            // bump the opponent's own `stats_seq`.
+            let other_packed = self
+                .combat
+                .fighters
+                .get(actor.arena_target)
+                .map(|o| o.packed_stats())
+                .unwrap_or_else(|| actor.packed_stats());
+            let frame = messages::player_stats_update(
+                actor.net_object_id,
+                actor.packed_stats(),
+                other_packed,
+            );
             for viewer in 0..self.combat.fighters.len() {
                 out.push((viewer, frame.clone()));
             }
@@ -2399,6 +2416,70 @@ pub(in crate::arena::combat) mod tests {
                      when round 2 opens — the HP reset used to be silent"
                 );
             }
+        }
+    }
+
+    /// **Report #24, cross-PR guard — the inter-round op65 names the opponent's REAL
+    /// stats at propId 5, not the placeholder.**
+    ///
+    /// `broadcast_current_stats` was written against the two-argument
+    /// `player_stats_update`, which hardcoded propId 5 (`_pvpOtherActorStats`) to the
+    /// literal `1`. `PackedStats` puts the stat word in the HIGH 32 bits and the
+    /// sequence id in the LOW 32, so `1` decodes to `health 0 / stamina 0 /
+    /// magicka 0` — meaning this broadcast would have re-opened round 2 announcing the
+    /// OPPONENT's three bars as empty, which is the same stale-bar symptom the
+    /// broadcast exists to clear. Fixing only the caller's arity would have compiled
+    /// and shipped that. This asserts the value, so it cannot regress silently.
+    #[test]
+    fn interround_op65_carries_the_opponents_real_stats_not_a_placeholder() {
+        use super::super::state::PackedStats;
+        let (mut m, t0) = live_inst(2);
+        let (_death, t) = swing_until_death(&mut m, 0, t0);
+
+        // Walk the between-rounds progression, keeping the RAW op65 bytes so propId 5
+        // can be read (the shared `classify_interround` decodes only propId 4).
+        let mut seen: Vec<(i64, u64)> = Vec::new();
+        let step = Duration::from_millis(100);
+        for i in 1..=600u32 {
+            for (_viewer, b) in m.on_tick(2, t + step * i) {
+                if b.len() > 2 && b[1] == 0x36 {
+                    let nd = arena_proto::parse_netdata(&b[2..]);
+                    if nd.int(3) == Some(65) {
+                        if let (Some(obj), Some(NetDataValue::ULong(other))) =
+                            (nd.int(0), nd.props.get(&5))
+                        {
+                            seen.push((obj, *other));
+                        }
+                    }
+                }
+            }
+            if m.phase() == FlowState::StateTimeout {
+                break;
+            }
+        }
+        assert_eq!(m.phase(), FlowState::StateTimeout, "round 2 must re-open");
+        assert!(!seen.is_empty(), "the between-rounds walk must emit op65 frames");
+
+        for slot in 0..2 {
+            let obj = m.combat.fighters[slot].net_object_id as i64;
+            let opp = m.combat.fighters[slot].arena_target;
+            let expected = m.combat.fighters[opp].packed_stats();
+            let (_, other) = seen
+                .iter()
+                .find(|(o, _)| *o == obj)
+                .unwrap_or_else(|| panic!("no op65 named slot {slot} (obj {obj})"));
+            let (h, s, mg, _) = PackedStats::unpack(*other);
+            assert!(
+                h > 0 && s > 0 && mg > 0,
+                "slot {slot}'s op65 must describe its opponent (slot {opp}) as ALIVE at \
+                 the top of round 2, not empty — got h={h} s={s} m={mg}. The old \
+                 hardcoded `1` decoded to 0/0/0.",
+            );
+            assert_eq!(
+                *other, expected,
+                "propId 5 must be slot {opp}'s packed_stats(), the opponent of the \
+                 avatar named at propId 0",
+            );
         }
     }
 
