@@ -1265,6 +1265,44 @@ impl Fighter {
         self.stats_seq = self.stats_seq.wrapping_add(1);
     }
 
+    /// Apply the **non-health** damage components of a hit to their pools:
+    /// `DamageType::Stamina` drains stamina and `DamageType::Magicka` drains
+    /// magicka, both clamped at 0.
+    ///
+    /// These are the *mirrored drains* the shipped `CombatParameters` define —
+    /// `frostDamageToStaminaDamage = 1` (Frost → Stamina) and
+    /// `shockDamageToMagickaDamage = 1` (Shock → Magicka). `damage::mirrored_drain`
+    /// has always put them on the wire, and the retail capture agrees they belong
+    /// there (s615 #4394011: `Frost 13.19 + Stamina 13.19` in one `ReceiveDamage`) —
+    /// but **nothing ever subtracted them**. `emit_damage` summed only the
+    /// health-typed components and called `take_damage`, so a Frostbite landing on a
+    /// full stamina bar left it full and the frame's own packed stats said so. That
+    /// is the whole distinctive effect of a frost build doing nothing.
+    ///
+    /// Returns `(stamina_drained, magicka_drained)` for logging.
+    pub fn drain_mirrored_pools(&mut self, components: &[(DamageType, f32)]) -> (u32, u32) {
+        let take = |ty: DamageType| -> u32 {
+            components
+                .iter()
+                .filter(|(t, _)| *t == ty)
+                .map(|(_, v)| *v)
+                .sum::<f32>()
+                .round()
+                .max(0.0) as u32
+        };
+        let s = take(DamageType::Stamina);
+        let m = take(DamageType::Magicka);
+        if s == 0 && m == 0 {
+            return (0, 0);
+        }
+        let drained_s = s.min(self.stamina);
+        let drained_m = m.min(self.magicka);
+        self.stamina -= drained_s;
+        self.magicka -= drained_m;
+        self.stats_seq = self.stats_seq.wrapping_add(1);
+        (drained_s, drained_m)
+    }
+
     /// The packed-stats ULong for `ReceiveDamage` propId 4/5: each pool encoded as
     /// its 10-bit fraction of max (`STAT_MAX` = full), + the sequence id in the hi32.
     pub fn packed_stats(&self) -> u64 {
