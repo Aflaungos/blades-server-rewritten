@@ -405,6 +405,7 @@ impl DamageModel for RetailDamageModel {
         now: Instant,
     ) -> ResolvedDamage {
         // The shipped per-rank `_damage` + the ability's own `damage_type`.
+        let mut source = DamageSource::Spell;
         let (ty, base) = match super::gamedata::ability(ability_uuid) {
             Some(a) => {
                 // Some spells are DAMAGE-OVER-TIME and ship no direct `_damage` at all —
@@ -413,20 +414,31 @@ impl DamageModel for RetailDamageModel {
                 // and `unwrap_or(0.0)` made a 280-magicka spell deal NOTHING. Measured on
                 // prod 2026-08-03, where 87 of 160 casts dealt exactly 0.0.
                 //
-                // The total is `dps × ELEMENTAL_STATUS_DURATION` — the same shipped
-                // duration the engine already uses for every elemental condition DoT
-                // (`resolve::CONDITION_DURATION_SECS`), so the number is derived from
-                // game data rather than invented.
+                // The total is `dps × the rank's OWN channel/effect length`, not the
+                // 5 s elemental-condition duration this used to reach for. Frostbite
+                // ships `channelMaxLength = 3`; billing it for 5 s inflated every rank
+                // by 5/3 (R4: 479.0 instead of 287.4 — the exact figure arena-server
+                // logged for the reporter's cast in prod session 911 on 2026-08-18).
+                // `ConsumingInferno` is the same shape; `PoisonCloud` ships
+                // `duration = 5`, so it is unchanged, and `ELEMENTAL_STATUS_DURATION`
+                // survives only as the last-resort default.
                 //
-                // CAVEAT, stated rather than hidden: retail almost certainly TICKS this
-                // over the duration instead of landing it in one hit. Applying it as a
-                // lump sum is the honest floor — the spell does its shipped total damage
-                // — and the tick schedule is the follow-up. It is not pinned by any
-                // capture we have.
+                // CAVEAT, stated rather than hidden: retail TICKS this over the channel
+                // instead of landing it in one hit — capture s615 #4394011ff shows a
+                // Frostbite cast producing a stream of `ReceiveDamage` frames rather
+                // than one. Applying the shipped total as a lump is the honest floor;
+                // the tick schedule is the follow-up.
                 let dmg = tables::ability_damage(ability_uuid, ability_level).unwrap_or_else(|| {
                     super::gamedata::ability_rank_clamped(ability_uuid, ability_level.max(1) as u16)
-                        .and_then(|r| r.damage_per_second())
-                        .map(|dps| dps * super::gamedata::combat_params::ELEMENTAL_STATUS_DURATION)
+                        .and_then(|r| r.damage_per_second().map(|dps| (r, dps)))
+                        .map(|(r, dps)| {
+                            // A CHANNELLED spell is `ContinuousSpell` on the wire, not
+                            // `Spell` — s615 #4394011 carries `damageSource = 8`. The
+                            // client keys its channelled-damage presentation off this
+                            // discriminator, so sending 2 renders a channel as nothing.
+                            source = DamageSource::ContinuousSpell;
+                            dps * dot_span_secs(&r)
+                        })
                         .unwrap_or(0.0)
                 });
                 let ty = a
@@ -445,8 +457,26 @@ impl DamageModel for RetailDamageModel {
         if let Some((drain_ty, ratio)) = mirrored_drain(ty) {
             components.push((drain_ty, base * ratio));
         }
-        finish_resolved(&Loadout::default(), target, DamageSource::Spell, active_side, &mut components, now)
+        finish_resolved(&Loadout::default(), target, source, active_side, &mut components, now)
     }
+}
+
+/// How long a `_damagePerSecond` ability applies for, in seconds — the rank's OWN
+/// shipped span, in the order the assets define it:
+///
+/// | field                | who ships it                        | value |
+/// |----------------------|-------------------------------------|-------|
+/// | `_channelMaxLength`  | Frostbite, ConsumingInferno         | 3     |
+/// | `_duration`          | PoisonCloud, FlameBreath, FrostBreath | 5 / 3 |
+///
+/// The fallback is `ELEMENTAL_STATUS_DURATION`, which is the *elemental-condition*
+/// DoT length and has nothing to do with a spell's channel — it was standing in for
+/// both, which is why Frostbite billed 5 s of damage for a 3 s channel.
+fn dot_span_secs(r: &super::gamedata::AbilityRank) -> f32 {
+    r.get(super::gamedata::AbilityField::ChannelMaxLength)
+        .or_else(|| r.duration())
+        .filter(|s| *s > 0.0)
+        .unwrap_or(super::gamedata::combat_params::ELEMENTAL_STATUS_DURATION)
 }
 
 /// Apply the post-roll mitigation pipeline and assemble the [`ResolvedDamage`]:
@@ -525,6 +555,47 @@ fn finish_resolved(
 /// `resistMessagingThreshold` is 0.2 — kept at the lower 0.05 wire floor because the
 /// capture reports `mostResisted` well below the *messaging* threshold.
 const MOST_RESISTED_FLOOR: f32 = 0.05;
+
+#[cfg(test)]
+mod report31_span_tests {
+    use super::*;
+    use crate::arena::combat::gamedata::{self, AbilityField};
+
+    /// The blast radius of reading a `_damagePerSecond` ability's OWN span instead
+    /// of the 5 s elemental-status duration. Exactly three abilities ship
+    /// `damagePerSecond` with no `_damage` and are routed to `resolve_ability`:
+    ///
+    /// | ability          | span field          | span | was | now |
+    /// |------------------|---------------------|------|-----|-----|
+    /// | Frostbite        | `channelMaxLength`  | 3    | ×5  | ×3  |
+    /// | ConsumingInferno | `channelMaxLength`  | 3    | ×5  | ×3  |
+    /// | PoisonCloud      | `duration`          | 5    | ×5  | ×5  |
+    ///
+    /// PoisonCloud is the control: its shipped `duration` IS 5, so this change
+    /// must leave it byte-identical. If the span lookup were wrong, it would move.
+    #[test]
+    fn dot_span_comes_from_the_ability_not_the_status_duration() {
+        const FROSTBITE: &str = "4be1d681-c35d-4540-b255-c2910ac80664";
+        const CONSUMING_INFERNO: &str = "e07f9b1a-64db-44ef-ba25-0e4378789ddc";
+        const POISON_CLOUD: &str = "66bdc017-30c5-4b5e-9753-215c45056f6a";
+
+        for (uuid, want) in [(FROSTBITE, 3.0), (CONSUMING_INFERNO, 3.0), (POISON_CLOUD, 5.0)] {
+            let r = gamedata::ability_rank_clamped(uuid, 1).expect("shipped rank 1");
+            assert!(r.damage_per_second().is_some(), "{uuid} ships damagePerSecond");
+            assert!(r.damage().is_none(), "{uuid} ships no flat _damage");
+            assert_eq!(dot_span_secs(&r), want, "{uuid} span");
+        }
+
+        // Frostbite's span is its channel, and it is NOT the elemental-status
+        // duration — the two were conflated.
+        let fb = gamedata::ability_rank_clamped(FROSTBITE, 4).unwrap();
+        assert_eq!(fb.get(AbilityField::ChannelMaxLength), Some(3.0));
+        assert_ne!(dot_span_secs(&fb), gamedata::combat_params::ELEMENTAL_STATUS_DURATION);
+        // Rank 4 is the reporter's rank (magickaCost 235, logged by arena-server on
+        // 2026-08-18 05:46:47): 95.80 dps × 3 s = 287.4, not the 479.0 prod emitted.
+        assert!((fb.damage_per_second().unwrap() * dot_span_secs(&fb) - 287.4).abs() < 0.1);
+    }
+}
 
 #[cfg(test)]
 mod tests {
