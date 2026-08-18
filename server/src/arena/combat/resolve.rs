@@ -3414,6 +3414,44 @@ mod tests {
         );
     }
 
+    /// **Report #31, "does not freeze the opponent".** Frostbite ships no
+    /// `_freezeDuration`, so the `apply_shipped_effects` gate can never fire for
+    /// it — the freeze is the ELEMENTAL STATUS (`Frozen`, status id 5), landed by
+    /// the conditioning accumulator. Retail lands it within ~1 s of every
+    /// Frostbite cast (s615: casts at 21:00:19 / 21:00:32 / 21:05:21 → op51
+    /// `apply=1 status=5` at 21:00:20 / 21:00:33 / 21:05:22).
+    #[test]
+    fn report31_frostbite_lands_the_frozen_status() {
+        let now = Instant::now();
+        let mut combat = make_prod_scale_combat(now);
+        let out = cast_frostbite(&mut combat, now);
+
+        let frozen: Vec<_> = out
+            .iter()
+            .filter(|(_, f)| messages::user_message_gmid(f) == Some(51))
+            .filter(|(_, f)| {
+                let nd = arena_proto::parse_netdata(&f[2..]);
+                nd.int(4) == Some(1)
+                    && nd.int(5)
+                        == Some(super::super::state::StatusEffectType::Frozen as u16 as i64)
+            })
+            .collect();
+        assert_eq!(
+            frozen.len(),
+            combat.fighters.len(),
+            "op51 Frozen(5) apply must go to every viewer, got {} frame(s)",
+            frozen.len()
+        );
+        let nd = arena_proto::parse_netdata(&frozen[0].1[2..]);
+        let dur = match nd.get(6) {
+            Some(arena_proto::NetDataValue::Float(v)) => *v,
+            _ => 0.0,
+        };
+        assert!(
+            (dur - super::super::gamedata::combat_params::ELEMENTAL_STATUS_DURATION).abs() < 0.01,
+            "the shipped elemental-status duration (5 s), got {dur}"
+        );
+    }
 
 }
 
