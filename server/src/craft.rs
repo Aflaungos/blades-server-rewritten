@@ -440,13 +440,23 @@ pub async fn finish_craft(
 ///   * `results: {}` on a job whose `completedAt` is in the past — the client shows
 ///     a collectable craft with nothing to collect, and `finish` grants nothing.
 ///
-/// Both are repaired here with the SAME resolution order the create path uses, and
-/// only from mappings that already exist in the extracted game data — a known
-/// recipe's own `craftingTypeId`, else the Smithing type for a resolvable forge
-/// craftable, else [`derive_plain_craft_type`]. No mapping is invented: for a recipe
-/// in neither table there is no recipe→station data on the Rust side at all, and the
-/// alchemy fallback (a real, client-mappable CraftingStation) is what unblocks the
-/// load. Closing that gap properly is a data-extraction task, not a code one.
+///   * a MAPPABLE but WRONG `craftingTypeId` — the third defect, only visible now that
+///     the APK table exists. Every craft written before this table fell back to
+///     Alchemy when its recipe was not one of the ~34 captured ones, so the live DB
+///     holds forge crafts (Iron Hand Axe, Iron Greatsword, Dragonbone Longsword, …)
+///     stored as ALCHEMY jobs. They load fine and name the wrong bench forever.
+///
+/// All three are repaired here with the SAME resolution order the create path uses,
+/// and only from mappings that already exist in the extracted game data: the APK's
+/// `recipe_crafting_types.json` first (per-recipe, authoritative, covers every recipe
+/// the client ships), else a known recipe's own `craftingTypeId`, else the Smithing
+/// type for a resolvable forge craftable, else [`derive_plain_craft_type`]. No mapping
+/// is invented — a recipe absent from the APK data keeps the old fallback chain.
+///
+/// One deliberate exception: a stored **Tempering / Enchanting** type is never
+/// second-guessed. Those two come from the request's `temperingLevel`
+/// ([`item_mod_crafting_type`]), which the recipe table cannot see, so the stored
+/// value carries information the table does not have.
 ///
 /// A well-formed job is returned borrowed and untouched.
 fn repaired_craft_fields<'a>(
@@ -457,27 +467,42 @@ fn repaired_craft_fields<'a>(
     // a CraftingType and a Recipe are different game-data objects and never share an id.
     let crafting_type_is_unmappable =
         job.crafting_type_id == job.recipe_id || job.crafting_type_id.is_nil();
+    let from_apk = apk_crafting_type(&job.recipe_id, static_data);
+    // A stored type the APK contradicts is a MISLABEL — written by a build that had no
+    // recipe→station table and guessed. Correct it, except for the two mod-craft types,
+    // which encode the request's `temperingLevel` rather than the recipe.
+    let crafting_type_is_mislabelled = match from_apk {
+        Some(right) => {
+            right != job.crafting_type_id
+                && job.crafting_type_id != item_mod_crafting_type(1)
+                && job.crafting_type_id != item_mod_crafting_type(0)
+        }
+        None => false,
+    };
     let results_are_empty = match &job.results {
         Value::Object(map) => map.is_empty(),
         Value::Null => true,
         _ => false,
     };
-    if !crafting_type_is_unmappable && !results_are_empty {
+    if !crafting_type_is_unmappable && !crafting_type_is_mislabelled && !results_are_empty {
         return (job.crafting_type_id, Cow::Borrowed(&job.results));
     }
 
     let known_recipe = static_data.recipes.get(&job.recipe_id);
     let smith_craftable = static_data.smith_craftables.resolve(&job.recipe_id);
 
-    let crafting_type_id = if !crafting_type_is_unmappable {
+    let crafting_type_id = if crafting_type_is_mislabelled {
+        from_apk.expect("mislabelled implies the APK has an answer")
+    } else if !crafting_type_is_unmappable {
         job.crafting_type_id
+    } else if let Some(right) = from_apk {
+        // The APK's own recipe -> CraftingType table: the RIGHT bench, not merely a
+        // mappable one. Ahead of the captured recipe and the smith guess because it is
+        // per-recipe data rather than a capture subset or a template-id coincidence
+        // (the loader test pins that it agrees with all 34 captured rows).
+        right
     } else if let Some(recipe) = known_recipe {
         recipe.crafting_type_id
-    } else if let Some(from_apk) = apk_crafting_type(&job.recipe_id, static_data) {
-        // The APK's own recipe -> CraftingType table: the RIGHT bench, not merely a
-        // mappable one. Ahead of the smith guess because it is per-recipe data rather
-        // than a template-id coincidence.
-        from_apk
     } else if smith_craftable.is_some() {
         smithing_crafting_type(static_data)
     } else {
@@ -1341,6 +1366,82 @@ mod tests {
             assert!(
                 apk_crafting_type(id, &sd).is_some(),
                 "salvage recipe {id} missing from the table"
+            );
+        }
+    }
+
+    /// The third defect the table exposes: a MAPPABLE but WRONG stored type. Every
+    /// craft written before the table fell back to Alchemy when its recipe was not one
+    /// of the ~34 captured ones, so the live DB holds forge crafts stored as ALCHEMY
+    /// jobs. They never hung the client — they just name the wrong bench forever.
+    ///
+    /// These six recipe ids are the ones actually sitting in production `craftJobs`
+    /// with `craftingTypeId = c9d3b3aa…` (Alchemy); all six are Smithing in the APK.
+    #[test]
+    fn a_forge_craft_stored_as_alchemy_is_relabelled_to_the_smithy() {
+        let sd = static_data_from_deploy();
+        let alchemy = Uuid::parse_str(ALCHEMY_CRAFTING_TYPE_ID).unwrap();
+        let smithing = Uuid::parse_str(SMITHING_CRAFTING_TYPE_ID).unwrap();
+        let live_forge_crafts_stored_as_alchemy = [
+            ("Iron Hand Axe", "b949b05f-2e46-4a0c-80e4-171c4aecb9e5"),
+            ("Iron Light Hammer", "38671302-f4f1-4357-aef9-5f57972c423d"),
+            ("Iron Dagger", "a57591a0-9354-411b-862a-5449dfbd335b"),
+            ("Iron Greatsword", "5fe0e868-957e-47c2-a094-9c1daad097d5"),
+            ("Iron Warhammer", "7ad4e3a0-49b0-4c2f-9a94-6158acbb51d9"),
+            ("Dragonbone Longsword", "668a077b-2a2e-477b-894d-cb0878fa7dd3"),
+        ];
+        for (name, id) in live_forge_crafts_stored_as_alchemy {
+            let recipe_id = Uuid::parse_str(id).unwrap();
+            assert_eq!(
+                apk_crafting_type(&recipe_id, &sd),
+                Some(smithing),
+                "{name} is forged at the Smithy"
+            );
+            let job = CraftJob {
+                id: Uuid::from_u128(0xF0),
+                recipe_id,
+                building_id: Uuid::from_u128(0xB4),
+                crafting_type_id: alchemy, // what the pre-table create path stored
+                completed_at_ms: 1_783_204_348_637,
+                results: serde_json::json!({"stackableItems": { id: 1 }}),
+            };
+            let wire = wire_of(&job, &sd);
+            assert_eq!(
+                wire["craftingTypeId"].as_str().unwrap(),
+                SMITHING_CRAFTING_TYPE_ID,
+                "{name}: a forge craft stored as Alchemy must be relabelled"
+            );
+            assert_eq!(wire["results"], job.results, "a mislabel must not touch the results");
+        }
+    }
+
+    /// The mod-craft exception: `temperingLevel` decides temper vs enchant and the
+    /// recipe table cannot see it, so a stored Tempering/Enchanting type is left alone
+    /// even when the table would say otherwise.
+    #[test]
+    fn a_stored_temper_or_enchant_type_is_never_second_guessed() {
+        let sd = static_data_from_deploy();
+        // A recipe the table calls Smithing, stored as a temper — the stored value wins.
+        let recipe_id = Uuid::parse_str("b949b05f-2e46-4a0c-80e4-171c4aecb9e5").unwrap();
+        for level in [0u64, 10] {
+            let stored = item_mod_crafting_type(level);
+            let job = CraftJob {
+                id: Uuid::from_u128(0xF2),
+                recipe_id,
+                building_id: Uuid::from_u128(0xB5),
+                crafting_type_id: stored,
+                completed_at_ms: 1_783_204_348_637,
+                results: serde_json::json!({"items":[{
+                    "id": "fad31819-b941-4446-a229-e22b3647b142",
+                    "itemTemplateId": "616b64ef-4184-4efb-af55-1a3f122431dc",
+                    "temperingLevel": level, "durability": 675.0
+                }]}),
+            };
+            let wire = wire_of(&job, &sd);
+            assert_eq!(
+                wire["craftingTypeId"].as_str().unwrap(),
+                stored.to_string(),
+                "a stored mod-craft type must survive (temperingLevel is not in the table)"
             );
         }
     }
