@@ -264,7 +264,12 @@ pub async fn create_craft(
                         if let Some(craftable) =
                             globals.static_data.smith_craftables.resolve(&recipe_id)
                         {
-                            let crafting_type_id = smithing_crafting_type(&globals.static_data);
+                            // Prefer the APK's per-recipe answer; the Smithing constant
+                            // stays as the fallback for a craftable resolved by template
+                            // id (which is not a recipe id and so is not in the table).
+                            let crafting_type_id =
+                                apk_crafting_type(&recipe_id, &globals.static_data)
+                                    .unwrap_or_else(|| smithing_crafting_type(&globals.static_data));
                             let results = mint_smith_craftable(craftable, tempering_level);
                             (results, crafting_type_id, craftable.duration_ms)
                         } else {
@@ -277,8 +282,13 @@ pub async fn create_craft(
                             // restarts. Derive a VALID crafting_type_id from context instead,
                             // and return a well-formed (non-empty) result so the craft-
                             // completion flow can finish.
+                            // The APK table answers this outright for every recipe the
+                            // client ships; `derive_plain_craft_type` is now only for a
+                            // recipe absent from the shipped data entirely.
                             let crafting_type_id =
-                                derive_plain_craft_type(building_id, &globals.static_data);
+                                apk_crafting_type(&recipe_id, &globals.static_data).unwrap_or_else(
+                                    || derive_plain_craft_type(building_id, &globals.static_data),
+                                );
                             // Approximate the brew's output as one stackable of the recipe's
                             // own id (the true potion template for an un-captured recipe is
                             // unknown; granting a single stackable is well-formed and lets the
@@ -463,6 +473,11 @@ fn repaired_craft_fields<'a>(
         job.crafting_type_id
     } else if let Some(recipe) = known_recipe {
         recipe.crafting_type_id
+    } else if let Some(from_apk) = apk_crafting_type(&job.recipe_id, static_data) {
+        // The APK's own recipe -> CraftingType table: the RIGHT bench, not merely a
+        // mappable one. Ahead of the smith guess because it is per-recipe data rather
+        // than a template-id coincidence.
+        from_apk
     } else if smith_craftable.is_some() {
         smithing_crafting_type(static_data)
     } else {
@@ -485,6 +500,25 @@ fn repaired_craft_fields<'a>(
     };
 
     (crafting_type_id, results)
+}
+
+/// The bench a recipe belongs to, from the APK-extracted `recipe_crafting_types.json`
+/// (`RecipeData._recipeMap` — every recipe the client ships, 2,978 across the 7
+/// `CraftingType`s). `None` only when the recipe is not in the shipped client data at
+/// all, in which case the caller keeps its fallback.
+///
+/// This is what closes the hole the create-path and read-path fixes left open. Before
+/// the table existed the only recipe→bench data on the server was the ~34 captured rows
+/// in `recipes.json`, so an un-captured craft could be given a *valid* CraftingType (any
+/// real station unblocks `GetCraftingStation`) but not the *right* one — report #34's
+/// second job is a forge craft that fell through to the Alchemy fallback, which unblocks
+/// the loading screen while naming the wrong bench to the player. With the table it
+/// resolves to Smithing, from data, with nothing guessed.
+fn apk_crafting_type(
+    recipe_id: &Uuid,
+    static_data: &blades_lib::static_data::StaticData,
+) -> Option<Uuid> {
+    static_data.recipe_crafting_types.crafting_type_of(recipe_id)
 }
 
 /// The universal ALCHEMY crafting type id (capture-confirmed: the craftingTypeId shared
@@ -1187,5 +1221,148 @@ mod tests {
             );
             assert_eq!(wire["results"], job.results, "healthy results must be preserved");
         }
+    }
+
+    // ── The recipe -> CraftingType table (report #34, second half) ────────────
+    //
+    // Repairing a poisoned job to *a* real CraftingType unblocks the loading screen;
+    // it does not make the job name the right bench. Report #34's forge craft is in
+    // neither `recipes.json` nor `smith_craftables.json`, so before the APK table it
+    // fell through to `derive_plain_craft_type` and the player's Dragonbone War Axe
+    // was reported as an ALCHEMY craft. `recipe_crafting_types.json` is walked out of
+    // the APK's own `RecipeData._recipeMap`, so every recipe the client ships now
+    // names its real station.
+
+    /// The committed `deploy/static` set, as the server actually loads it.
+    fn static_data_from_deploy() -> blades_lib::static_data::StaticData {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../deploy/static");
+        crate::static_loader::load(&dir)
+    }
+
+    /// Report #34's acceptance test. The Dragonbone War Axe craft
+    /// (`fd13cfa0-…-b3d08852f673`) is a FORGE craft; it must repair to the Smithing
+    /// bench, not to the Alchemy fallback.
+    #[test]
+    fn report_34_forge_craft_repairs_to_smithing_not_alchemy() {
+        let sd = static_data_from_deploy();
+        let job = poisoned_smith_job();
+
+        // The premise: this recipe is in NEITHER of the two tables the pre-table
+        // resolution order consulted, so nothing but the APK table can answer it.
+        assert!(sd.recipes.get(&job.recipe_id).is_none(), "not a captured recipe");
+        assert!(
+            sd.smith_craftables.resolve(&job.recipe_id).is_none(),
+            "not a resolvable smith craftable"
+        );
+
+        let wire = wire_of(&job, &sd);
+        let ctid = wire["craftingTypeId"].as_str().unwrap();
+        assert_ne!(ctid, wire["recipeId"].as_str().unwrap(), "must never echo the recipe id");
+        assert_ne!(
+            ctid, ALCHEMY_CRAFTING_TYPE_ID,
+            "a forge craft must not be reported as an Alchemy craft — it unblocks the \
+             loading screen but names the wrong bench to the player"
+        );
+        assert_eq!(ctid, SMITHING_CRAFTING_TYPE_ID, "Dragonbone War Axe is forged at the Smithy");
+    }
+
+    /// Both report-#34 rows resolve from the table, each to its own bench — the alchemy
+    /// row was right by luck (the fallback IS alchemy), the forge row was not.
+    #[test]
+    fn both_report_34_recipes_resolve_from_the_apk_table() {
+        let sd = static_data_from_deploy();
+        let alchemy_recipe = Uuid::parse_str("b5a2dbe9-d115-4bf2-99d9-558be1de3ef7").unwrap();
+        let forge_recipe = Uuid::parse_str("fd13cfa0-0148-41c0-be70-b3d08852f673").unwrap();
+        assert_eq!(
+            apk_crafting_type(&alchemy_recipe, &sd).map(|u| u.to_string()).as_deref(),
+            Some(ALCHEMY_CRAFTING_TYPE_ID),
+            "Deadly Aversion to Frost is brewed at the Alchemist"
+        );
+        assert_eq!(
+            apk_crafting_type(&forge_recipe, &sd).map(|u| u.to_string()).as_deref(),
+            Some(SMITHING_CRAFTING_TYPE_ID),
+            "Dragonbone War Axe is forged at the Smithy"
+        );
+    }
+
+    /// The table is not smithing-only: an un-captured ENCHANTING recipe must report the
+    /// Enchanter, where the alchemy fallback would have said Alchemist.
+    #[test]
+    fn an_uncaptured_enchanting_recipe_reports_the_enchanter() {
+        let sd = static_data_from_deploy();
+        let enchanting = sd
+            .recipe_crafting_types
+            .type_by_name("Enchanting")
+            .expect("Enchanting crafting type in the table");
+        // Any enchanting recipe the capture never saw.
+        let (recipe_id, _) = sd
+            .recipe_crafting_types
+            .recipes
+            .iter()
+            .find(|(id, r)| r.crafting_type_id == enchanting && !sd.recipes.contains_key(id))
+            .expect("an un-captured enchanting recipe exists");
+        let job = CraftJob {
+            id: Uuid::from_u128(0xE0),
+            recipe_id: *recipe_id,
+            building_id: Uuid::from_u128(0xB2),
+            crafting_type_id: *recipe_id, // poisoned exactly like report #34
+            completed_at_ms: 1_783_204_348_637,
+            results: serde_json::json!({}),
+        };
+        let wire = wire_of(&job, &sd);
+        assert_eq!(
+            wire["craftingTypeId"].as_str().unwrap(),
+            enchanting.to_string(),
+            "an enchanting recipe belongs to the Enchanter, not the Alchemist"
+        );
+    }
+
+    /// The committed table covers everything the server already knew about, and agrees
+    /// with it — the guard that a re-extraction has not moved the mapping under us.
+    #[test]
+    fn the_apk_table_covers_and_agrees_with_every_captured_recipe() {
+        let sd = static_data_from_deploy();
+        assert_eq!(
+            sd.recipe_crafting_types.crafting_types.len(),
+            7,
+            "the client ships exactly 7 CraftingTypes"
+        );
+        for (id, recipe) in &sd.recipes {
+            assert_eq!(
+                apk_crafting_type(id, &sd),
+                Some(recipe.crafting_type_id),
+                "captured recipe {id} missing from / disagreeing with the APK table"
+            );
+        }
+        for id in sd.item_mod_recipes.keys() {
+            assert!(apk_crafting_type(id, &sd).is_some(), "mod recipe {id} missing from the table");
+        }
+        for id in sd.salvage_recipes.keys() {
+            assert!(
+                apk_crafting_type(id, &sd).is_some(),
+                "salvage recipe {id} missing from the table"
+            );
+        }
+    }
+
+    /// A recipe genuinely absent from the shipped client data keeps the old fallback —
+    /// the table adds an answer, it does not remove the safety net.
+    #[test]
+    fn a_recipe_absent_from_the_table_still_falls_back() {
+        let sd = static_data_from_deploy();
+        let unknown = Uuid::from_u128(0xDEAD_BEEF_DEAD_BEEF);
+        assert!(apk_crafting_type(&unknown, &sd).is_none(), "not in the shipped data");
+        let job = CraftJob {
+            id: Uuid::from_u128(0xF1),
+            recipe_id: unknown,
+            building_id: Uuid::from_u128(0xB3),
+            crafting_type_id: unknown,
+            completed_at_ms: 1_783_204_348_637,
+            results: serde_json::json!({}),
+        };
+        let wire = wire_of(&job, &sd);
+        let ctid = wire["craftingTypeId"].as_str().unwrap();
+        assert_ne!(ctid, unknown.to_string(), "must never echo the recipe id");
+        assert_eq!(ctid, ALCHEMY_CRAFTING_TYPE_ID, "falls back exactly as before");
     }
 }
