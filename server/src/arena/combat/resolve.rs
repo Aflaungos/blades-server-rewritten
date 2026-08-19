@@ -2581,6 +2581,53 @@ fn begin_swing_animation(combat: &mut MatchCombat, slot: usize, now: Instant) {
     f.schedule_state(idle_at, ActorStateType::Idle);
 }
 
+/// How long after a round goes live before a bot may take its first action.
+///
+/// **AUTHORED — this is not a shipped game-data value.** It was searched for and does
+/// not exist, because retail arena is human-vs-human: there is no bot in the shipped
+/// client, so Bethesda had nothing to tune. Specifically:
+///
+///   * `PvpDefaultSettings` (`dump.cs:427009`) is nine constants — health multiplier,
+///     stamina reduction, block/stagger timings, block multipliers — none round-start.
+///   * `PvpParameters` (`dump.cs:611404`) is thirteen fields — sidestep idle, charge
+///     anim modifier, `serverHitTime`, spawn distance, consumables — none round-start.
+///   * `CombatParameters`' only timing fields are `_baseStaggerDuration`,
+///     `_endCombatTime`, `_endEncounterTime` and the IK/animation times.
+///   * The only AI-reaction data anywhere in the dump is
+///     `EnemyCombatAIParameters._reactionTime` (`dump.cs:624152`), the PvE dungeon
+///     brain — 0.2–1.0 s bands across 667 enemy variants. Wrong domain.
+///   * The inter-round state table (`engine::MATCH_STATE_INTERROUND_PROGRESSION`)
+///     stops at `InRound`: its 4 s hold is consumed BEFORE the live round begins, and
+///     `PreRound`'s 4.0 s is burned by the client's own READY/FIGHT HUD sequence
+///     (`PvpHUDMenu.PREROUND_*`, `dump.cs:667036`). Nothing shipped covers the window
+///     AFTER `InRound`.
+///
+/// So a number had to be chosen. 1.0 s, anchored two ways:
+///
+///   * **Upper bound from shipped precedent.** Retail demonstrably DOES stagger a
+///     round's first action: `ActiveAbility._initialCooldown` (`dump.cs:607776`,
+///     "cooldown charged at the start of a fight") runs 0.5 s (Lightning Bolt) to
+///     2.75 s (Power Attack, Frostbite, Paralyze, Guardbreaker) across the arena
+///     abilities — see `docs/arena-cooldowns-authoritative.md`. 1.0 s sits near the
+///     bottom of that band. This is an ANALOGY, not a derivation: `_initialCooldown`
+///     gates abilities, not weapon swings.
+///   * **Lower bound from what the mechanic requires.** With this delay the opening
+///     blow cannot land sooner than 1.0 + 0.35 + 0.05 = 1.4 s into the round, which is
+///     the budget the player needs to register that the round went live, press block,
+///     and have the c2s gmid 46 cross WireGuard. The previous behaviour gave 400 ms
+///     total, of which none was available for the first two steps.
+///
+/// Kept deliberately near the bottom of the precedent band: the goal is a blockable
+/// opener, not a passive bot. It is also consistent with [`BOT_SWING_COOLDOWN`], the
+/// bot's other cadence knob, which is authored for the same reason.
+///
+/// **This is not a substitute for the telegraph.** `BOT_CHARGE_WINDUP` (350 ms) +
+/// [`FOLLOW_THROUGH_DELAY`] (50 ms) = 400 ms matches retail's measured 383 ms median
+/// across 593 decoded swings and must stay exactly where it is — widening the wind-up
+/// to make the opener blockable would move us AWAY from retail. The defect was that
+/// there was ZERO opening delay, and this is the only thing that changes.
+pub(super) const ROUND_START_ENGAGE_DELAY: Duration = Duration::from_millis(1000);
+
 /// A bot fighter's auto-swing cadence. Slower than a human's `SWING_COOLDOWN` so the
 /// player wins comfortably but sees real incoming damage — a fight, not a static dummy.
 const BOT_SWING_COOLDOWN: Duration = Duration::from_millis(1800);
@@ -2663,6 +2710,21 @@ pub fn on_tick(combat: &mut MatchCombat, now: Instant, debug_hold: bool) -> Vec<
         // and letting `bot_swing_at` survive would land a swing out of a stun.
         if combat.fighters[bot].is_staggered(now) {
             combat.fighters[bot].bot_swing_at = None;
+            continue;
+        }
+        // OPENING DELAY. `ready` below falls back to `true` when `last_swing` is
+        // `None`, which at round start it always is — so the bot charged on tick 0 of
+        // the round and the opening blow landed `BOT_CHARGE_WINDUP` +
+        // `FOLLOW_THROUGH_DELAY` = 400 ms into a round the player had not yet seen go
+        // live. Blocking it required pressing block and getting the c2s gmid 46 across
+        // WireGuard inside that window: not reachable, and the opener was in practice
+        // unblockable.
+        //
+        // The knob is this delay, NOT the telegraph. 350 ms + 50 ms matches retail's
+        // measured 383 ms median across 593 decoded swings — widening the wind-up
+        // would move us away from retail, so it stays exactly where it is. What retail
+        // has and we lacked is any opening gap at all.
+        if now.duration_since(combat.phase_entered) < ROUND_START_ENGAGE_DELAY {
             continue;
         }
         // A bot swings in TWO steps, because retail's swing is two steps.
@@ -4947,6 +5009,92 @@ mod report_31_high_block_stun {
         assert!(c.fighters[1].bot_swing_at.is_some(), "the bot swings again after the stun");
     }
 
+
+
+    // -- The opening swing must be blockable -------------------------------
+    //
+    // `drive_bots` computed readiness as
+    //   `last_swing.map(|t| now - t >= BOT_SWING_COOLDOWN).unwrap_or(true)`
+    // and at round start `last_swing` is `None`, so the fallback said READY and the
+    // bot charged on tick 0 of the round. Impact landed `BOT_CHARGE_WINDUP` (350 ms)
+    // + `FOLLOW_THROUGH_DELAY` (50 ms) = 400 ms later — into which the player had to
+    // see the round go live, press block, and get the c2s gmid 46 across WireGuard.
+    // The opening hit was unblockable.
+
+    /// The bot must not act on tick 0 of a live round, and the opening delay is a
+    /// PER-ROUND property — round 2 gets it too.
+    #[test]
+    fn a_bot_cannot_act_before_the_round_start_delay() {
+        let now = Instant::now();
+        // expected_peers = 1 → slot 1 is the bot; the round goes live at `now`.
+        let mut c = combat(now, 1);
+
+        // Tick 0 of the live round.
+        super::on_tick(&mut c, now, false);
+        assert!(
+            c.fighters[1].bot_swing_at.is_none(),
+            "the bot must not queue a wind-up on tick 0 of the round",
+        );
+        assert_ne!(
+            c.fighters[1].actor_state(),
+            ActorStateType::Charging,
+            "…nor enter Charging on tick 0",
+        );
+
+        // Nor at any instant before the opening delay has elapsed.
+        let just_before = now + super::ROUND_START_ENGAGE_DELAY - Duration::from_millis(1);
+        super::on_tick(&mut c, just_before, false);
+        assert!(
+            c.fighters[1].bot_swing_at.is_none(),
+            "the bot must not act 1 ms before the opening delay expires",
+        );
+
+        // Once it has, the bot engages exactly as before.
+        let after = now + super::ROUND_START_ENGAGE_DELAY + Duration::from_millis(1);
+        super::on_tick(&mut c, after, false);
+        let swing_at = c.fighters[1]
+            .bot_swing_at
+            .expect("the bot engages once the opening delay has elapsed");
+        assert_eq!(
+            c.fighters[1].actor_state(),
+            ActorStateType::Charging,
+            "…and the wind-up is a real telegraph, not an instant hit",
+        );
+
+        // The FIX IS THE OPENING DELAY, NOT A WIDER TELEGRAPH. 350 ms + 50 ms = 400 ms
+        // matches retail's measured 383 ms median across 593 decoded swings; widening
+        // it would move us AWAY from retail. This pins it so a future "fix" for an
+        // unblockable opener cannot reach for the telegraph instead.
+        assert_eq!(
+            super::BOT_CHARGE_WINDUP,
+            Duration::from_millis(350),
+            "the telegraph must stay at retail's measured value — the opening delay is \
+             the knob, not the wind-up",
+        );
+
+        // The earliest the opening blow can LAND is delay + wind-up + follow-through.
+        let impact = swing_at + super::FOLLOW_THROUGH_DELAY;
+        assert!(
+            impact.duration_since(now)
+                >= super::ROUND_START_ENGAGE_DELAY
+                    + super::BOT_CHARGE_WINDUP
+                    + super::FOLLOW_THROUGH_DELAY,
+            "the opening blow must not be able to land before delay + wind-up + \
+             follow-through",
+        );
+
+        // …and it is PER ROUND. Round 2 re-enters the live phase with a fresh
+        // `phase_entered`, so the opening delay must apply again — a bot that opened
+        // round 2 instantly would be the same defect with one round of warning.
+        let r2 = after + Duration::from_secs(10);
+        c.reset_fighters_for_next_round(r2);
+        c.phase_entered = r2;
+        super::on_tick(&mut c, r2, false);
+        assert!(
+            c.fighters[1].bot_swing_at.is_none(),
+            "the opening delay is per-ROUND: the bot must not act on tick 0 of round 2",
+        );
+    }
 
     // -- Frozen must actually freeze --------------------------------------
     //
