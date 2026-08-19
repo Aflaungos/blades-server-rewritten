@@ -507,3 +507,102 @@ fn unarmored_target_takes_the_raw_tempered_base() {
     );
     assert!((slash_of(&rd) - 144.0).abs() < 0.05, "raw tempered base, got {:.2}", slash_of(&rd));
 }
+
+// ---------------------------------------------------------------------------
+// (G) The mirrored stat drain mirrors the POST-block elemental (tracker #31).
+//
+// Wire evidence: capture session **s293**, decoded over a full ENet walk (241
+// distinct `ReceiveDamage` hits after deduping the 5x live-ingest inflation by
+// `sequenceId`; 40 optimal-block, 71 mirrored-drain, 9 carrying BOTH). On an
+// optimally-blocked hit the drain still lands, and it equals the ALREADY-REDUCED
+// elemental component exactly:
+//
+// | seq | components                                       |
+// |-----|--------------------------------------------------|
+// |  40 | 232.93 Slashing + 105.87 Shock + 105.87 Magicka  |
+// | 164 |                    71.75 Shock +  71.75 Magicka  |
+// | 348 |  44.09 Slashing +  10.26 Shock +  10.26 Magicka  |
+//
+// The flags are `0xb` (bit 3 = `wasOptimalBlocking`), corroborated by
+// `ReceiveDamage(DamageList, DamageSource, ActiveSide, Actor attacker, bool fxOnly,
+// bool wasOptimalBlocking)` at `reference/il2cpp/dump.cs:338156`. The victim's pool
+// genuinely moved: obj#65 seq 468 -> 474, both optimal-blocked, magicka -25/1023
+// across the pair. So the drain is REDUCED with the element, never suppressed.
+// ---------------------------------------------------------------------------
+
+fn comp_of(rd: &super::damage::ResolvedDamage, ty: DamageType) -> f32 {
+    rd.components.iter().filter(|(t, _)| *t == ty).map(|(_, v)| *v).sum()
+}
+
+/// Flappety's dagger with the Poison suffix swapped for `Weapon Frost Damage`
+/// tier 10 — the same derived s506 fixture, exercising the Frost -> Stamina mirror.
+fn flappety_frost_dagger() -> Loadout {
+    let mut lo = flappety_dagger();
+    lo.enchants = vec![(DamageType::Frost, 10)];
+    lo
+}
+
+/// Blank holding a **connected optimal block** — the s506 seq-323 defender state.
+fn blank_optimal_blocking(now: Instant) -> Fighter {
+    let mut def = blank();
+    def.set_actor_state(ActorStateType::Blocking, now);
+    def.blocking_side = ActiveSide::Right;
+    def.block_raised_at = Some(now);
+    def.blocking_until = Some(now + std::time::Duration::from_secs(2));
+    def
+}
+
+/// **The no-block path must not move.** With no guard up the block factor is 1.0, so
+/// the drain is the full elemental — byte-identical to the pre-fix numbers, pinned
+/// here as exact `f32`s so any drift in the drain's derivation shows up as a failure.
+#[test]
+fn mirrored_drain_is_byte_identical_without_a_block() {
+    let m = RetailDamageModel;
+    let now = Instant::now();
+    let open =
+        m.resolve_attack(&flappety_frost_dagger(), &blank(), DamageSource::Attack, ActiveSide::Right, 1.0, 0, now);
+
+    assert_eq!(open.flags & flags::WAS_OPTIMAL_BLOCKING, 0, "no guard is up");
+    // Exact pre-fix values, measured on main@1334cbd + #28 + #29.
+    assert_eq!(
+        open.components,
+        vec![(DamageType::Slashing, 113.82), (DamageType::Frost, 137.3212), (DamageType::Stamina, 137.3212)],
+        "the unblocked component list (order and values) must be unchanged",
+    );
+    assert_eq!(open.total, 251.1412, "drains are excluded from `total`");
+}
+
+/// **The optimal-block path: drain == post-block elemental, 1:1 (s293).** Before the
+/// fix the drain was pushed in `swing_components` from the PRE-block elemental and
+/// then skipped by `BlockOutcome::factor_for` (whose Stamina/Magicka fall-through is
+/// 1.0), so it was doubly unmitigated: 137.32 drained while only 67.84 landed.
+#[test]
+fn mirrored_drain_mirrors_the_post_block_elemental() {
+    let m = RetailDamageModel;
+    let lo = flappety_frost_dagger();
+    let now = Instant::now();
+
+    let open = m.resolve_attack(&lo, &blank(), DamageSource::Attack, ActiveSide::Right, 1.0, 0, now);
+    let frost_open = comp_of(&open, DamageType::Frost);
+
+    let def = blank_optimal_blocking(now);
+    let blocked = m.resolve_attack(&lo, &def, DamageSource::Attack, ActiveSide::Right, 1.0, 0, now);
+    assert!(blocked.flags & flags::WAS_OPTIMAL_BLOCKING != 0, "optimal-block flag set");
+
+    let frost_blocked = comp_of(&blocked, DamageType::Frost);
+    let stam_blocked = comp_of(&blocked, DamageType::Stamina);
+    assert!(
+        frost_blocked > 0.0 && frost_blocked < frost_open,
+        "the block must REDUCE, not negate, the elemental: {frost_blocked:.2} of {frost_open:.2}",
+    );
+    assert_eq!(
+        stam_blocked, frost_blocked,
+        "DIVERGENCE (s293): the mirrored drain must be a 1:1 mirror of the POST-block \
+         elemental {frost_blocked:.2}, got {stam_blocked:.2} — the PRE-block {frost_open:.2}, \
+         i.e. drained unmitigated. s293 seq 40/164/348 carry element == drain on \
+         `wasOptimalBlocking` hits, and obj#65 seq 468->474 shows the pool really falling.",
+    );
+    // The drain is NOT a health type, so the hit total is the blocked elemental alone
+    // and is unaffected by this change.
+    assert_eq!(blocked.total, frost_blocked, "`total` sums health types only");
+}

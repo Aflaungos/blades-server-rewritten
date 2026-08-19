@@ -192,7 +192,10 @@ impl BlockOutcome {
             let pierced = (self.rating - self.elem_block_piercing).max(0.0);
             return 1.0 - tables::block_reduction(pierced, false);
         }
-        // Stamina/Magicka drains and raw Health are not blocked.
+        // Stamina/Magicka drains and raw Health are not blocked. This stays at 1.0
+        // ON PURPOSE for the drains: they are derived in [`append_mirrored_drains`]
+        // from the element's ALREADY-blocked value, so the reduction is baked in and
+        // applying the factor here as well would mitigate the drain twice.
         1.0
     }
 }
@@ -329,15 +332,14 @@ impl RetailDamageModel {
             components.push((ty, base * scale));
         }
         // Enchant tracks: independent of the physical combo roll (capture-validated,
-        // §4.3). The magnitude is the family's own shipped curve value; the
-        // mirrored stat drain is per-element, NOT a blanket Magicka drain.
+        // §4.3). The magnitude is the family's own shipped curve value.
+        //
+        // The mirrored stat drain is NOT appended here: it mirrors the element
+        // *after* mitigation and is derived in [`append_mirrored_drains`], which
+        // `finish_resolved` calls once the block factor has been applied.
         for (ench_ty, magnitude) in enchant_tracks(attacker) {
             let amp = target.element_amp_for(ench_ty) * (1.0 + fortify_for(attacker, ench_ty));
-            let v = magnitude * amp;
-            components.push((ench_ty, v));
-            if let Some((drain_ty, ratio)) = mirrored_drain(ench_ty) {
-                components.push((drain_ty, v * ratio));
-            }
+            components.push((ench_ty, magnitude * amp));
         }
         components
     }
@@ -453,10 +455,9 @@ impl DamageModel for RetailDamageModel {
                 tables::ability_damage(super::gamedata::ids::FIREBALL, ability_level).unwrap_or(0.0),
             ),
         };
+        // The mirrored stat drain is appended by `finish_resolved` from the
+        // post-block value — see [`append_mirrored_drains`].
         let mut components = vec![(ty, base)];
-        if let Some((drain_ty, ratio)) = mirrored_drain(ty) {
-            components.push((drain_ty, base * ratio));
-        }
         finish_resolved(&Loadout::default(), target, source, active_side, &mut components, now)
     }
 }
@@ -477,6 +478,55 @@ fn dot_span_secs(r: &super::gamedata::AbilityRank) -> f32 {
         .or_else(|| r.duration())
         .filter(|s| *s > 0.0)
         .unwrap_or(super::gamedata::combat_params::ELEMENTAL_STATUS_DURATION)
+}
+
+/// Append each element's mirrored stat drain, 1:1 with the value the element carries
+/// **at the moment of the call** — i.e. after [`BlockOutcome::factor_for`] has run.
+///
+/// # Why the drain is derived here and not with the element
+///
+/// The drain used to be pushed alongside its element while the components were still
+/// being built, from the PRE-block magnitude, and `factor_for`'s Stamina/Magicka
+/// fall-through then returned `1.0` for it. That made the drain **doubly**
+/// unmitigated: never scaled by block, and computed from the unreduced element. On
+/// the s506 fixture with a Frost tier-10 enchant against a connected optimal block
+/// the elemental landed for 67.84 while the drain still took 137.32 — from a quantity
+/// documented as a 1:1 mirror.
+///
+/// Retail disagrees. Capture session **s293**, decoded over a full ENet walk (241
+/// distinct hits after deduping the 5x live-ingest inflation by `sequenceId`; 40
+/// optimal-block, 71 mirrored-drain, **9 carrying both**), shows the drain still
+/// landing on an optimally-blocked hit and equal to the already-reduced element:
+/// seq 40 `232.93 Slashing + 105.87 Shock + 105.87 Magicka`, seq 164 `71.75 Shock +
+/// 71.75 Magicka`, seq 348 `44.09 Slashing + 10.26 Shock + 10.26 Magicka`. The flags
+/// are `0xb`, bit 3 being `wasOptimalBlocking` — corroborated by the signature
+/// `ReceiveDamage(DamageList, DamageSource, ActiveSide, Actor attacker, bool fxOnly,
+/// bool wasOptimalBlocking)` at `reference/il2cpp/dump.cs:338156`. And the pool really
+/// moved: obj#65 seq 468 → 474, both optimal-blocked, magicka −25/1023 across the
+/// pair. Magicka *falls* across consecutive optimal blocks, so the drain is reduced
+/// with the element rather than suppressed.
+///
+/// `factor_for` deliberately keeps its `1.0` fall-through for Stamina/Magicka: the
+/// mitigation is already baked into the value being mirrored, and routing the drain
+/// through the block factor as well would apply it twice.
+///
+/// The drain is inserted immediately after its own element so the component ORDER on
+/// the wire is exactly what it was before, and it is appended before step 2 so the
+/// resistance/weakness pass still sees it — together those make the no-block case
+/// (block factor 1.0) byte-identical. Pinned by
+/// `roundtrip_s506_damage::mirrored_drain_is_byte_identical_without_a_block`.
+fn append_mirrored_drains(components: &mut Vec<(DamageType, f32)>) {
+    if !components.iter().any(|(ty, _)| mirrored_drain(*ty).is_some()) {
+        return;
+    }
+    let mut out: Vec<(DamageType, f32)> = Vec::with_capacity(components.len() + 1);
+    for (ty, v) in components.iter() {
+        out.push((*ty, *v));
+        if let Some((drain_ty, ratio)) = mirrored_drain(*ty) {
+            out.push((drain_ty, *v * ratio));
+        }
+    }
+    *components = out;
 }
 
 /// Apply the post-roll mitigation pipeline and assemble the [`ResolvedDamage`]:
@@ -503,6 +553,11 @@ fn finish_resolved(
     for (ty, v) in components.iter_mut() {
         *v *= block.factor_for(*ty);
     }
+
+    // 1.5) MIRRORED STAT DRAIN — Frost→Stamina / Shock→Magicka, 1:1 with the
+    //      element's **post-block** value. This lands HERE, after step 1, because
+    //      retail's drain follows the reduced element rather than the raw roll.
+    append_mirrored_drains(components);
 
     // 2) RESISTANCE — a FLAT subtraction driven by the defender's Resistance Rating,
     //    capped at `maximumResistanceReduction`, with elemental resistance first
