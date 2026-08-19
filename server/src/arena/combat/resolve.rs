@@ -1662,6 +1662,10 @@ fn emit_damage(
     let hp_before = combat.fighters[target_slot].health;
     let max_hp = combat.fighters[target_slot].max_health;
     combat.fighters[target_slot].take_damage(total.round().max(0.0) as u32);
+    // The mirrored Stamina/Magicka tracks come off their pools BEFORE `packed_stats()`
+    // is read for the frame, so the bars the client draws match the numbers the same
+    // frame reports. [Fighter::drain_mirrored_pools]
+    let (drained_stam, drained_mag) = combat.fighters[target_slot].drain_mirrored_pools(&components);
     let hp_after = combat.fighters[target_slot].health;
     // Per-hit damage-vs-maxHP ratio (info-level so the ghost-verify on the box shows the
     // before→after HP without RUST_LOG=debug). NOTE: the 25% one-shot clamp is GONE for
@@ -1669,7 +1673,7 @@ fn emit_damage(
     let pct = if max_hp > 0 { 100.0 * total / max_hp as f32 } else { 0.0 };
     let dealt = hp_before.saturating_sub(hp_after);
     info!(
-        "combat damage: slot {attacker_slot} → slot {target_slot} | source {:?} side {:?} | total {total:.1} = {pct:.1}% of {max_hp} maxHP | HP {hp_before} → {hp_after} (−{dealt})",
+        "combat damage: slot {attacker_slot} → slot {target_slot} | source {:?} side {:?} | total {total:.1} = {pct:.1}% of {max_hp} maxHP | HP {hp_before} → {hp_after} (−{dealt}) | drained stam −{drained_stam} mag −{drained_mag}",
         resolved.source,
         resolved.active_side,
     );
@@ -3399,6 +3403,230 @@ mod tests {
         let out3 = on_c2s_input(&mut combat, 0, &frame, after);
         assert!(!out3.is_empty(), "the ability fires again once its cooldown elapses");
     }
+
+    // -----------------------------------------------------------------------
+    // Tracker #31 — "Frostbite gives no damage and does not freeze the opponent"
+    //
+    // These drive the REAL emission path (c2s op37 → resolve → s2c frames), not
+    // the damage model in isolation, and assert against the retail wire recorded
+    // in capture session 615 (2026-06-27 21:00:19, `docs/arena-status-resistance-spec.md`
+    // §5): a Frostbite cast produces `ReceiveDamage` frames with
+    // `DamageSource::ContinuousSpell (8)` carrying `Frost + Stamina` in equal
+    // measure, and an op51 `Frozen (5)` apply lands within the channel.
+    // -----------------------------------------------------------------------
+
+    /// Frostbite (`4be1d681…`) — `ability_type: spell`, `damage_type: frost`,
+    /// `damagePerSecond` per rank, `channelMaxLength: 3`, no `_damage` field.
+    const FROSTBITE_UUID: &str = "4be1d681-c35d-4540-b255-c2910ac80664";
+    /// Rank 4: `damagePerSecond = 95.80`, `magickaCost = 235` — the rank the
+    /// project owner cast in prod session 911 (arena-server logged `mag=235`).
+    const FROSTBITE_RANK: u8 = 4;
+
+    /// The exact fighter pair from the reporter's prod match (arena-server,
+    /// 2026-08-18 05:46:47): the caster is L86 (`maxHP 3150`, `pool 625`) and the
+    /// target is L89 (`maxHP 3240`). The levels matter: the `Frozen` trigger is a
+    /// fraction of the TARGET's max HP, so a low-level test fighter freezes where
+    /// a real arena opponent does not.
+    fn make_prod_scale_combat(now: Instant) -> MatchCombat {
+        use super::super::loadout::starter;
+        let mut combat = MatchCombat::new(2, 2, now);
+        for (slot, level) in [(0usize, 86u16), (1, 89)] {
+            let obj_id = combat.alloc_net_object_id();
+            let mut lo = starter();
+            lo.level = level;
+            let mut f = Fighter::new(slot, obj_id, lo, now);
+            f.loadout.weapon = super::super::state::WeaponProfile {
+                primary_type: Some(DamageType::Slashing),
+                base_by_type: vec![(DamageType::Slashing, 113.82)],
+                weight: Some(super::super::tables::Weight::Light),
+            };
+            f.loadout.weapon_template = None;
+            combat.fighters.push(f);
+        }
+        combat.match_net_object_id = combat.alloc_net_object_id();
+        combat.phase = FlowState::StateTimeout;
+        combat.phase_entered = now;
+        combat
+    }
+
+    /// Cast Frostbite through `on_c2s_input` and return the s2c frames.
+    fn cast_frostbite(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8>)> {
+        combat.fighters[0].loadout.abilities.push(EquippedAbility {
+            instance_uuid: FROSTBITE_UUID.to_string(),
+            level: FROSTBITE_RANK,
+            tag: super::super::loadout::ability_tag_for_template(FROSTBITE_UUID),
+        });
+        let frame = make_ability_frame(120, FROSTBITE_UUID);
+        let mut out = on_c2s_input(combat, 0, &frame, now);
+        out.extend(land(combat, now));
+        out
+    }
+
+    /// Decode every `ReceiveDamage` (50) frame in `out` into
+    /// `(source, total, [(damage_type, value)])`.
+    fn damage_frames(out: &[(usize, Vec<u8>)]) -> Vec<(u8, f32, Vec<(u8, f32)>)> {
+        let mut got = Vec::new();
+        for (_, f) in out {
+            if messages::user_message_gmid(f) != Some(50) {
+                continue;
+            }
+            let nd = arena_proto::parse_netdata(&f[2..]);
+            let n = nd.int(12).unwrap_or(0) as u8;
+            let mut comps = Vec::new();
+            for k in 0..n {
+                let base = 13 + 2 * k;
+                let ty = nd.int(base).unwrap_or(0) as u8;
+                let v = match nd.get(base + 1) {
+                    Some(arena_proto::NetDataValue::Float(v)) => *v,
+                    _ => 0.0,
+                };
+                comps.push((ty, v));
+            }
+            let total = match nd.get(8) {
+                Some(arena_proto::NetDataValue::Float(v)) => *v,
+                _ => 0.0,
+            };
+            got.push((nd.int(6).unwrap_or(0) as u8, total, comps));
+        }
+        got
+    }
+
+    /// The HEALTH half of a Frostbite cast must reach the wire with a non-zero
+    /// Frost component AND take the health off the target — the mirrored Stamina
+    /// drain must not be the only thing that lands.
+    #[test]
+    fn report31_frostbite_health_damage_reaches_the_wire() {
+        let now = Instant::now();
+        let mut combat = make_prod_scale_combat(now);
+        let hp_before = combat.fighters[1].health;
+        let out = cast_frostbite(&mut combat, now);
+
+        let dmg = damage_frames(&out);
+        assert!(!dmg.is_empty(), "a Frostbite cast must emit at least one op50 ReceiveDamage");
+        let (_src, total, comps) = &dmg[0];
+
+        let frost: f32 = comps.iter().filter(|(t, _)| *t == 5).map(|(_, v)| *v).sum();
+        let stam: f32 = comps.iter().filter(|(t, _)| *t == 8).map(|(_, v)| *v).sum();
+        assert!(frost > 0.0, "Frost (health) component must be non-zero on the wire, got {comps:?}");
+        assert!(stam > 0.0, "the mirrored Stamina drain must be on the wire, got {comps:?}");
+        assert!(
+            (frost - stam).abs() < 0.01,
+            "frostDamageToStaminaDamage = 1 → the two tracks are equal ({frost} vs {stam})"
+        );
+        assert!(*total > 0.0, "totalDamage (health sum) must be non-zero");
+        assert!(
+            combat.fighters[1].health < hp_before,
+            "the target's HP must actually drop ({hp_before} → {})",
+            combat.fighters[1].health
+        );
+    }
+
+    /// **Report #31, "gives no damage".** The magnitude is the rank's own
+    /// `damagePerSecond × channelMaxLength` — NOT `× ELEMENTAL_STATUS_DURATION`,
+    /// which is a different shipped constant (the elemental-condition DoT length)
+    /// that happens to live in the same module. Frostbite ships
+    /// `channelMaxLength = 3`; using 5.0 inflated every rank by 5/3.
+    #[test]
+    fn report31_frostbite_total_is_dps_times_its_own_channel_length() {
+        use super::super::gamedata;
+        let r = gamedata::ability_rank_clamped(FROSTBITE_UUID, FROSTBITE_RANK as u16)
+            .expect("Frostbite rank 4 is in the shipped table");
+        let dps = r.damage_per_second().expect("Frostbite ships damagePerSecond");
+        let channel = r
+            .get(gamedata::AbilityField::ChannelMaxLength)
+            .expect("Frostbite ships channelMaxLength");
+        assert_eq!(channel, 3.0, "shipped channelMaxLength");
+
+        let now = Instant::now();
+        let mut combat = make_prod_scale_combat(now);
+        let out = cast_frostbite(&mut combat, now);
+        let dmg = damage_frames(&out);
+        let frost: f32 = dmg[0].2.iter().filter(|(t, _)| *t == 5).map(|(_, v)| *v).sum();
+        assert!(
+            (frost - dps * channel).abs() < 0.5,
+            "Frostbite R{FROSTBITE_RANK} must deal dps({dps}) × channelMaxLength({channel}) = {}, got {frost}",
+            dps * channel
+        );
+    }
+
+    /// **Retail wire fidelity.** s615 #4394011: a Frostbite tick is
+    /// `DamageSource = 8 (ContinuousSpell)`, not `2 (Spell)`. The client renders a
+    /// channelled spell's damage off this discriminator.
+    #[test]
+    fn report31_frostbite_is_a_continuous_spell_on_the_wire() {
+        let now = Instant::now();
+        let mut combat = make_prod_scale_combat(now);
+        let out = cast_frostbite(&mut combat, now);
+        let dmg = damage_frames(&out);
+        assert_eq!(
+            dmg[0].0,
+            super::super::state::DamageSource::ContinuousSpell as u8,
+            "a channelled dps spell rides DamageSource::ContinuousSpell (8), per s615 #4394011"
+        );
+    }
+
+    /// **Report #31, the stamina half.** `CombatParameters.frostDamageToStaminaDamage = 1`
+    /// means Frost drains the target's STAMINA pool one-for-one. The component was
+    /// already written to the wire; nothing ever subtracted it, so a Frostbite
+    /// landed on a full stamina bar and left it full.
+    #[test]
+    fn report31_frost_drains_the_targets_stamina_pool() {
+        let now = Instant::now();
+        let mut combat = make_prod_scale_combat(now);
+        let stam_before = combat.fighters[1].stamina;
+        assert!(stam_before > 0, "the target starts with stamina to drain");
+
+        let out = cast_frostbite(&mut combat, now);
+        let dmg = damage_frames(&out);
+        let stam_component: f32 = dmg[0].2.iter().filter(|(t, _)| *t == 8).map(|(_, v)| *v).sum();
+        assert!(stam_component > 0.0, "the wire carries a Stamina component");
+
+        let expected = stam_before.saturating_sub(stam_component.round() as u32);
+        assert_eq!(
+            combat.fighters[1].stamina, expected,
+            "the Stamina component must come off the pool ({stam_before} − {stam_component:.1})"
+        );
+    }
+
+    /// **Report #31, "does not freeze the opponent".** Frostbite ships no
+    /// `_freezeDuration`, so the `apply_shipped_effects` gate can never fire for
+    /// it — the freeze is the ELEMENTAL STATUS (`Frozen`, status id 5), landed by
+    /// the conditioning accumulator. Retail lands it within ~1 s of every
+    /// Frostbite cast (s615: casts at 21:00:19 / 21:00:32 / 21:05:21 → op51
+    /// `apply=1 status=5` at 21:00:20 / 21:00:33 / 21:05:22).
+    #[test]
+    fn report31_frostbite_lands_the_frozen_status() {
+        let now = Instant::now();
+        let mut combat = make_prod_scale_combat(now);
+        let out = cast_frostbite(&mut combat, now);
+
+        let frozen: Vec<_> = out
+            .iter()
+            .filter(|(_, f)| messages::user_message_gmid(f) == Some(51))
+            .filter(|(_, f)| {
+                let nd = arena_proto::parse_netdata(&f[2..]);
+                nd.int(4) == Some(1)
+                    && nd.int(5)
+                        == Some(super::super::state::StatusEffectType::Frozen as u16 as i64)
+            })
+            .collect();
+        assert_eq!(
+            frozen.len(),
+            combat.fighters.len(),
+            "op51 Frozen(5) apply must go to every viewer, got {} frame(s)",
+            frozen.len()
+        );
+        let nd = arena_proto::parse_netdata(&frozen[0].1[2..]);
+        let dur = match nd.get(6) {
+            Some(arena_proto::NetDataValue::Float(v)) => *v,
+            _ => 0.0,
+        };
+        assert!(
+            (dur - super::super::gamedata::combat_params::ELEMENTAL_STATUS_DURATION).abs() < 0.01,
+            "the shipped elemental-status duration (5 s), got {dur}"
+        );
+    }
+
 }
 
 #[cfg(test)]

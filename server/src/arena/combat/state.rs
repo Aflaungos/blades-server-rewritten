@@ -1274,6 +1274,44 @@ impl Fighter {
         self.stats_seq = self.stats_seq.wrapping_add(1);
     }
 
+    /// Apply the **non-health** damage components of a hit to their pools:
+    /// `DamageType::Stamina` drains stamina and `DamageType::Magicka` drains
+    /// magicka, both clamped at 0.
+    ///
+    /// These are the *mirrored drains* the shipped `CombatParameters` define —
+    /// `frostDamageToStaminaDamage = 1` (Frost → Stamina) and
+    /// `shockDamageToMagickaDamage = 1` (Shock → Magicka). `damage::mirrored_drain`
+    /// has always put them on the wire, and the retail capture agrees they belong
+    /// there (s615 #4394011: `Frost 13.19 + Stamina 13.19` in one `ReceiveDamage`) —
+    /// but **nothing ever subtracted them**. `emit_damage` summed only the
+    /// health-typed components and called `take_damage`, so a Frostbite landing on a
+    /// full stamina bar left it full and the frame's own packed stats said so. That
+    /// is the whole distinctive effect of a frost build doing nothing.
+    ///
+    /// Returns `(stamina_drained, magicka_drained)` for logging.
+    pub fn drain_mirrored_pools(&mut self, components: &[(DamageType, f32)]) -> (u32, u32) {
+        let take = |ty: DamageType| -> u32 {
+            components
+                .iter()
+                .filter(|(t, _)| *t == ty)
+                .map(|(_, v)| *v)
+                .sum::<f32>()
+                .round()
+                .max(0.0) as u32
+        };
+        let s = take(DamageType::Stamina);
+        let m = take(DamageType::Magicka);
+        if s == 0 && m == 0 {
+            return (0, 0);
+        }
+        let drained_s = s.min(self.stamina);
+        let drained_m = m.min(self.magicka);
+        self.stamina -= drained_s;
+        self.magicka -= drained_m;
+        self.stats_seq = self.stats_seq.wrapping_add(1);
+        (drained_s, drained_m)
+    }
+
     /// The packed-stats ULong for `ReceiveDamage` propId 4/5: each pool encoded as
     /// its 10-bit fraction of max (`STAT_MAX` = full), + the sequence id in the hi32.
     pub fn packed_stats(&self) -> u64 {
@@ -1343,17 +1381,53 @@ impl Fighter {
         perm + transient
     }
 
+    /// Max health WITHOUT the arena PvP health cheat — i.e. the character's own
+    /// shipped pool. `max_health` is `health_for_level(level) × ARENA_HEALTH_MULTIPLIER`,
+    /// and that multiplier is `PvpDefaultSettings.CHEAT_BASE_HEALTH_MULTIPLIER`: a
+    /// pacing knob bolted onto the bar, not a change to the character's stats.
+    pub fn base_max_health(&self) -> u32 {
+        self.max_health / ARENA_HEALTH_MULTIPLIER.max(1)
+    }
+
     /// The per-condition land threshold (absolute HP) for `condition`: the base
-    /// `HEALTH_PERCENT_TO_CAUSE_STATUS × max_health`, RAISED by any matching
+    /// `HEALTH_PERCENT_TO_CAUSE_STATUS × base_max_health`, RAISED by any matching
     /// `status_resist` ("Fortify Poisoned/…") bump. [§5.2 + §5.5]
+    ///
+    /// **Tracker #31.** This used `max_health`, i.e. the arena-TRIPLED bar, which
+    /// made every elemental condition need 3× the shipped damage to land. The repo
+    /// already flagged that as a known distortion
+    /// (`docs/arena-status-resistance-spec.md` §5.2 "Arena ×3 caveat";
+    /// `docs/arena-combat-fidelity-iteration.md`: "re-triggering from DoT alone is
+    /// impossible in a single 5 s window"), and the retail capture settles the
+    /// direction: in s615 (2026-06-27), `Frozen` (status 5) lands 31 times in one
+    /// session on fighters who absorb single 400–780 damage hits, and it lands
+    /// within ~1 s of EVERY Frostbite cast. Under `0.25 × tripled maxHP` the
+    /// reporter's own match needed 810 accumulated frost against a 3240 HP
+    /// opponent, and a full-rank-4 Frostbite channel delivers 287.4 — it could
+    /// never fire.
+    ///
+    /// The `CHEAT_BASE_HEALTH_MULTIPLIER` is not part of the character's stats, so
+    /// `_healthPercentToCauseStatus` — authored against the character's own pool —
+    /// is read against the un-cheated pool.
+    ///
+    /// **This is a floor, not a pin.** The observed retail accumulations at the
+    /// moment `Frozen` lands sit in the ~50–200 band (s470/s615, measured with a
+    /// coarse accumulator that over-counts), i.e. still BELOW `0.25 × base maxHP`
+    /// (270 at L89). Dropping the cheat multiplier moves us into the right order of
+    /// magnitude without inventing a number; pinning the exact rule needs a
+    /// dedicated pass over the capture corpus.
     pub fn condition_threshold(&self, condition: StatusEffectType) -> f32 {
-        let base = HEALTH_PERCENT_TO_CAUSE_STATUS * self.max_health as f32;
+        // Both terms are fractions of the SAME pool — the Fortify bump used to be a
+        // fraction of the tripled bar while the base was too, so they matched; now
+        // that the base is the un-cheated pool the bump follows it.
+        let pool = self.base_max_health() as f32;
+        let base = HEALTH_PERCENT_TO_CAUSE_STATUS * pool;
         let bump: f32 = self
             .loadout
             .status_resist
             .iter()
             .filter(|(c, _)| *c == condition)
-            .map(|(_, frac)| *frac * self.max_health as f32)
+            .map(|(_, frac)| *frac * pool)
             .sum();
         base + bump
     }
@@ -1923,13 +1997,25 @@ mod tests {
         f.record_element_damage(DamageType::Poison, 0.0, now);
         assert_eq!(f.recent_element_damage(DamageType::Slashing), 0.0, "physical is not conditioned");
 
-        // Base Poisoned threshold = 25% of max HP; Fortify-Poisoned raises it.
+        // Base Poisoned threshold = 25% of the character's OWN max HP; Fortify-Poisoned
+        // raises it. Tracker #31: the arena `CHEAT_BASE_HEALTH_MULTIPLIER` must NOT
+        // inflate it — under the old reading every elemental condition needed 3× the
+        // shipped damage and Frostbite could never freeze anyone.
+        let base_hp = f.base_max_health() as f32;
+        assert!((max - base_hp * ARENA_HEALTH_MULTIPLIER as f32).abs() < 1e-2, "the bar IS tripled");
         let base = f.condition_threshold(StatusEffectType::Poisoned);
-        assert!((base - HEALTH_PERCENT_TO_CAUSE_STATUS * max).abs() < 1e-2, "base threshold = 25% max HP");
+        assert!(
+            (base - HEALTH_PERCENT_TO_CAUSE_STATUS * base_hp).abs() < 1e-2,
+            "base threshold = 25% of the UN-cheated max HP"
+        );
+        assert!(base < HEALTH_PERCENT_TO_CAUSE_STATUS * max, "the arena health cheat does not raise it");
         f.loadout.status_resist = vec![(StatusEffectType::Poisoned, 0.10)];
         let bumped = f.condition_threshold(StatusEffectType::Poisoned);
         assert!(bumped > base, "Fortify Poisoned raises the threshold");
-        assert!((bumped - (HEALTH_PERCENT_TO_CAUSE_STATUS + 0.10) * max).abs() < 1e-2, "+10% of max HP bump");
+        assert!(
+            (bumped - (HEALTH_PERCENT_TO_CAUSE_STATUS + 0.10) * base_hp).abs() < 1e-2,
+            "the Fortify bump is a fraction of the same un-cheated pool"
+        );
     }
 
     /// RESISTANCE (§2): flat per-type subtraction, with elemental resist scaled by the
