@@ -2722,8 +2722,11 @@ pub fn on_tick(combat: &mut MatchCombat, now: Instant, debug_hold: bool) -> Vec<
         //
         // The knob is this delay, NOT the telegraph. 350 ms + 50 ms matches retail's
         // measured 383 ms median across 593 decoded swings — widening the wind-up
-        // would move us away from retail, so it stays exactly where it is. What retail
-        // has and we lacked is any opening gap at all.
+        // would move us away from retail, so it stays exactly where it is. Precisely:
+        // the gap was not literally zero, it was 400 ms of swing ANIMATION and nothing
+        // else. What was missing is any opening delay BEYOND the animation, i.e. any
+        // time in which the player can register that the round is live before the
+        // telegraph starts.
         if now.duration_since(combat.phase_entered) < ROUND_START_ENGAGE_DELAY {
             continue;
         }
