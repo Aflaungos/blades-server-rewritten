@@ -351,6 +351,55 @@ impl RecipeCraftingTypes {
             .find(|t| t.editor_name == editor_name)
             .map(|t| t.crafting_type_id)
     }
+
+    /// The `results` shape retail pairs with this CraftingType, or `None` when the type
+    /// is not in the loaded table (an unloaded/absent table therefore disables every
+    /// check built on this, which is the safe direction).
+    ///
+    /// `craftingTypeId` and `results` are NOT independent fields: across all 482 craft
+    /// records in the retail captures (`https://blades.bgs.services/.../crafts`) the
+    /// pairing is total and without exception —
+    ///
+    /// | CraftingType       | `results` shape  | retail records |
+    /// |--------------------|------------------|----------------|
+    /// | Smithing           | `items`          | 26 / 26        |
+    /// | Enchanting         | `items`          | 297 / 297      |
+    /// | Tempering          | `items`          | 51 / 51        |
+    /// | Alchemy            | `stackableItems` | 100 / 100      |
+    /// | DecorationCrafting | `stackableItems` | 8 / 8          |
+    ///
+    /// which is the game's own division: the benches that mint or mutate a piece of
+    /// GEAR hand back one instanced item, while the Alchemist and the Workshop hand
+    /// back a count of a stackable template. Salvaging and Repairing are unobserved in
+    /// the captures (neither ever created a *job*) but are item-input benches, so they
+    /// classify with the instanced side.
+    ///
+    /// The two stackable types are exactly the non-item-input types other than
+    /// Smithing; `is_item_input_crafting` alone cannot separate Smithing from Alchemy,
+    /// so the split is by name, pinned by
+    /// `every_crafting_type_classifies_as_the_captures_show_it`.
+    pub fn result_shape_of_type(&self, crafting_type_id: &Uuid) -> Option<CraftResultShape> {
+        let def = self
+            .crafting_types
+            .iter()
+            .find(|t| t.crafting_type_id == *crafting_type_id)?;
+        Some(match def.editor_name.as_str() {
+            "Alchemy" | "DecorationCrafting" => CraftResultShape::Stackable,
+            "" => return None,
+            _ => CraftResultShape::Instanced,
+        })
+    }
+}
+
+/// What a completed craft hands back, per CraftingType. See
+/// [`RecipeCraftingTypes::result_shape_of_type`] for the retail evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CraftResultShape {
+    /// `{"items":[{id, itemTemplateId, temperingLevel, durability}]}` — one instanced
+    /// piece of gear.
+    Instanced,
+    /// `{"stackableItems":{"<itemTemplateId>": n}}` — a count of a stackable template.
+    Stackable,
 }
 
 /// One row of `recipe_crafting_types.json.craftingTypes`.
