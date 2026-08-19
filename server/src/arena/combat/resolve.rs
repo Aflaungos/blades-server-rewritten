@@ -1900,6 +1900,40 @@ fn apply_status_conditioning(
                 }
             }
 
+
+            // FREEZE (frost only): `Frozen` used to be inert. It emitted its op51 and
+            // pushed an `ActiveEffect` whose per-tick is `dot_percent_health(Frost) ×
+            // maxHP` = **0.0** — Frost is a CONTROL status, not a DoT (Phase 3.8) — and
+            // then did nothing else: no actor state, no guard drop, and no gate anywhere
+            // in the bot loop, which only ever checked `is_staggered` / `is_paralyzed`.
+            // So a frozen opponent kept swinging and Frostbite's whole point was
+            // invisible (report #31, "does not freeze the opponent").
+            //
+            // The vehicle is the STAGGER path, for the same reason `apply_stagger_for`
+            // documents for ability stuns, mirrored: `ActorStateType` has **no `Frozen`
+            // member** (`dump.cs` 340171–340200, transcribed verbatim in `state.rs`), so
+            // there is no frozen actor-state id to put on the wire, and inventing one
+            // risks the client's `FindStateTypeByID` returning null and dropping the
+            // frame. `Staggered` (5) is capture-validated and does the same observable
+            // thing — inputs locked, guard dropped, combo broken, and an animation to
+            // play. The FROST identity still reaches the client: the op51 above carries
+            // the real `StatusEffectType::Frozen` (5), which is what drives the frost
+            // VFX. This reuses the existing plumbing wholesale, so the bot gate
+            // (`is_staggered` in `on_tick`) and the human input gate (`is_staggered` in
+            // `on_c2s_input`) both start applying to a freeze for free.
+            //
+            // Duration is SHIPPED: `ELEMENTAL_STATUSES[1]` (Frost) `.duration` = 5.0 s,
+            // the same figure the op51 above already put on the wire — the lock and the
+            // client-side status now expire together instead of disagreeing.
+            if *ty == DamageType::Frost && !already {
+                let secs = super::gamedata::combat_params::elemental_status(
+                    StatusEffectType::Frozen as u16 as u8,
+                )
+                .map(|e| e.duration)
+                .unwrap_or(CONDITION_DURATION_SECS);
+                info!("combat: slot {target_slot} FROZEN (frost {recent:.1} ≥ {threshold:.1}) for {secs}s");
+                combat.fighters[target_slot].apply_stagger_for(now, secs);
+            }
             // PARALYSE (poison only): the absolute poison threshold layered on top —
             // gated by can_be_paralyzed (player) + the defender's poison resist /
             // Fortify-Poisoned / Ward (all already folded into `recent` via mitigation
@@ -4911,6 +4945,87 @@ mod report_31_high_block_stun {
         super::on_tick(&mut c, after, false);
         assert!(!c.fighters[1].is_staggered(after));
         assert!(c.fighters[1].bot_swing_at.is_some(), "the bot swings again after the stun");
+    }
+
+
+    // -- Frozen must actually freeze --------------------------------------
+    //
+    // The Frost elemental status emitted its op51 and pushed an `ActiveEffect`,
+    // and that was all it did: its per-tick is `dot_percent_health(Frost) × maxHP`
+    // = 0.0 (Frost is a CONTROL status, not a DoT), it set no actor state, it did
+    // not drop the victim's guard, and nothing in the bot loop gated on it. So a
+    // "frozen" opponent kept swinging and the mechanic was invisible — the same
+    // shape of defect as the missing stagger gate above.
+
+    /// A frozen bot must stop swinging and must enter an actor state the client can
+    /// animate, exactly the way a stunned one does.
+    #[test]
+    fn a_frozen_bot_stops_swinging_and_enters_an_actor_state() {
+        let t0 = Instant::now();
+        // The round has been live for a while, so nothing about round START is in play.
+        let now = t0 + Duration::from_secs(30);
+
+        // Control: at this same instant an UNFROZEN bot does engage.
+        let mut ctrl = combat(t0, 1);
+        super::on_tick(&mut ctrl, now, false);
+        assert!(
+            ctrl.fighters[1].bot_swing_at.is_some(),
+            "control: an unfrozen bot engages at this instant",
+        );
+
+        // expected_peers = 1 → slot 1 is the bot. Land Frozen on it with an
+        // overwhelming Frost hit (the conditioning threshold is a fraction of maxHP).
+        let mut c = combat(t0, 1);
+        let out = super::apply_status_conditioning(
+            &mut c,
+            1,
+            &[(super::super::state::DamageType::Frost, 1.0e5)],
+            now,
+        );
+        let froze = out.iter().any(|(_, f)| {
+            messages::user_message_gmid(f) == Some(51) && {
+                let nd = arena_proto::parse_netdata(&f[2..]);
+                nd.int(4) == Some(1)
+                    && nd.int(5) == Some(StatusEffectType::Frozen as u16 as i64)
+            }
+        });
+        assert!(froze, "precondition: the op51 Frozen(5) apply must land");
+
+        // (1) The freeze sets an actor state, so the client has something to animate.
+        assert_ne!(
+            c.fighters[1].actor_state(),
+            ActorStateType::Idle,
+            "Frozen must set an actor state — a frozen fighter cannot still be Idle",
+        );
+        let entered = c.fighters[1].actor_state();
+        let transitions = c.fighters[1].take_state_changes();
+        assert!(
+            transitions.iter().any(|t| t.to == entered),
+            "…and the transition must be queued for the wire, so viewers see it",
+        );
+
+        // (2) The freeze gates the bot exactly the way a stagger does.
+        super::on_tick(&mut c, now + Duration::from_millis(10), false);
+        assert!(
+            c.fighters[1].bot_swing_at.is_none(),
+            "a frozen bot must not queue a wind-up",
+        );
+        assert_ne!(
+            c.fighters[1].actor_state(),
+            ActorStateType::Charging,
+            "…nor enter Charging",
+        );
+
+        // (3) …and it thaws on the SHIPPED Frost duration, it is not a permanent lock.
+        let frost_secs = super::super::gamedata::combat_params::elemental_status(5)
+            .expect("Frost (status_type 5) is in the shipped ELEMENTAL_STATUSES table")
+            .duration;
+        let thawed = now + Duration::from_secs_f32(frost_secs + 0.1);
+        super::on_tick(&mut c, thawed, false);
+        assert!(
+            c.fighters[1].bot_swing_at.is_some(),
+            "the bot swings again once the {frost_secs}s freeze lapses",
+        );
     }
 
     // -- (C) the bash's own 0.5 s guard window -------------------------------
