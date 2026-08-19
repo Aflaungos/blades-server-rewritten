@@ -311,6 +311,75 @@ impl AbyssStaticData {
     }
 }
 
+/// The APK-extracted `recipeId -> CraftingType` table (`recipe_crafting_types.json`).
+///
+/// The client keys a `CraftingStation` by **CraftingType**, never by recipe. Echo
+/// anything else in a craft job's `craftingTypeId` and `GetCraftingStation()` returns
+/// null: the town-build coroutine never completes and the player is stuck on the
+/// loading screen with no client-side way out (report #34).
+///
+/// Until this table existed there was no recipe→station mapping on the server at all
+/// beyond the ~34 captured `recipes.json` rows, so an un-captured recipe could only be
+/// guessed at. The table is walked out of the APK's own `RecipeData._recipeMap` (each
+/// `RecipeActionMapping` pairs a `UidCraftingTypePointer` with the `RecipeList` whose
+/// recipes belong to it), so it covers every recipe the client ships — 2,978 across the
+/// 7 crafting types. Nothing in it is authored: a recipe absent here is absent from the
+/// shipped client data, and the caller's existing fallback still applies.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeCraftingTypes {
+    /// The 7 `CraftingType` definitions (Smithing, Alchemy, Enchanting, Tempering,
+    /// DecorationCrafting, Salvaging, Repairing).
+    #[serde(default)]
+    pub crafting_types: Vec<CraftingTypeDef>,
+    /// `recipeId -> {craftingTypeId, …}`.
+    #[serde(default)]
+    pub recipes: HashMap<Uuid, RecipeCraftingType>,
+}
+
+impl RecipeCraftingTypes {
+    /// The `CraftingType` uuid a recipe belongs to, or `None` when the recipe is not in
+    /// the shipped client data. Never returns the recipe id.
+    pub fn crafting_type_of(&self, recipe_id: &Uuid) -> Option<Uuid> {
+        self.recipes.get(recipe_id).map(|r| r.crafting_type_id)
+    }
+
+    /// The uuid of the crafting type with the given `editorName` (e.g. `"Smithing"`).
+    pub fn type_by_name(&self, editor_name: &str) -> Option<Uuid> {
+        self.crafting_types
+            .iter()
+            .find(|t| t.editor_name == editor_name)
+            .map(|t| t.crafting_type_id)
+    }
+}
+
+/// One row of `recipe_crafting_types.json.craftingTypes`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CraftingTypeDef {
+    pub crafting_type_id: Uuid,
+    #[serde(default)]
+    pub editor_name: String,
+    #[serde(default)]
+    pub is_item_input_crafting: bool,
+    #[serde(default)]
+    pub recipe_count: u32,
+}
+
+/// One row of `recipe_crafting_types.json.recipes`. `nameKey` / `name` are carried for
+/// human debugging (the next "which bench is this?" report), not used by any logic.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecipeCraftingType {
+    pub crafting_type_id: Uuid,
+    #[serde(default)]
+    pub crafting_type: String,
+    #[serde(default)]
+    pub name_key: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+}
+
 /// One craftable the Forge's Smithing station can mint, from `smith_craftables.json`.
 /// The craftable LIST is client-side (its RecipeManager, gated by forge level); the
 /// server's job is to MINT the picked item at its `itemTemplateId` + `gradeIndex`.
@@ -565,6 +634,10 @@ pub struct StaticData {
     /// Temper/enchant recipes keyed by `recipeId` — the `POST /crafts` requests that
     /// carry an `itemId` and modify an existing item (vs `recipes`, which mint a new one).
     pub item_mod_recipes: HashMap<Uuid, ItemModRecipe>,
+    /// APK-extracted `recipeId -> CraftingType` (`recipe_crafting_types.json`). The
+    /// authoritative answer to "which bench does this recipe belong to", covering every
+    /// recipe the client ships — not just the captured ones.
+    pub recipe_crafting_types: RecipeCraftingTypes,
     /// Capture-derived quest completion rewards, keyed by quest/`gldQuestId` UUID.
     /// Used by `POST /quests/{id}/complete` to grant the reward without re-running the
     /// quest logic. Lenient: an unknown quest id returns an empty reward.

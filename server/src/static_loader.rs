@@ -14,8 +14,8 @@ use blades_lib::features::challenges::ChallengeTemplate;
 use blades_lib::features::daily_reward::DailyRewardDef;
 use blades_lib::features::game_events::EventDef;
 use blades_lib::static_data::{
-    Announcement, AbyssStaticData, GiftDef, ItemModRecipe, QuestsDailyData, Recipe, ShopBundle,
-    ShopData, SmithCraftables, SmithCraftablesFile, StaticData,
+    Announcement, AbyssStaticData, GiftDef, ItemModRecipe, QuestsDailyData, Recipe,
+    RecipeCraftingTypes, ShopBundle, ShopData, SmithCraftables, SmithCraftablesFile, StaticData,
 };
 use log::warn;
 use serde::de::DeserializeOwned;
@@ -98,6 +98,11 @@ pub fn load(dir: &Path) -> StaticData {
     let recipes: HashMap<Uuid, Recipe> = read_json(&dir.join("recipes.json"));
     let item_mod_recipes: HashMap<Uuid, ItemModRecipe> =
         read_json(&dir.join("item_mod_recipes.json"));
+    // The APK-extracted recipe -> CraftingType table. A missing file degrades to an
+    // empty map and the craft path keeps its captured-recipe / smith / alchemy fallback
+    // chain — the same behaviour as before the table existed.
+    let recipe_crafting_types: RecipeCraftingTypes =
+        read_json(&dir.join("recipe_crafting_types.json"));
     let quest_rewards: HashMap<Uuid, RewardGrant> =
         read_json(&dir.join("quest_rewards.json"));
     let abyss: AbyssStaticData = read_json(&dir.join("abyss.json"));
@@ -125,6 +130,7 @@ pub fn load(dir: &Path) -> StaticData {
         shop_bundles,
         recipes,
         item_mod_recipes,
+        recipe_crafting_types,
         quest_rewards,
         abyss,
         smith_craftables,
@@ -164,6 +170,28 @@ mod tests {
         assert!(!sd.shop_bundles.is_empty(), "shop_bundles.json");
         assert!(!sd.recipes.is_empty(), "recipes.json");
         assert!(!sd.item_mod_recipes.is_empty(), "item_mod_recipes.json");
+        // The APK-extracted recipe -> CraftingType table. Every recipe the client ships
+        // is in here, so a craft job can always name a real bench instead of guessing.
+        assert!(
+            !sd.recipe_crafting_types.recipes.is_empty(),
+            "recipe_crafting_types.json recipes"
+        );
+        assert_eq!(
+            sd.recipe_crafting_types.crafting_types.len(),
+            7,
+            "recipe_crafting_types.json craftingTypes (the client ships exactly 7)"
+        );
+        // Every captured recipe must agree with the APK on which bench it belongs to —
+        // this is the cross-check that the extraction is reading the right pointer. It
+        // held for all 34 committed rows at extraction time.
+        for (id, recipe) in &sd.recipes {
+            if let Some(from_apk) = sd.recipe_crafting_types.crafting_type_of(id) {
+                assert_eq!(
+                    recipe.crafting_type_id, from_apk,
+                    "recipes.json {id} disagrees with the APK crafting type"
+                );
+            }
+        }
         assert!(sd.global_shop_overrides.get("globalShopOverrides").is_some());
         assert!(sd.iap.get("fulfillmentOverrides").is_some());
         assert!(!sd.quest_rewards.is_empty(), "quest_rewards.json");
