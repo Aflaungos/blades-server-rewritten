@@ -568,9 +568,13 @@ const CONTROL_PAUSE_TIME: bool = false;
 /// fork's `MatchCombat::flow_controller_id` is exactly this object, and the spawn
 /// simply registers it before it is used.
 ///
-/// NetData (byte-for-byte vs s127 #954698 and s616 #4413504):
+/// NetData shape (byte-for-byte vs s127 #954698 and s616 #4413504):
 /// `{0:Int id · 1:Byte 57 · 2:Byte 3 · 4:Bool · 5:Float · 6:Bool · 7:Bool · 8:Bool ·
 /// 9:Bool · 10:Bool · 11:Bool · 12:Bool}` — note **propId 3 is absent**.
+///
+/// The *values* are retail's except for prop4 / prop8 / prop9, which tracker #35
+/// forces `false`; see the `CONTROL_*` constants for why claiming those would be a
+/// false statement about this server.
 pub fn spawn_control(net_object_id: i32) -> Vec<u8> {
     let mut w = NetDataWriter::new();
     w.int(0, net_object_id)
@@ -1376,13 +1380,28 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// Byte-for-byte vs the real retail **Control** net-object SPAWN — prod
-    /// `arena_udp_frames` #954698 (session 127, s2c, 39 B plaintext, obj 560). Strip
-    /// the 10-byte ENet header and the frame is exactly these 29 bytes.
+    /// Vs the real retail **Control** net-object SPAWN — prod `arena_udp_frames`
+    /// #954698 (session 127, s2c, 39 B plaintext, obj 560). Strip the 10-byte ENet
+    /// header and retail's frame is exactly these 29 bytes.
     ///
-    /// All **38** Control spawns in the corpus share one value tuple; #4413504
-    /// (session 616, obj 725, 27 days later) is asserted below to be the same frame
-    /// with only the id changed.
+    /// **This is deliberately NOT byte-identical to retail any more.** Three bools
+    /// differ — prop4 `LagCompensation`, prop8 `InputManager`, prop9 `StatePrediction`
+    /// — which retail sent `true` and we send `false`. Every other byte, including the
+    /// frame shape, the propId bitmap, the type nibbles and prop6
+    /// `InstantShieldBlock = true`, still matches the capture exactly, which is what
+    /// this test is really guarding.
+    ///
+    /// **Do not "fix" these three back to the captured `0x01`.** Doing so is what
+    /// tracker #35 was: those props advertise *server* capabilities this fork does not
+    /// implement, the client believes the claim, and manual swing/block/shield stop
+    /// working while abilities keep working. Byte-fidelity with retail is the right
+    /// default for wire *shape*; it is wrong for a prop that describes the sender.
+    /// See the `CONTROL_*` constants for the per-prop reasoning.
+    ///
+    /// All 38 Control spawns in the corpus share one value tuple; #4413504 (session
+    /// 616, obj 725, 27 days later) is asserted below to be the same frame with only
+    /// the id changed — that invariant survives this deviation, since we deviate
+    /// identically on every spawn.
     #[test]
     fn spawn_control_matches_s127_capture() {
         let got = spawn_control(560);
@@ -1395,12 +1414,12 @@ mod tests {
             0x30, 0x02, 0x00, 0x00, // prop0  Int   = 560 (the Control / flow-controller id)
             0x39, // prop1  Byte  = 57 (NetObjectType::Control)
             0x03, // prop2  Byte  = 3  (NetRole::Autonomous)
-            0x01, // prop4  Bool  = true  LagCompensation
+            0x00, // prop4  Bool  = false LagCompensation  <- retail 0x01, see #35
             0x0A, 0xD7, 0x23, 0x3D, // prop5  Float = 0.04  ServerHitTime
-            0x01, // prop6  Bool  = true  InstantShieldBlock
-            0x00, // prop7  Bool  = false CombatDebugInfo
-            0x01, // prop8  Bool  = true  InputManager
-            0x01, // prop9  Bool  = true  StatePrediction
+            0x01, // prop6  Bool  = true  InstantShieldBlock (matches retail)
+            0x00, // prop7  Bool  = false CombatDebugInfo    (matches retail)
+            0x00, // prop8  Bool  = false InputManager       <- retail 0x01, see #35
+            0x00, // prop9  Bool  = false StatePrediction    <- retail 0x01, see #35
             0x00, // prop10 Bool  = false PauseInroundTime
             0x00, // prop11 Bool  = false PauseLoadoutTime
             0x00, // prop12 Bool  = false PauseOpponentShowcaseTime
@@ -1408,22 +1427,79 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// The same builder must reproduce a *different* captured session verbatim —
-    /// #4413504 (session 616, obj 725 = 0x2D5). Only the propId0 id differs from
-    /// s127, which is the whole claim: retail's Control settings are constant.
+    /// The same builder must reproduce a *different* captured session — #4413504
+    /// (session 616, obj 725 = 0x2D5). Only the propId0 id differs from s127, which is
+    /// the whole claim: the Control settings block is constant across sessions.
+    ///
+    /// Like the s127 test above, this expectation carries the **intentional** tracker
+    /// #35 deviation: prop4 / prop8 / prop9 are `00` here where retail's capture had
+    /// `01`. The hex below was recomputed from the capture bytes by flipping exactly
+    /// those three offsets (17, 24, 25 of the 29-byte frame) — not hand-edited nibble
+    /// by nibble — and the surrounding bytes are unchanged from the capture.
+    /// Reverting them to `01` re-breaks manual combat; see `CONTROL_INPUT_MANAGER`.
     #[test]
     fn spawn_control_matches_s616_capture() {
         let got = spawn_control(725);
         let want: Vec<u8> = hex_bytes(
-            "BE320CF71F706765666666D50200003903010AD7233D01000101000000",
+            "BE320CF71F706765666666D50200003903000AD7233D01000000000000",
         );
         assert_eq!(got, want);
+    }
+
+    /// **Tracker #35 — do not flip these back without building the feature.**
+    ///
+    /// PR #34 shipped the retail Control spawn with retail's byte-exact prop tuple,
+    /// which told the client `InputManager = true` and `StatePrediction = true`. Live
+    /// report from the owner: *"No shield. Cannot block or swing manually. Spells and
+    /// skills are not showing active but still work."*
+    ///
+    /// The split is the diagnosis. Manual swing / block / shield are routed through
+    /// the client's server-input + prediction path; abilities and spells activate by a
+    /// different route. Claiming the two capabilities sends manual input into a server
+    /// path this fork never implemented, so only the manual half dies.
+    ///
+    /// `LagCompensation` is pinned for the same reason: it advertises server-side hit
+    /// rewind, and this fork has no position history — `gamedata::SERVER_HIT_TIME` is
+    /// declared and never read.
+    ///
+    /// These constants may become `true` only in the same change that implements the
+    /// capability they advertise. Until then a byte-fidelity argument is not a reason
+    /// to change them: a capability flag describes the sender, and we are not retail.
+    #[test]
+    fn control_capability_props_are_not_claimed() {
+        assert!(
+            !CONTROL_INPUT_MANAGER,
+            "tracker #35: no server-side input manager exists, so claiming one \
+             disables the client's manual swing/block/shield path"
+        );
+        assert!(
+            !CONTROL_STATE_PREDICTION,
+            "tracker #35: no server-side state reconciliation exists, so claiming \
+             prediction leaves the client waiting on a confirmation we never send"
+        );
+        assert!(
+            !CONTROL_LAG_COMPENSATION,
+            "tracker #35: no hit rewind / position history exists on this server"
+        );
+        // The counterpart: InstantShieldBlock is a client *behaviour* flag backed by
+        // PvpDefaultSettings.INSTANT_SHIELD_BLOCK = True, not a server-capability
+        // claim. It is the setting PR #34 actually wanted and it stays on.
+        assert!(
+            CONTROL_INSTANT_SHIELD_BLOCK,
+            "InstantShieldBlock is a client behaviour flag and must stay true"
+        );
     }
 
     /// Decode the built frame back through `parse_netdata` and assert each value
     /// against the *source of truth* rather than the byte pattern: the propIds are
     /// `ControlPropIds` (`dump.cs:588076-88`), `InstantShieldBlock` matches
     /// `PvpDefaultSettings.INSTANT_SHIELD_BLOCK = True` (`dump.cs:427017`).
+    ///
+    /// The three server-capability props (`LagCompensation`, `InputManager`,
+    /// `StatePrediction`) are asserted `false` on purpose — tracker #35. `dump.cs`
+    /// tells us the propId and the type; it does not oblige us to claim a capability
+    /// we have not built. `PvpDefaultSettings` carries no entry for any of the three,
+    /// so `false` is also the client's own fallback.
     #[test]
     fn spawn_control_props_match_dump_cs() {
         let f = spawn_control(560);
@@ -1440,11 +1516,14 @@ mod tests {
 
         use control_prop as p;
         for (prop, want) in [
-            (p::LAG_COMPENSATION, true),
+            // false, NOT retail's true: no rewind on this server (tracker #35).
+            (p::LAG_COMPENSATION, false),
             (p::INSTANT_SHIELD_BLOCK, true), // PvpDefaultSettings.INSTANT_SHIELD_BLOCK
             (p::COMBAT_DEBUG_INFO, false),
-            (p::INPUT_MANAGER, true),
-            (p::STATE_PREDICTION, true),
+            // false, NOT retail's true: no server-side input manager (tracker #35).
+            (p::INPUT_MANAGER, false),
+            // false, NOT retail's true: no state reconciliation (tracker #35).
+            (p::STATE_PREDICTION, false),
             (p::PAUSE_INROUND_TIME, false),
             (p::PAUSE_LOADOUT_TIME, false),
             (p::PAUSE_OPPONENT_SHOWCASE_TIME, false),
