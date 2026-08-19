@@ -23,6 +23,10 @@ starve a co-located stack.
 deploy/arena.sh build           # build the arena-server image
 deploy/arena.sh push            # docker save | ssh → docker load on the box
 
+# from any checkout, over ssh:
+deploy/arena.sh static --dry-run  # what a static-data sync would change
+deploy/arena.sh static            # ship deploy/static/ + restart the server
+
 # on the SERVER box (repo dir; deploy/arena.env present):
 deploy/arena.sh up              # start db → migrate → server (idempotent)
 deploy/arena.sh status          # container state + health
@@ -32,7 +36,47 @@ deploy/arena.sh restart
 deploy/arena.sh down            # stop (keeps the arena-db-data volume)
 deploy/arena.sh migrate         # re-run the idempotent migration if needed
 ```
-(Env overrides: `ARENA_ENV`, `ARENA_BOX`, `ARENA_SSH_KEY`.)
+(Env overrides: `ARENA_ENV`, `ARENA_BOX`, `ARENA_BOX_DIR`, `ARENA_SSH_KEY`.)
+
+## Shipping game data (`deploy/arena.sh static`)
+
+`deploy/static/*.json` is mounted read-only at `/data/static` and read **once, at
+startup**. `sync` deliberately skips `deploy/` — `arena.env` lives there — so for
+a long time nothing shipped this directory at all and it drifted: files sat in
+git for weeks while the box logged
+
+```
+[static] no "/data/static/recipe_crafting_types.json": No such file or directory; using default
+```
+
+once at boot and then served the fallback silently. Each missing file degrades
+one feature (crafting-bench names, sell prices, enchant values, repair costs)
+without erroring, so nothing surfaces it. `static` is the step that was missing.
+
+```bash
+deploy/arena.sh static --dry-run   # itemises what would change; touches nothing
+deploy/arena.sh static             # rsync, then `docker restart arena-server`
+```
+
+Run the dry run first. Three things about it are deliberate:
+
+- **It restarts the server.** A static-data sync without a restart is a no-op,
+  which is exactly the failure mode being fixed. It is a plain `docker restart`
+  on the running container, not a compose `up`: the compose file root actually
+  runs is `/etc/newblades/docker-compose.arena.yml`, not the repo copy.
+- **No `--delete`, ever.** The box's `deploy/static` is not a mirror of git.
+  `bundles.blades.bgs.services/` is a 1.1 GB asset mirror maintained in place by
+  blades-capture's `scripts/bundle-mirror.py` (excluded outright, since git holds
+  only a `.gitkeep` for it), and files such as `default_town.json` and
+  `item_durability.json` are generated straight onto the box. `--delete` would
+  erase all of it on the first run.
+- **Overwrites are kept** under `deploy/static-backup/<UTC timestamp>/`, outside
+  the mounted directory. git is not reliably the newer side — some of these
+  files are produced by generators that write to the box — so an overwrite can
+  be a downgrade, and `-i` names every file it touched.
+
+After the sync the command prints any `[static]` lines the restarted server
+logged. No output means every file loaded.
 
 ## Wire the web (makes /arena Transfer work)
 On the `newblades-web` container set (same token as `arena.env`):
