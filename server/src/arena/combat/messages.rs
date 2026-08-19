@@ -478,14 +478,37 @@ pub mod control_prop {
     pub const PAUSE_OPPONENT_SHOWCASE_TIME: u8 = 12;
 }
 
-/// Every value below is the one retail actually put on the wire. All **38** Control
-/// spawns in the decrypted capture corpus (15 distinct sessions, 2026-05-31 →
-/// 2026-06-29) carry a **single, byte-identical** value tuple — there is no variation
-/// to model. [prod `arena_udp_frames`, sweep 2026-08-19.]
+/// The retail baseline: all **38** Control spawns in the decrypted capture corpus
+/// (15 distinct sessions, 2026-05-31 → 2026-06-29) carry a **single, byte-identical**
+/// value tuple — there is no variation to model. [prod `arena_udp_frames`, sweep
+/// 2026-08-19.]
 ///
-/// `LagCompensation = true`: the client's `PvpClientManager.HasLagCompensation`
-/// (`dump.cs:584710`) reads it.
-const CONTROL_LAG_COMPENSATION: bool = true;
+/// **Three of these values intentionally do NOT match retail** — `LagCompensation`,
+/// `InputManager` and `StatePrediction`, all forced `false` by tracker #35. Each is a
+/// claim about what the **server** implements, not a client cosmetic toggle, and this
+/// fork implements none of the three. Retail could honestly send `true`; we cannot.
+/// Sending them `true` (PR #34, live 14:29 UTC 2026-08-17) routed manual swing, block
+/// and shield into server paths that do not exist and broke live combat. See each
+/// constant for the specific reasoning — and do **not** "restore fidelity" here
+/// without first implementing the capability the prop advertises.
+///
+/// `LagCompensation = false` — **deliberate deviation from retail** (tracker #35).
+///
+/// Retail sent `true` because retail's server rewound actor positions to the
+/// attacker's view-time when registering a hit. **This fork implements no such
+/// rewind**: there is no position history, no per-client time offset, and
+/// `gamedata::SERVER_HIT_TIME` is declared but never read on any resolution path —
+/// hits resolve against present-tick state only. The client's
+/// `PvpClientManager.HasLagCompensation` (`dump.cs:584710`) reads this prop, so
+/// sending retail's `true` is a claim about a server capability we do not have, and
+/// puts hit registration on a path the server never completes.
+///
+/// Byte-fidelity with the retail capture is *not* the goal for this prop: the prop
+/// describes the **sender's** capabilities, and we are not retail. Note also that
+/// `PvpDefaultSettings` (`dump.cs:427009`) has no entry for it, so before PR #34 —
+/// when the fork spawned no Control object at all and manual combat worked — the
+/// client ran on the field default `false`. This restores that.
+const CONTROL_LAG_COMPENSATION: bool = false;
 /// `ServerHitTime = 0.04 s` — 40 ms. Capture-only: `PvpDefaultSettings`
 /// (`dump.cs:427008`) has no entry for it, so this is the observed retail value, not
 /// a guess.
@@ -498,10 +521,34 @@ const CONTROL_SERVER_HIT_TIME: f32 = 0.04;
 const CONTROL_INSTANT_SHIELD_BLOCK: bool = true;
 /// `CombatDebugInfo = false` — the on-screen combat debug overlay stays off.
 const CONTROL_COMBAT_DEBUG_INFO: bool = false;
-/// `InputManager = true`.
-const CONTROL_INPUT_MANAGER: bool = true;
-/// `StatePrediction = true` — client-side prediction of its own actor state.
-const CONTROL_STATE_PREDICTION: bool = true;
+/// `InputManager = false` — **deliberate deviation from retail** (tracker #35).
+///
+/// Retail sent `true` because retail's server ran a server-side input manager that
+/// accepted, ordered and applied the client's raw input stream. **This fork
+/// implements none of that.** Telling the client `true` makes it hand manual input
+/// (swing, block, shield raise) to a server path that does not exist, so those
+/// inputs are swallowed and never resolve. Abilities and spells activate through a
+/// different route and keep working — which is exactly the symptom split the owner
+/// reported: "No shield. Cannot block or swing manually. Spells and skills are not
+/// showing active but still work."
+///
+/// Sending retail's byte-exact value here is a **lie about our server**, not
+/// fidelity. Set it back to `true` only together with an actual server-side input
+/// manager.
+const CONTROL_INPUT_MANAGER: bool = false;
+/// `StatePrediction = false` — **deliberate deviation from retail** (tracker #35).
+///
+/// Retail sent `true` because retail's server supported client-side prediction of
+/// actor state with server reconciliation. **This fork implements no reconciliation**
+/// — it broadcasts authoritative actor-state transitions and never corrects a
+/// client's predicted state. With `true` the client predicts locally and then waits
+/// for a confirmation the server never sends, which is why locally-driven actions
+/// (shield/block/swing) visibly die while server-driven ones survive.
+///
+/// Same rule as `CONTROL_INPUT_MANAGER`: this prop advertises a **server**
+/// capability, so matching retail's byte would be a false claim. Flip it back only
+/// alongside real state reconciliation.
+const CONTROL_STATE_PREDICTION: bool = false;
 /// `Pause{Inround,Loadout,OpponentShowcase}Time = false` — the three debug
 /// timer-freeze toggles; retail ships them all off.
 const CONTROL_PAUSE_TIME: bool = false;
