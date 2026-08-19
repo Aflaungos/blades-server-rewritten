@@ -1900,6 +1900,40 @@ fn apply_status_conditioning(
                 }
             }
 
+
+            // FREEZE (frost only): `Frozen` used to be inert. It emitted its op51 and
+            // pushed an `ActiveEffect` whose per-tick is `dot_percent_health(Frost) ×
+            // maxHP` = **0.0** — Frost is a CONTROL status, not a DoT (Phase 3.8) — and
+            // then did nothing else: no actor state, no guard drop, and no gate anywhere
+            // in the bot loop, which only ever checked `is_staggered` / `is_paralyzed`.
+            // So a frozen opponent kept swinging and Frostbite's whole point was
+            // invisible (report #31, "does not freeze the opponent").
+            //
+            // The vehicle is the STAGGER path, for the same reason `apply_stagger_for`
+            // documents for ability stuns, mirrored: `ActorStateType` has **no `Frozen`
+            // member** (`dump.cs` 340171–340200, transcribed verbatim in `state.rs`), so
+            // there is no frozen actor-state id to put on the wire, and inventing one
+            // risks the client's `FindStateTypeByID` returning null and dropping the
+            // frame. `Staggered` (5) is capture-validated and does the same observable
+            // thing — inputs locked, guard dropped, combo broken, and an animation to
+            // play. The FROST identity still reaches the client: the op51 above carries
+            // the real `StatusEffectType::Frozen` (5), which is what drives the frost
+            // VFX. This reuses the existing plumbing wholesale, so the bot gate
+            // (`is_staggered` in `on_tick`) and the human input gate (`is_staggered` in
+            // `on_c2s_input`) both start applying to a freeze for free.
+            //
+            // Duration is SHIPPED: `ELEMENTAL_STATUSES[1]` (Frost) `.duration` = 5.0 s,
+            // the same figure the op51 above already put on the wire — the lock and the
+            // client-side status now expire together instead of disagreeing.
+            if *ty == DamageType::Frost && !already {
+                let secs = super::gamedata::combat_params::elemental_status(
+                    StatusEffectType::Frozen as u16 as u8,
+                )
+                .map(|e| e.duration)
+                .unwrap_or(CONDITION_DURATION_SECS);
+                info!("combat: slot {target_slot} FROZEN (frost {recent:.1} ≥ {threshold:.1}) for {secs}s");
+                combat.fighters[target_slot].apply_stagger_for(now, secs);
+            }
             // PARALYSE (poison only): the absolute poison threshold layered on top —
             // gated by can_be_paralyzed (player) + the defender's poison resist /
             // Fortify-Poisoned / Ward (all already folded into `recent` via mitigation
@@ -2547,6 +2581,53 @@ fn begin_swing_animation(combat: &mut MatchCombat, slot: usize, now: Instant) {
     f.schedule_state(idle_at, ActorStateType::Idle);
 }
 
+/// How long after a round goes live before a bot may take its first action.
+///
+/// **AUTHORED — this is not a shipped game-data value.** It was searched for and does
+/// not exist, because retail arena is human-vs-human: there is no bot in the shipped
+/// client, so Bethesda had nothing to tune. Specifically:
+///
+///   * `PvpDefaultSettings` (`dump.cs:427009`) is nine constants — health multiplier,
+///     stamina reduction, block/stagger timings, block multipliers — none round-start.
+///   * `PvpParameters` (`dump.cs:611404`) is thirteen fields — sidestep idle, charge
+///     anim modifier, `serverHitTime`, spawn distance, consumables — none round-start.
+///   * `CombatParameters`' only timing fields are `_baseStaggerDuration`,
+///     `_endCombatTime`, `_endEncounterTime` and the IK/animation times.
+///   * The only AI-reaction data anywhere in the dump is
+///     `EnemyCombatAIParameters._reactionTime` (`dump.cs:624152`), the PvE dungeon
+///     brain — 0.2–1.0 s bands across 667 enemy variants. Wrong domain.
+///   * The inter-round state table (`engine::MATCH_STATE_INTERROUND_PROGRESSION`)
+///     stops at `InRound`: its 4 s hold is consumed BEFORE the live round begins, and
+///     `PreRound`'s 4.0 s is burned by the client's own READY/FIGHT HUD sequence
+///     (`PvpHUDMenu.PREROUND_*`, `dump.cs:667036`). Nothing shipped covers the window
+///     AFTER `InRound`.
+///
+/// So a number had to be chosen. 1.0 s, anchored two ways:
+///
+///   * **Upper bound from shipped precedent.** Retail demonstrably DOES stagger a
+///     round's first action: `ActiveAbility._initialCooldown` (`dump.cs:607776`,
+///     "cooldown charged at the start of a fight") runs 0.5 s (Lightning Bolt) to
+///     2.75 s (Power Attack, Frostbite, Paralyze, Guardbreaker) across the arena
+///     abilities — see `docs/arena-cooldowns-authoritative.md`. 1.0 s sits near the
+///     bottom of that band. This is an ANALOGY, not a derivation: `_initialCooldown`
+///     gates abilities, not weapon swings.
+///   * **Lower bound from what the mechanic requires.** With this delay the opening
+///     blow cannot land sooner than 1.0 + 0.35 + 0.05 = 1.4 s into the round, which is
+///     the budget the player needs to register that the round went live, press block,
+///     and have the c2s gmid 46 cross WireGuard. The previous behaviour gave 400 ms
+///     total, of which none was available for the first two steps.
+///
+/// Kept deliberately near the bottom of the precedent band: the goal is a blockable
+/// opener, not a passive bot. It is also consistent with [`BOT_SWING_COOLDOWN`], the
+/// bot's other cadence knob, which is authored for the same reason.
+///
+/// **This is not a substitute for the telegraph.** `BOT_CHARGE_WINDUP` (350 ms) +
+/// [`FOLLOW_THROUGH_DELAY`] (50 ms) = 400 ms matches retail's measured 383 ms median
+/// across 593 decoded swings and must stay exactly where it is — widening the wind-up
+/// to make the opener blockable would move us AWAY from retail. The defect was that
+/// there was ZERO opening delay, and this is the only thing that changes.
+pub(super) const ROUND_START_ENGAGE_DELAY: Duration = Duration::from_millis(1000);
+
 /// A bot fighter's auto-swing cadence. Slower than a human's `SWING_COOLDOWN` so the
 /// player wins comfortably but sees real incoming damage — a fight, not a static dummy.
 const BOT_SWING_COOLDOWN: Duration = Duration::from_millis(1800);
@@ -2629,6 +2710,24 @@ pub fn on_tick(combat: &mut MatchCombat, now: Instant, debug_hold: bool) -> Vec<
         // and letting `bot_swing_at` survive would land a swing out of a stun.
         if combat.fighters[bot].is_staggered(now) {
             combat.fighters[bot].bot_swing_at = None;
+            continue;
+        }
+        // OPENING DELAY. `ready` below falls back to `true` when `last_swing` is
+        // `None`, which at round start it always is — so the bot charged on tick 0 of
+        // the round and the opening blow landed `BOT_CHARGE_WINDUP` +
+        // `FOLLOW_THROUGH_DELAY` = 400 ms into a round the player had not yet seen go
+        // live. Blocking it required pressing block and getting the c2s gmid 46 across
+        // WireGuard inside that window: not reachable, and the opener was in practice
+        // unblockable.
+        //
+        // The knob is this delay, NOT the telegraph. 350 ms + 50 ms matches retail's
+        // measured 383 ms median across 593 decoded swings — widening the wind-up
+        // would move us away from retail, so it stays exactly where it is. Precisely:
+        // the gap was not literally zero, it was 400 ms of swing ANIMATION and nothing
+        // else. What was missing is any opening delay BEYOND the animation, i.e. any
+        // time in which the player can register that the round is live before the
+        // telegraph starts.
+        if now.duration_since(combat.phase_entered) < ROUND_START_ENGAGE_DELAY {
             continue;
         }
         // A bot swings in TWO steps, because retail's swing is two steps.
@@ -4911,6 +5010,173 @@ mod report_31_high_block_stun {
         super::on_tick(&mut c, after, false);
         assert!(!c.fighters[1].is_staggered(after));
         assert!(c.fighters[1].bot_swing_at.is_some(), "the bot swings again after the stun");
+    }
+
+
+
+    // -- The opening swing must be blockable -------------------------------
+    //
+    // `drive_bots` computed readiness as
+    //   `last_swing.map(|t| now - t >= BOT_SWING_COOLDOWN).unwrap_or(true)`
+    // and at round start `last_swing` is `None`, so the fallback said READY and the
+    // bot charged on tick 0 of the round. Impact landed `BOT_CHARGE_WINDUP` (350 ms)
+    // + `FOLLOW_THROUGH_DELAY` (50 ms) = 400 ms later — into which the player had to
+    // see the round go live, press block, and get the c2s gmid 46 across WireGuard.
+    // The opening hit was unblockable.
+
+    /// The bot must not act on tick 0 of a live round, and the opening delay is a
+    /// PER-ROUND property — round 2 gets it too.
+    #[test]
+    fn a_bot_cannot_act_before_the_round_start_delay() {
+        let now = Instant::now();
+        // expected_peers = 1 → slot 1 is the bot; the round goes live at `now`.
+        let mut c = combat(now, 1);
+
+        // Tick 0 of the live round.
+        super::on_tick(&mut c, now, false);
+        assert!(
+            c.fighters[1].bot_swing_at.is_none(),
+            "the bot must not queue a wind-up on tick 0 of the round",
+        );
+        assert_ne!(
+            c.fighters[1].actor_state(),
+            ActorStateType::Charging,
+            "…nor enter Charging on tick 0",
+        );
+
+        // Nor at any instant before the opening delay has elapsed.
+        let just_before = now + super::ROUND_START_ENGAGE_DELAY - Duration::from_millis(1);
+        super::on_tick(&mut c, just_before, false);
+        assert!(
+            c.fighters[1].bot_swing_at.is_none(),
+            "the bot must not act 1 ms before the opening delay expires",
+        );
+
+        // Once it has, the bot engages exactly as before.
+        let after = now + super::ROUND_START_ENGAGE_DELAY + Duration::from_millis(1);
+        super::on_tick(&mut c, after, false);
+        let swing_at = c.fighters[1]
+            .bot_swing_at
+            .expect("the bot engages once the opening delay has elapsed");
+        assert_eq!(
+            c.fighters[1].actor_state(),
+            ActorStateType::Charging,
+            "…and the wind-up is a real telegraph, not an instant hit",
+        );
+
+        // The FIX IS THE OPENING DELAY, NOT A WIDER TELEGRAPH. 350 ms + 50 ms = 400 ms
+        // matches retail's measured 383 ms median across 593 decoded swings; widening
+        // it would move us AWAY from retail. This pins it so a future "fix" for an
+        // unblockable opener cannot reach for the telegraph instead.
+        assert_eq!(
+            super::BOT_CHARGE_WINDUP,
+            Duration::from_millis(350),
+            "the telegraph must stay at retail's measured value — the opening delay is \
+             the knob, not the wind-up",
+        );
+
+        // The earliest the opening blow can LAND is delay + wind-up + follow-through.
+        let impact = swing_at + super::FOLLOW_THROUGH_DELAY;
+        assert!(
+            impact.duration_since(now)
+                >= super::ROUND_START_ENGAGE_DELAY
+                    + super::BOT_CHARGE_WINDUP
+                    + super::FOLLOW_THROUGH_DELAY,
+            "the opening blow must not be able to land before delay + wind-up + \
+             follow-through",
+        );
+
+        // …and it is PER ROUND. Round 2 re-enters the live phase with a fresh
+        // `phase_entered`, so the opening delay must apply again — a bot that opened
+        // round 2 instantly would be the same defect with one round of warning.
+        let r2 = after + Duration::from_secs(10);
+        c.reset_fighters_for_next_round(r2);
+        c.phase_entered = r2;
+        super::on_tick(&mut c, r2, false);
+        assert!(
+            c.fighters[1].bot_swing_at.is_none(),
+            "the opening delay is per-ROUND: the bot must not act on tick 0 of round 2",
+        );
+    }
+
+    // -- Frozen must actually freeze --------------------------------------
+    //
+    // The Frost elemental status emitted its op51 and pushed an `ActiveEffect`,
+    // and that was all it did: its per-tick is `dot_percent_health(Frost) × maxHP`
+    // = 0.0 (Frost is a CONTROL status, not a DoT), it set no actor state, it did
+    // not drop the victim's guard, and nothing in the bot loop gated on it. So a
+    // "frozen" opponent kept swinging and the mechanic was invisible — the same
+    // shape of defect as the missing stagger gate above.
+
+    /// A frozen bot must stop swinging and must enter an actor state the client can
+    /// animate, exactly the way a stunned one does.
+    #[test]
+    fn a_frozen_bot_stops_swinging_and_enters_an_actor_state() {
+        let t0 = Instant::now();
+        // The round has been live for a while, so nothing about round START is in play.
+        let now = t0 + Duration::from_secs(30);
+
+        // Control: at this same instant an UNFROZEN bot does engage.
+        let mut ctrl = combat(t0, 1);
+        super::on_tick(&mut ctrl, now, false);
+        assert!(
+            ctrl.fighters[1].bot_swing_at.is_some(),
+            "control: an unfrozen bot engages at this instant",
+        );
+
+        // expected_peers = 1 → slot 1 is the bot. Land Frozen on it with an
+        // overwhelming Frost hit (the conditioning threshold is a fraction of maxHP).
+        let mut c = combat(t0, 1);
+        let out = super::apply_status_conditioning(
+            &mut c,
+            1,
+            &[(super::super::state::DamageType::Frost, 1.0e5)],
+            now,
+        );
+        let froze = out.iter().any(|(_, f)| {
+            messages::user_message_gmid(f) == Some(51) && {
+                let nd = arena_proto::parse_netdata(&f[2..]);
+                nd.int(4) == Some(1)
+                    && nd.int(5) == Some(StatusEffectType::Frozen as u16 as i64)
+            }
+        });
+        assert!(froze, "precondition: the op51 Frozen(5) apply must land");
+
+        // (1) The freeze sets an actor state, so the client has something to animate.
+        assert_ne!(
+            c.fighters[1].actor_state(),
+            ActorStateType::Idle,
+            "Frozen must set an actor state — a frozen fighter cannot still be Idle",
+        );
+        let entered = c.fighters[1].actor_state();
+        let transitions = c.fighters[1].take_state_changes();
+        assert!(
+            transitions.iter().any(|t| t.to == entered),
+            "…and the transition must be queued for the wire, so viewers see it",
+        );
+
+        // (2) The freeze gates the bot exactly the way a stagger does.
+        super::on_tick(&mut c, now + Duration::from_millis(10), false);
+        assert!(
+            c.fighters[1].bot_swing_at.is_none(),
+            "a frozen bot must not queue a wind-up",
+        );
+        assert_ne!(
+            c.fighters[1].actor_state(),
+            ActorStateType::Charging,
+            "…nor enter Charging",
+        );
+
+        // (3) …and it thaws on the SHIPPED Frost duration, it is not a permanent lock.
+        let frost_secs = super::super::gamedata::combat_params::elemental_status(5)
+            .expect("Frost (status_type 5) is in the shipped ELEMENTAL_STATUSES table")
+            .duration;
+        let thawed = now + Duration::from_secs_f32(frost_secs + 0.1);
+        super::on_tick(&mut c, thawed, false);
+        assert!(
+            c.fighters[1].bot_swing_at.is_some(),
+            "the bot swings again once the {frost_secs}s freeze lapses",
+        );
     }
 
     // -- (C) the bash's own 0.5 s guard window -------------------------------
