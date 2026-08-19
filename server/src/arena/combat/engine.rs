@@ -1047,16 +1047,6 @@ impl MatchInstance {
     /// constructs the opponent — see `broadcast_profiles`.
     fn broadcast_spawns(&self, out: &mut Vec<(usize, Vec<u8>)>) {
         for viewer in 0..self.combat.fighters.len() {
-            // op50 SPAWN of the type-57 **Control** net object — FIRST, ahead of the
-            // Players, exactly as retail orders it (capture: s293 obj 0 type 57 →
-            // Player → Match → Avatars; s390 obj 477 type 57 → 478/479 Player). This
-            // is the object `PvpControl.Initialize(INetObjectProxy)` binds to, and it
-            // carries the replicated PvP settings block (`ControlPropIds`) —
-            // `InstantShieldBlock`, `ServerHitTime`, `LagCompensation`,
-            // `StatePrediction`, `InputManager`. Same id as the op79/op80 flow
-            // messages already use, so the object the client is being *talked to* on
-            // finally gets *registered* first. [see messages::spawn_control]
-            out.push((viewer, messages::spawn_control(self.combat.flow_controller_id)));
             for actor in &self.combat.fighters {
                 let is_own = actor.slot == viewer;
                 let role = if is_own {
@@ -1582,15 +1572,10 @@ pub(in crate::arena::combat) mod tests {
         // (Connecting→Spawning) sends per viewer = a Player op50 for BOTH fighters + the
         // single type-54 **Match** net-object op50 (propId5 = WaitingForPlayers, pc 1).
         // The Avatars come LATER (after the Match→InitialPlayerSetup transition, see
-        // `match_state_progresses_3_4_5`). Prefixed by the type-57 **Control** spawn,
-        // which retail sends ahead of everything (see
-        // `round_start_spawns_control_object_first`). So this burst = 2 viewers ×
-        // (1 Control + 2 Player + 1 Match) = 8 op50 (0x32) spawn messages — NO Avatars yet.
+        // `match_state_progresses_3_4_5`). So this burst = 2 viewers × (2 Player + 1
+        // Match) = 6 op50 (0x32) spawn messages — NO Avatars yet.
         let spawns = out.iter().filter(|(_, b)| b.len() >= 2 && b[1] == 0x32).count();
-        assert_eq!(
-            spawns, 8,
-            "op50 = Control + Player(both) + Match per viewer; avatars come after state 3→4"
-        );
+        assert_eq!(spawns, 6, "op50 = Player(both) + Match per viewer; avatars come after state 3→4");
         // No Avatar (type 56) op50 in the first burst (they ride the 3→4 tick).
         let avatars = out
             .iter()
@@ -1603,66 +1588,6 @@ pub(in crate::arena::combat) mod tests {
             m.match_state_for_test(),
             crate::arena::combat::state::MatchState::WaitingForPlayers,
             "Match net-object spawns at WaitingForPlayers(3), the binding-gate state"
-        );
-    }
-
-    /// Retail spawns the type-57 **Control** net object FIRST, before either Player.
-    ///
-    /// Capture-proven across every match in the corpus that contains a Control spawn
-    /// (prod `arena_udp_frames`, 2026-08-19 sweep): s293 obj 0 type 57 → obj 2 Player
-    /// → obj 3 Match → obj 5/6 Avatar; s390 obj 477 type 57 → obj 478/479 Player; s127
-    /// obj 560 type 57 → obj 561/563 Player. The Control object is what the client's
-    /// `PvpControl.Initialize(INetObjectProxy)` (`dump.cs:585831`) binds to, and it
-    /// carries the replicated PvP settings block (`ControlPropIds`, `dump.cs:588076`)
-    /// — `InstantShieldBlock`, `ServerHitTime`, `LagCompensation`, `StatePrediction`.
-    ///
-    /// Before this test the fork spawned **zero** Control objects, so the client ran
-    /// the whole match on its own defaults for all nine settings even though it was
-    /// already being sent op79 flow messages addressed to that very object id.
-    #[test]
-    fn round_start_spawns_control_object_first() {
-        let (mut m, t0) = inst(2);
-        let out = m.on_tick(2, t0); // Connecting → Spawning
-        assert_eq!(m.phase(), FlowState::Spawning);
-
-        // Per viewer: exactly one op50 SPAWN of net-object type 57.
-        for viewer in 0..2 {
-            let spawns: Vec<&(usize, Vec<u8>)> = out
-                .iter()
-                .filter(|(v, b)| *v == viewer && b.len() >= 3 && b[1] == 0x32)
-                .collect();
-            let control_ix = spawns.iter().position(|(_, b)| {
-                arena_proto::parse_netdata(&b[2..]).int(1) == Some(57)
-            });
-            assert_eq!(
-                control_ix,
-                Some(0),
-                "viewer {viewer}: the type-57 Control spawn must be the FIRST op50 \
-                 (retail order: Control → Player → Player → Match)"
-            );
-        }
-
-        // It must address the SAME net object the op79 flow messages use — otherwise
-        // the client binds its PvpControl to an object the server never talks to.
-        let control = out
-            .iter()
-            .find(|(_, b)| {
-                b.len() >= 3 && b[1] == 0x32 && arena_proto::parse_netdata(&b[2..]).int(1) == Some(57)
-            })
-            .expect("a Control spawn was emitted");
-        let nd = arena_proto::parse_netdata(&control.1[2..]);
-        assert_eq!(
-            nd.int(0),
-            Some(i64::from(m.combat.flow_controller_id)),
-            "the Control spawn id must equal flow_controller_id (the op79/op80 target)"
-        );
-
-        // And it must carry the settings, not just exist: InstantShieldBlock = true
-        // (`PvpDefaultSettings.INSTANT_SHIELD_BLOCK`, dump.cs:427017).
-        assert_eq!(
-            nd.int(super::messages::control_prop::INSTANT_SHIELD_BLOCK),
-            Some(1),
-            "Control propId 6 InstantShieldBlock must replicate as true"
         );
     }
 
