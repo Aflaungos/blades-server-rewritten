@@ -575,6 +575,16 @@ const CONTROL_PAUSE_TIME: bool = false;
 /// The *values* are retail's except for prop4 / prop8 / prop9, which tracker #35
 /// forces `false`; see the `CONTROL_*` constants for why claiming those would be a
 /// false statement about this server.
+///
+/// **NOT CURRENTLY CALLED — tracker #35.** `engine.rs::broadcast_spawns` no longer
+/// emits this object. With it spawned, the client loses the shield and the manual
+/// swing while server-driven actions (bash, spells) keep working; forcing the three
+/// capability props to `false` (PR #36, live) changed nothing, so it is the
+/// *presence* of the Control object the client reacts to, not its values. The
+/// builder and its capture-fidelity tests below are kept because the evidence behind
+/// them is sound (38 byte-identical retail spawns across 15 sessions, all nine
+/// propIds proved) — something the client needs alongside the spawn is still
+/// missing. Re-enable the call only with a way to test against a real client first.
 pub fn spawn_control(net_object_id: i32) -> Vec<u8> {
     let mut w = NetDataWriter::new();
     w.int(0, net_object_id)
