@@ -16,6 +16,7 @@
 //! item. `arcaneTier` is not modelled on `Item` (the server drops it for every item).
 
 use std::{
+    borrow::Cow,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -60,22 +61,32 @@ struct CraftJobWire<'a> {
     crafting_type_id: Uuid,
     completed_at: i64,
     batch_size: u32,
-    results: &'a Value,
+    results: Cow<'a, Value>,
     version: u32,
 }
 
 impl<'a> CraftJobWire<'a> {
-    fn from_job(job: &'a CraftJob, user_id: Uuid, character_id: Uuid) -> Self {
+    /// Build the wire record for a stored job, running it through
+    /// [`repaired_craft_fields`] first. Every craft record the client ever sees goes
+    /// through here, so this is the single choke point for the
+    /// `craftingTypeId != recipeId` + non-empty-`results` invariants.
+    fn from_job(
+        job: &'a CraftJob,
+        user_id: Uuid,
+        character_id: Uuid,
+        static_data: &blades_lib::static_data::StaticData,
+    ) -> Self {
+        let (crafting_type_id, results) = repaired_craft_fields(job, static_data);
         CraftJobWire {
             id: job.id,
             user_id,
             character_id,
             building_id: job.building_id,
             recipe_id: job.recipe_id,
-            crafting_type_id: job.crafting_type_id,
+            crafting_type_id,
             completed_at: job.completed_at_ms,
             batch_size: 1,
-            results: &job.results,
+            results,
             version: 1,
         }
     }
@@ -99,6 +110,7 @@ pub async fn get_crafts(
     let session = session.get_session_or_error()?;
     let user_id = session.session.user_id;
     let character_id = path.into_inner();
+    let globals = app_state.get_ref().clone();
     let mut conn = app_state.db_pool.get().await.unwrap();
 
     conn.transaction(move |mut conn| {
@@ -110,8 +122,13 @@ pub async fn get_crafts(
                 .craft_jobs
                 .iter()
                 .map(|job| {
-                    serde_json::to_value(CraftJobWire::from_job(job, user_id, character_id))
-                        .unwrap_or(Value::Null)
+                    serde_json::to_value(CraftJobWire::from_job(
+                        job,
+                        user_id,
+                        character_id,
+                        &globals.static_data,
+                    ))
+                    .unwrap_or(Value::Null)
                 })
                 .collect();
             Ok::<_, BladeApiError>(Json(GetCraftsResponse { crafts }))
@@ -286,9 +303,13 @@ pub async fn create_craft(
             };
             entry.server_state.0.craft_jobs.push(job.clone());
 
-            let craft_wire =
-                serde_json::to_value(CraftJobWire::from_job(&job, user_id, character_id))
-                    .unwrap_or(Value::Null);
+            let craft_wire = serde_json::to_value(CraftJobWire::from_job(
+                &job,
+                user_id,
+                character_id,
+                &globals.static_data,
+            ))
+            .unwrap_or(Value::Null);
             let inventory = entry.inventory.0.generate_client_update(&tracker);
             let wallet = entry.wallet.0.clone();
             write_back(&mut conn, entry).await?;
@@ -340,6 +361,7 @@ pub async fn finish_craft(
     let session = session.get_session_or_error()?;
     let user_id = session.session.user_id;
     let (character_id, craft_id) = path.into_inner();
+    let globals = app_state.get_ref().clone();
     let mut conn = app_state.db_pool.get().await.unwrap();
 
     conn.transaction(move |mut conn| {
@@ -356,8 +378,12 @@ pub async fn finish_craft(
                 .ok_or_else(|| BladeApiError::new(StatusCode::NOT_FOUND, 20000, 5))?;
             let job = entry.server_state.0.craft_jobs.remove(job_pos);
 
-            // Build a RewardGrant from the job's results, re-minting item ids.
-            let reward = reward_from_results(&job.results);
+            // Build a RewardGrant from the job's results, re-minting item ids. Repair
+            // first, for the same reason `GET /crafts` does: a pre-fix job stored
+            // `results: {}`, so collecting it granted nothing and left the player with a
+            // permanently uncollectable craft.
+            let (_, repaired_results) = repaired_craft_fields(&job, &globals.static_data);
+            let reward = reward_from_results(&repaired_results);
 
             let mut tracker = InventoryChangeTracker::default();
             apply_reward(
@@ -389,6 +415,77 @@ pub async fn finish_craft(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Repair a STORED craft job on the way out to the client.
+///
+/// The create path has been hardened three times (temper e5659c9/985cc31, alchemy
+/// b874c26, forge 462c279) so it no longer emits a bad record — but nothing ever
+/// repaired the jobs already sitting in `server_state.craft_jobs`. `GET /crafts`
+/// echoed them verbatim, so a row written by a pre-fix build is re-served forever:
+///
+///   * `craftingTypeId == recipeId` — an *item* uuid in the CraftingStation slot.
+///     `GetCraftingStation(<item uuid>)` returns null, the town-build coroutine
+///     never completes, and the player is stuck on the loading screen with no
+///     client-side way out (report #34).
+///   * `results: {}` on a job whose `completedAt` is in the past — the client shows
+///     a collectable craft with nothing to collect, and `finish` grants nothing.
+///
+/// Both are repaired here with the SAME resolution order the create path uses, and
+/// only from mappings that already exist in the extracted game data — a known
+/// recipe's own `craftingTypeId`, else the Smithing type for a resolvable forge
+/// craftable, else [`derive_plain_craft_type`]. No mapping is invented: for a recipe
+/// in neither table there is no recipe→station data on the Rust side at all, and the
+/// alchemy fallback (a real, client-mappable CraftingStation) is what unblocks the
+/// load. Closing that gap properly is a data-extraction task, not a code one.
+///
+/// A well-formed job is returned borrowed and untouched.
+fn repaired_craft_fields<'a>(
+    job: &'a CraftJob,
+    static_data: &blades_lib::static_data::StaticData,
+) -> (Uuid, Cow<'a, Value>) {
+    // An item uuid (or nil) in the CraftingStation slot — never a legitimate value:
+    // a CraftingType and a Recipe are different game-data objects and never share an id.
+    let crafting_type_is_unmappable =
+        job.crafting_type_id == job.recipe_id || job.crafting_type_id.is_nil();
+    let results_are_empty = match &job.results {
+        Value::Object(map) => map.is_empty(),
+        Value::Null => true,
+        _ => false,
+    };
+    if !crafting_type_is_unmappable && !results_are_empty {
+        return (job.crafting_type_id, Cow::Borrowed(&job.results));
+    }
+
+    let known_recipe = static_data.recipes.get(&job.recipe_id);
+    let smith_craftable = static_data.smith_craftables.resolve(&job.recipe_id);
+
+    let crafting_type_id = if !crafting_type_is_unmappable {
+        job.crafting_type_id
+    } else if let Some(recipe) = known_recipe {
+        recipe.crafting_type_id
+    } else if smith_craftable.is_some() {
+        smithing_crafting_type(static_data)
+    } else {
+        derive_plain_craft_type(job.building_id, static_data)
+    };
+
+    let results = if !results_are_empty {
+        Cow::Borrowed(&job.results)
+    } else if let Some(recipe) = known_recipe {
+        // Fresh instanced ids, exactly as a newly-created job would get.
+        Cow::Owned(remint_result_item_ids(recipe.results.clone()))
+    } else if let Some(craftable) = smith_craftable {
+        // Tempering level is not stored on the job, so a repaired forge result mints at
+        // the base level; the item itself is real and finish-able.
+        Cow::Owned(mint_smith_craftable(craftable, 0))
+    } else {
+        // Same approximation the unknown-recipe create path makes: one stackable of the
+        // recipe's own id — well-formed and grantable, so the completion flow can finish.
+        Cow::Owned(serde_json::json!({ "stackableItems": { job.recipe_id.to_string(): 1 } }))
+    };
+
+    (crafting_type_id, results)
+}
 
 /// The universal ALCHEMY crafting type id (capture-confirmed: the craftingTypeId shared
 /// by the captured alchemy recipes in recipes.json). Used as the derived type for an
@@ -874,5 +971,221 @@ mod tests {
         let reward = reward_from_results(&results);
         assert!(!reward.stackable_items.is_empty(), "unknown-recipe result yields a real grant");
         assert_eq!(reward.stackable_items.get(&recipe_id), Some(&1));
+    }
+
+    // ── Report #34: stored craft jobs must be REPAIRED on the way out ─────────
+    //
+    // The create path (tests above) has been hardened three times; the READ path
+    // never was. `GET /crafts` echoes `server_state.craft_jobs` verbatim, so a job
+    // written by an older build — `craftingTypeId == recipeId`, `results: {}` — is
+    // re-served forever. `GetCraftingStation(<item uuid>)` returns null, the
+    // town-build coroutine never completes, and the player loads forever with no
+    // way out from the client side. These tests pin the invariant at the
+    // serialization seam, the one place that covers BOTH freshly-created jobs and
+    // already-poisoned stored ones.
+
+    /// The exact rows on the affected character (`f0405dbc-…-e2434ae5b607`, report
+    /// #34): `craftingTypeId` is an *item* uuid, not a CraftingType, and `results`
+    /// is empty even though `completedAt` is in the past.
+    fn poisoned_alchemy_job() -> CraftJob {
+        CraftJob {
+            id: Uuid::parse_str("de08437c-dbd6-425f-b013-160cdf94b55d").unwrap(),
+            recipe_id: Uuid::parse_str("b5a2dbe9-d115-4bf2-99d9-558be1de3ef7").unwrap(),
+            building_id: Uuid::parse_str("b782d584-01b7-4c2f-a019-81f56cf44993").unwrap(),
+            crafting_type_id: Uuid::parse_str("b5a2dbe9-d115-4bf2-99d9-558be1de3ef7").unwrap(),
+            completed_at_ms: 1_783_175_604_008,
+            results: serde_json::json!({}),
+        }
+    }
+
+    fn poisoned_smith_job() -> CraftJob {
+        CraftJob {
+            id: Uuid::parse_str("5e455253-dfa5-48f4-9c5a-4b699a40177f").unwrap(),
+            recipe_id: Uuid::parse_str("fd13cfa0-0148-41c0-be70-b3d08852f673").unwrap(),
+            building_id: Uuid::parse_str("cd83f12e-3a0d-4795-82ff-35c107ae07b3").unwrap(),
+            crafting_type_id: Uuid::parse_str("fd13cfa0-0148-41c0-be70-b3d08852f673").unwrap(),
+            completed_at_ms: 1_783_197_110_167,
+            results: serde_json::json!({}),
+        }
+    }
+
+    /// The third row on the same character — written AFTER the create-path fix. It is
+    /// already well-formed and must survive the repair untouched.
+    fn healthy_alchemy_job() -> CraftJob {
+        CraftJob {
+            id: Uuid::parse_str("4f732c4d-5601-4fbd-ba0e-a23c60bf43b5").unwrap(),
+            recipe_id: Uuid::parse_str("b5a2dbe9-d115-4bf2-99d9-558be1de3ef7").unwrap(),
+            building_id: Uuid::parse_str("b782d584-01b7-4c2f-a019-81f56cf44993").unwrap(),
+            crafting_type_id: Uuid::parse_str(ALCHEMY_CRAFTING_TYPE_ID).unwrap(),
+            completed_at_ms: 1_783_204_348_637,
+            results: serde_json::json!({
+                "stackableItems": { "b5a2dbe9-d115-4bf2-99d9-558be1de3ef7": 1 }
+            }),
+        }
+    }
+
+    /// A temper job as the (already fixed) create path writes it: universal temper
+    /// CraftingType + the mutated item. Extends the temper regression coverage to the
+    /// read path — the temper fix passing while alchemy/smith stayed broken is exactly
+    /// what let report #34 through.
+    fn healthy_temper_job() -> CraftJob {
+        CraftJob {
+            id: Uuid::from_u128(0x7E_9E_00),
+            recipe_id: Uuid::from_u128(0xDEAD_BEEF),
+            building_id: Uuid::from_u128(0xB1),
+            crafting_type_id: item_mod_crafting_type(10),
+            completed_at_ms: 1_783_204_348_637,
+            results: serde_json::json!({"items":[{
+                "id": "fad31819-b941-4446-a229-e22b3647b142",
+                "itemTemplateId": "616b64ef-4184-4efb-af55-1a3f122431dc",
+                "temperingLevel": 10, "durability": 675.0
+            }]}),
+        }
+    }
+
+    /// StaticData shaped like the deployed set: alchemy present in `recipes`, a
+    /// smithing crafting type loaded. NEITHER report-#34 recipe id is in it (verified
+    /// against the committed `recipes.json` / `smith_craftables.json`), so the repair
+    /// must work from what it *does* have and never echo the recipe id.
+    fn static_data_like_prod() -> blades_lib::static_data::StaticData {
+        use blades_lib::static_data::{Recipe, SmithCraftables, StaticData};
+        let mut sd = StaticData::default();
+        sd.recipes.insert(
+            Uuid::from_u128(0xA1),
+            Recipe {
+                crafting_type_id: Uuid::parse_str(ALCHEMY_CRAFTING_TYPE_ID).unwrap(),
+                results: serde_json::json!({}),
+                duration_ms: 0,
+            },
+        );
+        sd.smith_craftables = SmithCraftables {
+            smithing_crafting_type_id: Some(Uuid::parse_str(SMITHING_CRAFTING_TYPE_ID).unwrap()),
+            forge_building_type_id: None,
+            by_recipe: Default::default(),
+            by_template: Default::default(),
+        };
+        sd
+    }
+
+    fn wire_of(job: &CraftJob, sd: &blades_lib::static_data::StaticData) -> Value {
+        serde_json::to_value(CraftJobWire::from_job(
+            job,
+            Uuid::from_u128(0x11D),
+            Uuid::from_u128(0xC1D),
+            sd,
+        ))
+        .unwrap()
+    }
+
+    /// The Alchemy leg: a stored job whose `craftingTypeId` is an ITEM uuid must be
+    /// repaired to a real CraftingType before it reaches the client.
+    #[test]
+    fn legacy_alchemy_job_is_repaired_on_read() {
+        let sd = static_data_like_prod();
+        let wire = wire_of(&poisoned_alchemy_job(), &sd);
+        assert_ne!(
+            wire["craftingTypeId"], wire["recipeId"],
+            "craftingTypeId must never be the recipeId — GetCraftingStation() returns null \
+             and the town-build coroutine never completes (report #34)"
+        );
+        assert_eq!(
+            wire["craftingTypeId"].as_str().unwrap(),
+            ALCHEMY_CRAFTING_TYPE_ID,
+            "an unknown plain-craft recipe repairs to the Alchemy station"
+        );
+    }
+
+    /// The Blacksmith leg: same defect, different building. Repaired the same way.
+    #[test]
+    fn legacy_smith_job_is_repaired_on_read() {
+        use blades_lib::static_data::SmithCraftable;
+        let mut sd = static_data_like_prod();
+        // Make this recipe resolvable as a forge craftable, as a fuller data set would.
+        let recipe = Uuid::parse_str("fd13cfa0-0148-41c0-be70-b3d08852f673").unwrap();
+        sd.smith_craftables.by_recipe.insert(
+            recipe,
+            SmithCraftable {
+                item_template_id: Uuid::from_u128(0xDBA7E),
+                grade_index: 0,
+                recipe_id: Some(recipe),
+                duration_ms: 0,
+                name: Some("Dragonbone War Axe".into()),
+            },
+        );
+        let wire = wire_of(&poisoned_smith_job(), &sd);
+        assert_ne!(wire["craftingTypeId"], wire["recipeId"], "must never echo the recipe id");
+        assert_eq!(
+            wire["craftingTypeId"].as_str().unwrap(),
+            SMITHING_CRAFTING_TYPE_ID,
+            "a forge craftable repairs to the Smithing station"
+        );
+    }
+
+    /// A completed craft must never serialize `results: {}` — the client shows a
+    /// collectable craft with nothing to collect and `finish` grants nothing.
+    #[test]
+    fn a_completed_craft_never_serializes_empty_results() {
+        let sd = static_data_like_prod();
+        for job in [poisoned_alchemy_job(), poisoned_smith_job()] {
+            let wire = wire_of(&job, &sd);
+            let results = &wire["results"];
+            assert!(
+                results.is_object() && !results.as_object().unwrap().is_empty(),
+                "completed craft {} serialized empty results",
+                job.id
+            );
+            // …and the repaired result must actually be grantable by `finish`.
+            let reward = reward_from_results(results);
+            assert!(
+                !reward.items.is_empty() || !reward.stackable_items.is_empty(),
+                "repaired results must yield a real grant on finish"
+            );
+        }
+    }
+
+    /// The blanket invariant over EVERY emitted craft record — poisoned and healthy,
+    /// alchemy, smith and temper alike. This is the assertion whose absence let the
+    /// temper-only fix ship while the other two paths stayed broken.
+    #[test]
+    fn every_emitted_craft_record_carries_a_station_and_a_grantable_result() {
+        let sd = static_data_like_prod();
+        let jobs = [
+            ("legacy alchemy", poisoned_alchemy_job()),
+            ("legacy smith", poisoned_smith_job()),
+            ("healthy alchemy", healthy_alchemy_job()),
+            ("healthy temper", healthy_temper_job()),
+        ];
+        for (label, job) in jobs {
+            let wire = wire_of(&job, &sd);
+            assert_ne!(
+                wire["craftingTypeId"], wire["recipeId"],
+                "{label}: craftingTypeId == recipeId"
+            );
+            assert_ne!(
+                wire["craftingTypeId"].as_str().unwrap(),
+                Uuid::nil().to_string(),
+                "{label}: craftingTypeId is nil"
+            );
+            let results = &wire["results"];
+            assert!(
+                results.is_object() && !results.as_object().unwrap().is_empty(),
+                "{label}: empty results"
+            );
+        }
+    }
+
+    /// Repair is surgical: an already-well-formed job passes through unchanged.
+    #[test]
+    fn a_well_formed_job_is_not_rewritten() {
+        let sd = static_data_like_prod();
+        for job in [healthy_alchemy_job(), healthy_temper_job()] {
+            let wire = wire_of(&job, &sd);
+            assert_eq!(
+                wire["craftingTypeId"].as_str().unwrap(),
+                job.crafting_type_id.to_string(),
+                "healthy craftingTypeId must be preserved"
+            );
+            assert_eq!(wire["results"], job.results, "healthy results must be preserved");
+        }
     }
 }
