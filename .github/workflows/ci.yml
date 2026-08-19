@@ -22,6 +22,34 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # deploy/*.sh is not covered by `cargo test`, and it is the half of this repo
+  # that talks to production. A broken deploy script does not fail here, it
+  # fails at the moment someone is trying to ship. Seconds to run, so there is
+  # no reason for it to stay a manual step nobody remembers.
+  shell:
+    name: deploy scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: shell syntax
+        run: |
+          set -euo pipefail
+          fail=0
+          for f in deploy/*.sh; do
+            [ -e "$f" ] || continue
+            bash -n "$f" || { echo "::error file=$f::bash -n failed"; fail=1; }
+          done
+          exit $fail
+
+      # rsync and ssh are mocked, so this reaches no host and needs no secrets.
+      # test-migrate-ledger.sh is deliberately not run alongside it: that one
+      # reconstructs the migrate entrypoint out of the compose file and is about
+      # the database, not about whether a deploy script is safe to run.
+      - name: arena.sh static
+        run: deploy/test-arena-static.sh
+
   test:
     name: cargo test --workspace
     runs-on: ubuntu-latest
