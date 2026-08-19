@@ -442,6 +442,105 @@ pub fn combat_screen_info(net_object_id: i32, net_object_type: NetObjectType, ro
 /// captures; see `docs/arena-protocol-spec.md` §6.2 and `docs/arena-journey-log.md` §6.
 pub const MSGTYPE_SPAWN: u8 = 0x32; // 50
 
+/// `ControlPropIds` (`dump.cs:588076`) — the replicated properties of the **Control**
+/// net object (type 57), the object `PvpControl.Initialize(INetObjectProxy)`
+/// (`dump.cs:585831`) binds to and through which the client both receives op79
+/// `MatchStateChangeRequest` and sends its c2s `PlayerInfo`.
+///
+/// Note what is **absent**: `BaseStaggerDuration`, `BlockOptimalTime`,
+/// `OptimalBlockResetTime`, `InitialHealthMultiplier`, `PhysicalBlockMultiplier`,
+/// `ElementalBlockMultiplier` and `StaminaReductionPerSwing` are settable properties
+/// of `PvpClientManager` (`dump.cs:584713-720`) but have **no propId at all** — they
+/// are not replicated. Retail's only wire path to them is the debug
+/// `SetServerCheat` GameMessage (id 30, `dump.cs:588579`), whose string cheat ids
+/// include `"base_stagger_duration"` / `"block_optimal_time"` /
+/// `"optimal_block_reset_time"` — and gmid 30 occurs **zero** times in the whole
+/// 1.37 M-frame decrypted capture corpus (`arena_udp_frames`, 2026-08-19 sweep), so
+/// retail never sends it in a real match. The client sources those values locally.
+pub mod control_prop {
+    /// `ControlPropIds.LagCompensation` — `dump.cs:588079`.
+    pub const LAG_COMPENSATION: u8 = 4;
+    /// `ControlPropIds.ServerHitTime` — `dump.cs:588080`.
+    pub const SERVER_HIT_TIME: u8 = 5;
+    /// `ControlPropIds.InstantShieldBlock` — `dump.cs:588081`.
+    pub const INSTANT_SHIELD_BLOCK: u8 = 6;
+    /// `ControlPropIds.CombatDebugInfo` — `dump.cs:588082`.
+    pub const COMBAT_DEBUG_INFO: u8 = 7;
+    /// `ControlPropIds.InputManager` — `dump.cs:588083`.
+    pub const INPUT_MANAGER: u8 = 8;
+    /// `ControlPropIds.StatePrediction` — `dump.cs:588084`.
+    pub const STATE_PREDICTION: u8 = 9;
+    /// `ControlPropIds.PauseInroundTime` — `dump.cs:588085`.
+    pub const PAUSE_INROUND_TIME: u8 = 10;
+    /// `ControlPropIds.PauseLoadoutTime` — `dump.cs:588086`.
+    pub const PAUSE_LOADOUT_TIME: u8 = 11;
+    /// `ControlPropIds.PauseOpponentShowcaseTime` — `dump.cs:588087`.
+    pub const PAUSE_OPPONENT_SHOWCASE_TIME: u8 = 12;
+}
+
+/// Every value below is the one retail actually put on the wire. All **38** Control
+/// spawns in the decrypted capture corpus (15 distinct sessions, 2026-05-31 →
+/// 2026-06-29) carry a **single, byte-identical** value tuple — there is no variation
+/// to model. [prod `arena_udp_frames`, sweep 2026-08-19.]
+///
+/// `LagCompensation = true`: the client's `PvpClientManager.HasLagCompensation`
+/// (`dump.cs:584710`) reads it.
+const CONTROL_LAG_COMPENSATION: bool = true;
+/// `ServerHitTime = 0.04 s` — 40 ms. Capture-only: `PvpDefaultSettings`
+/// (`dump.cs:427008`) has no entry for it, so this is the observed retail value, not
+/// a guess.
+const CONTROL_SERVER_HIT_TIME: f32 = 0.04;
+/// `InstantShieldBlock = true`. Agrees with `PvpDefaultSettings.INSTANT_SHIELD_BLOCK
+/// = True` (`dump.cs:427017`) — two independent sources, same value. With the Control
+/// object never spawned (the fork's behaviour before this change) the client falls
+/// back to its own default and can apply a shield-raise delay the server does not
+/// model.
+const CONTROL_INSTANT_SHIELD_BLOCK: bool = true;
+/// `CombatDebugInfo = false` — the on-screen combat debug overlay stays off.
+const CONTROL_COMBAT_DEBUG_INFO: bool = false;
+/// `InputManager = true`.
+const CONTROL_INPUT_MANAGER: bool = true;
+/// `StatePrediction = true` — client-side prediction of its own actor state.
+const CONTROL_STATE_PREDICTION: bool = true;
+/// `Pause{Inround,Loadout,OpponentShowcase}Time = false` — the three debug
+/// timer-freeze toggles; retail ships them all off.
+const CONTROL_PAUSE_TIME: bool = false;
+
+/// op50 SPAWN (carrier `0x32`) of the type-57 **Control** net object — the PvP
+/// settings block retail replicates to the client at the very start of a match.
+///
+/// **This is the FIRST net object retail spawns**, ~1 s ahead of the two Player
+/// spawns and well ahead of the Avatars (capture: s293 obj 0 type 57 @19:01:00 → obj
+/// 2 Player → obj 3 Match → obj 5/6 Avatar; s390 obj 477 type 57 → 478/479 Player →
+/// 481/482 Avatar; s127 obj 560 type 57 → 561/563 Player). Role is **3 Autonomous**
+/// on the spawn (the receiving client owns it).
+///
+/// `net_object_id` is the same id the op79/op80 flow messages address — capture-
+/// proven: s127 spawns type 57 obj **560** and every subsequent op79
+/// `MatchStateChangeRequest` / c2s op80 ack on that match carries obj **560**. So the
+/// fork's `MatchCombat::flow_controller_id` is exactly this object, and the spawn
+/// simply registers it before it is used.
+///
+/// NetData (byte-for-byte vs s127 #954698 and s616 #4413504):
+/// `{0:Int id · 1:Byte 57 · 2:Byte 3 · 4:Bool · 5:Float · 6:Bool · 7:Bool · 8:Bool ·
+/// 9:Bool · 10:Bool · 11:Bool · 12:Bool}` — note **propId 3 is absent**.
+pub fn spawn_control(net_object_id: i32) -> Vec<u8> {
+    let mut w = NetDataWriter::new();
+    w.int(0, net_object_id)
+        .byte(1, NetObjectType::Control as u8)
+        .byte(2, NetRole::Autonomous as u8)
+        .bool(control_prop::LAG_COMPENSATION, CONTROL_LAG_COMPENSATION)
+        .float(control_prop::SERVER_HIT_TIME, CONTROL_SERVER_HIT_TIME)
+        .bool(control_prop::INSTANT_SHIELD_BLOCK, CONTROL_INSTANT_SHIELD_BLOCK)
+        .bool(control_prop::COMBAT_DEBUG_INFO, CONTROL_COMBAT_DEBUG_INFO)
+        .bool(control_prop::INPUT_MANAGER, CONTROL_INPUT_MANAGER)
+        .bool(control_prop::STATE_PREDICTION, CONTROL_STATE_PREDICTION)
+        .bool(control_prop::PAUSE_INROUND_TIME, CONTROL_PAUSE_TIME)
+        .bool(control_prop::PAUSE_LOADOUT_TIME, CONTROL_PAUSE_TIME)
+        .bool(control_prop::PAUSE_OPPONENT_SHOWCASE_TIME, CONTROL_PAUSE_TIME);
+    frame(MSGTYPE_SPAWN, w.finish())
+}
+
 /// Spawn a **Player** net-object (the per-player object the client renders + names).
 /// `role`: [`NetRole::Autonomous`] (3) for the viewer's OWN player, [`NetRole::Simulated`]
 /// (2) for the opponent. `rank_a`/`rank_b` are the two trailing ints (arena rank/index —
@@ -1228,6 +1327,134 @@ mod tests {
         ];
         want.extend_from_slice(b"BackendMatchCreated");
         assert_eq!(got, want);
+    }
+
+    /// Byte-for-byte vs the real retail **Control** net-object SPAWN — prod
+    /// `arena_udp_frames` #954698 (session 127, s2c, 39 B plaintext, obj 560). Strip
+    /// the 10-byte ENet header and the frame is exactly these 29 bytes.
+    ///
+    /// All **38** Control spawns in the corpus share one value tuple; #4413504
+    /// (session 616, obj 725, 27 days later) is asserted below to be the same frame
+    /// with only the id changed.
+    #[test]
+    fn spawn_control_matches_s127_capture() {
+        let got = spawn_control(560);
+        let want = [
+            0xBE, 0x32, // marker + SPAWN carrier (50)
+            0x0C, // maxPropId = 12
+            0xF7, 0x1F, // bitmap {0,1,2,4,5,6,7,8,9,10,11,12} — propId 3 ABSENT
+            // type nibbles: [Int,Byte,Byte,Bool,Float,Bool,Bool,Bool,Bool,Bool,Bool,Bool]
+            0x70, 0x67, 0x65, 0x66, 0x66, 0x66, //
+            0x30, 0x02, 0x00, 0x00, // prop0  Int   = 560 (the Control / flow-controller id)
+            0x39, // prop1  Byte  = 57 (NetObjectType::Control)
+            0x03, // prop2  Byte  = 3  (NetRole::Autonomous)
+            0x01, // prop4  Bool  = true  LagCompensation
+            0x0A, 0xD7, 0x23, 0x3D, // prop5  Float = 0.04  ServerHitTime
+            0x01, // prop6  Bool  = true  InstantShieldBlock
+            0x00, // prop7  Bool  = false CombatDebugInfo
+            0x01, // prop8  Bool  = true  InputManager
+            0x01, // prop9  Bool  = true  StatePrediction
+            0x00, // prop10 Bool  = false PauseInroundTime
+            0x00, // prop11 Bool  = false PauseLoadoutTime
+            0x00, // prop12 Bool  = false PauseOpponentShowcaseTime
+        ];
+        assert_eq!(got, want);
+    }
+
+    /// The same builder must reproduce a *different* captured session verbatim —
+    /// #4413504 (session 616, obj 725 = 0x2D5). Only the propId0 id differs from
+    /// s127, which is the whole claim: retail's Control settings are constant.
+    #[test]
+    fn spawn_control_matches_s616_capture() {
+        let got = spawn_control(725);
+        let want: Vec<u8> = hex_bytes(
+            "BE320CF71F706765666666D50200003903010AD7233D01000101000000",
+        );
+        assert_eq!(got, want);
+    }
+
+    /// Decode the built frame back through `parse_netdata` and assert each value
+    /// against the *source of truth* rather than the byte pattern: the propIds are
+    /// `ControlPropIds` (`dump.cs:588076-88`), `InstantShieldBlock` matches
+    /// `PvpDefaultSettings.INSTANT_SHIELD_BLOCK = True` (`dump.cs:427017`).
+    #[test]
+    fn spawn_control_props_match_dump_cs() {
+        let f = spawn_control(560);
+        assert_eq!(f[1], MSGTYPE_SPAWN, "carrier must be op50 SPAWN 0x32");
+        let nd = arena_proto::parse_netdata(&f[2..]);
+        assert!(nd.ok && nd.consumed == f.len() - 2, "frame parses and consumes exactly");
+        assert_eq!(nd.int(1), Some(57), "prop1 = NetObjectType::Control");
+        assert_eq!(nd.int(2), Some(3), "prop2 = NetRole::Autonomous");
+        assert_eq!(nd.int(0), Some(560), "prop0 = the Control net-object id");
+        assert!(
+            nd.get(3).is_none(),
+            "propId 3 is not a ControlPropId and must stay absent"
+        );
+
+        use control_prop as p;
+        for (prop, want) in [
+            (p::LAG_COMPENSATION, true),
+            (p::INSTANT_SHIELD_BLOCK, true), // PvpDefaultSettings.INSTANT_SHIELD_BLOCK
+            (p::COMBAT_DEBUG_INFO, false),
+            (p::INPUT_MANAGER, true),
+            (p::STATE_PREDICTION, true),
+            (p::PAUSE_INROUND_TIME, false),
+            (p::PAUSE_LOADOUT_TIME, false),
+            (p::PAUSE_OPPONENT_SHOWCASE_TIME, false),
+        ] {
+            assert_eq!(
+                nd.int(prop),
+                Some(i64::from(want)),
+                "Control propId {prop} (bool) must be {want}"
+            );
+        }
+        // ServerHitTime is the only non-bool setting: 0.04 s, capture-sourced.
+        assert_eq!(
+            nd.get(p::SERVER_HIT_TIME),
+            Some(&arena_proto::NetDataValue::Float(0.04)),
+            "Control propId {} = ServerHitTime 0.04 s",
+            p::SERVER_HIT_TIME
+        );
+    }
+
+    /// `BaseStaggerDuration` has **no** Control propId and is not replicated by any
+    /// other net object either. This test pins that negative result so a future agent
+    /// does not "helpfully" invent an id: writing a wrong propId would overwrite a
+    /// live client setting. The only wire path retail defines is `SetServerCheat`
+    /// (GameMessageId 30) with cheatId `"base_stagger_duration"`, which occurs zero
+    /// times in the capture corpus.
+    #[test]
+    fn base_stagger_duration_is_not_a_control_prop() {
+        use control_prop as p;
+        let ids = [
+            p::LAG_COMPENSATION,
+            p::SERVER_HIT_TIME,
+            p::INSTANT_SHIELD_BLOCK,
+            p::COMBAT_DEBUG_INFO,
+            p::INPUT_MANAGER,
+            p::STATE_PREDICTION,
+            p::PAUSE_INROUND_TIME,
+            p::PAUSE_LOADOUT_TIME,
+            p::PAUSE_OPPONENT_SHOWCASE_TIME,
+        ];
+        assert_eq!(ids, [4, 5, 6, 7, 8, 9, 10, 11, 12], "ControlPropIds dump.cs:588076");
+        let f = spawn_control(1);
+        let nd = arena_proto::parse_netdata(&f[2..]);
+        // 2.5 s never appears as a value: the server keeps BASE_STAGGER_DURATION_SECS
+        // authoritative and tells the client nothing about it, exactly like retail.
+        for prop in 0..=12u8 {
+            if let Some(arena_proto::NetDataValue::Float(v)) = nd.get(prop) {
+                assert_ne!(
+                    *v, super::super::state::BASE_STAGGER_DURATION_SECS,
+                    "no Control prop may carry BASE_STAGGER_DURATION (propId {prop})"
+                );
+            }
+        }
+        assert_eq!(
+            super::super::state::BASE_STAGGER_DURATION_SECS,
+            2.5,
+            "server-side stagger stays 2.5 s (PvpDefaultSettings.BASE_STAGGER_DURATION)"
+        );
     }
 
     /// Byte-for-byte vs s486 round-start op58 (after `BE 3A`): two Longs
