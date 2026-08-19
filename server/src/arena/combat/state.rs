@@ -733,6 +733,15 @@ pub struct Fighter {
     pub state_entered: Instant,
     /// Slot of the implicit arena target (the opponent) for `RequestExecuteAbility`.
     pub arena_target: usize,
+    /// The facing the guard animation was raised on — retail's
+    /// `PlayerBlockingState.Parameters.ActiveSide` (`dump.cs:597100-597103`), which is
+    /// `Middle` in 578 of 578 recorded blocking-state frames.
+    ///
+    /// **Presentational only. It is NOT a hit-test** (tracker #31): high vs low
+    /// blocking is a timing phase ([`Fighter::block_phase`]), never a direction, so
+    /// `damage::block_outcome` does not compare it against the attacker's side. The
+    /// field is kept because it mirrors a real wire property and is still set on both
+    /// block-raise paths; nothing in the damage pipeline reads it.
     pub blocking_side: ActiveSide,
     /// While set and in the future, this fighter is BLOCKING (guard up) until the
     /// instant — incoming hits are reduced/negated per `damage::block_outcome`. Set

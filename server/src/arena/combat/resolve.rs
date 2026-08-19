@@ -942,11 +942,87 @@ fn land_due_hits(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8>)
             now,
         );
         // A connected OPTIMAL block on the target RESETS the attacker's combo (§4.2: a
-        // block breaks the chain — the next swing starts fresh at ×1.0).
-        if resolved.flags & super::damage::flags::WAS_OPTIMAL_BLOCKING != 0 {
+        // block breaks the chain — the next swing starts fresh at ×1.0) **and STUNS the
+        // attacker** (tracker #31).
+        let blocked_high = resolved.flags & super::damage::flags::WAS_OPTIMAL_BLOCKING != 0;
+        if blocked_high {
             combat.fighters[h.sender].reset_combo();
         }
         out.extend(emit_damage(combat, h.sender, h.target, &resolved, now));
+        // AFTER the damage frame: retail fires `_causedStagger` from inside
+        // `CombatManager.ApplyDamage` (`dump.cs:546170`), so the stun follows the hit
+        // it came from.
+        if blocked_high {
+            out.extend(stun_the_blocked_attacker(combat, h.sender, h.target, now));
+        }
+    }
+    out
+}
+
+/// **The high-block stun** (tracker #31): a WEAPON attack that connects with an
+/// OPTIMAL ("high") block stuns the ATTACKER.
+///
+/// Retail, from the shipped client text:
+/// * `UI.Help.Blocking.Description` — *"At first, for a short time, you will block
+///   high, then lower your shield to block low. **When a weapon attack is blocked high,
+///   the attacker gets stunned.** … Weapons can also block high and stun your enemy …
+///   Broken shields and weapons … cannot stun the attacker."*
+/// * `UI.Help.Arena.Description` — *"High blocks can be held longer, refresh faster,
+///   and **stun opponents for longer**."*
+/// * `Challenge.StunEnemy.HighBlock` — *"Stun {0} Enemies with High Blocks"*, a shipped
+///   challenge type.
+/// * `Enchantment.Effect.PowerfulBlock` — *"Target stunned by a blocked attack takes
+///   {0} extra damage while stunned."*
+///
+/// Client corroboration: `PowerfulBlockBonusInstance.CausedStagger(DamageSource, Actor
+/// attacker, Actor owner)` (`dump.cs:621783`), registered into
+/// `ActorBonusHandler._causedStagger` (`:618680`) and fired from
+/// `CombatManager.ApplyDamage` (`:546170`) — the only stagger callback whose signature
+/// carries BOTH the attacker and the block's owner.
+///
+/// **WEAPON ATTACKS ONLY.** `UI.Help.Skills.Description`: *"You do not get stunned when
+/// your ability attack is blocked high."* That exclusion is structural here — this is
+/// called only from [`land_due_hits`], which lands auto-attack swings. The maneuver /
+/// spell lane in `resolve_ability_cast` never calls it, so a blocked Shield Bash or
+/// Fireball leaves its caster free, exactly as the help text says.
+///
+/// **Duration is shipped data, not authored:**
+/// `PvpDefaultSettings.BASE_STAGGER_DURATION = 2.5` (`dump.cs:427016`), already exposed
+/// as [`state::BASE_STAGGER_DURATION_SECS`]. That is also the "for longer" in the arena
+/// help text: `CombatParameters.baseStaggerDuration` (the PvE value) is 1.5 s. No
+/// separate "blocked-attacker stun" constant exists anywhere in `PvpDefaultSettings`,
+/// `CombatParameters` or `PlayerCombatParameters`, so the generic PvP stagger duration
+/// is the shipped value that applies.
+///
+/// NOT MODELLED: retail's `PlayerBlockingState._consumedOptimalBlock`
+/// (`dump.cs:597064`) makes one guard-raise yield one high block. It is unnecessary
+/// here — the 2.5 s stun already outlasts the defender's 2.0 s
+/// `BLOCK_OPTIMAL_TIME` window, so a second stun inside the same window is
+/// unreachable. Also not modelled: broken shields/weapons cannot stun — nothing in this
+/// engine breaks, so there is no broken state to check.
+fn stun_the_blocked_attacker(
+    combat: &mut MatchCombat,
+    attacker_slot: usize,
+    blocker_slot: usize,
+    now: Instant,
+) -> Vec<(usize, Vec<u8>)> {
+    use super::state::{BASE_STAGGER_DURATION_SECS, StatusEffectType};
+    let mut out = Vec::new();
+    let viewers = combat.fighters.len();
+    if attacker_slot >= viewers || combat.fighters[attacker_slot].is_dead() {
+        return out;
+    }
+    let secs = BASE_STAGGER_DURATION_SECS;
+    combat.fighters[attacker_slot].apply_stagger_for(now, secs);
+    let obj = combat.fighters[attacker_slot].net_object_id;
+    info!(
+        "combat: slot {attacker_slot} STUNNED {secs:.2}s — its weapon attack was \
+         blocked HIGH by slot {blocker_slot} (tracker #31)"
+    );
+    let frame =
+        messages::change_combat_status_effect(obj, true, StatusEffectType::Staggered, secs, 0);
+    for v in 0..viewers {
+        out.push((v, frame.clone()));
     }
     out
 }
@@ -1095,6 +1171,12 @@ fn resolve_ability_cast(
     // Zero for buffs and for a maneuver that missed, which is correct: a threshold
     // effect must not fire on a cast that did not land.
     let mut last_hit_total = 0.0f32;
+    // The `ReceiveDamage` block bits this cast produced on the TARGET
+    // (`WAS_LATE_BLOCKING` / `WAS_OPTIMAL_BLOCKING`). Guardbreaker and Staggering Bash
+    // ship the SAME `_damageToCauseStagger` but opposite block conditions, so the gate
+    // in `apply_shipped_effects` needs to know whether the target blocked. 0 for arms
+    // that deal no damage — a cast that never touched the target was not blocked.
+    let mut block_flags = 0u8;
     match tag {
         AbilityTag::Ward => out.extend(apply_ward(combat, sender, level, now)),
         AbilityTag::Absorb => out.extend(apply_absorb(combat, sender, level, now)),
@@ -1156,6 +1238,7 @@ fn resolve_ability_cast(
                 ea.ability_uuid, resolved.total,
             );
             last_hit_total = resolved.total;
+            block_flags = resolved.flags;
             out.extend(emit_damage(combat, sender, target_slot, &resolved, now));
         }
         AbilityTag::Paralyze | AbilityTag::Damage | AbilityTag::Generic => {
@@ -1167,6 +1250,7 @@ fn resolve_ability_cast(
                 now,
             );
             last_hit_total = resolved.total;
+            block_flags = resolved.flags;
             out.extend(emit_damage(combat, sender, target_slot, &resolved, now));
             // A landed Paralyze also carries its own paralyse threshold + duration
             // (`_damageToCauseParalyze` / `_duration`), applied by
@@ -1185,7 +1269,8 @@ fn resolve_ability_cast(
     // rather than from the ability's name. Seven abilities used to spend a resource
     // and do nothing because these fields were read by no code.
     out.extend(apply_shipped_effects(
-        combat, sender, target_slot, &ea.ability_uuid, level, last_hit_total, now,
+        combat, sender, target_slot, &ea.ability_uuid, level, last_hit_total, block_flags,
+        now,
     ));
     out
 }
@@ -1226,6 +1311,9 @@ fn apply_shipped_effects(
     level: u8,
     // Health damage this cast just dealt — the gate for threshold effects like Blind.
     last_hit_total: f32,
+    // The `damage::flags` block bits this cast produced on the target. Guardbreaker
+    // stuns only when the target DID block; Staggering Bash only when it did NOT.
+    block_flags: u8,
     now: Instant,
 ) -> Vec<(usize, Vec<u8>)> {
     use super::state::{DamageNegationSource, NegationPool, StatusEffectType};
@@ -1289,6 +1377,45 @@ fn apply_shipped_effects(
             for v in 0..viewers {
                 out.push((v, frame.clone()));
             }
+        }
+    }
+
+    // `_blockDuration` → **the bash's own guard window** (tracker #31).
+    //
+    // Retail's `AbilityDoShieldBash : AbilityDoManeuver` (`dump.cs:604149-604161`) is
+    // literally a block followed by a slam: it holds `_blockDuration`, `_timer`,
+    // `_appliedBlock`, `_removedBlock` and a `_blockingEffect`, and every subclass ctor
+    // takes the duration first — `AbilityDoHarryingBash(maneuver, blockDuration,
+    // cooldownIncrease)` (`:603663`), `AbilityDoStaggeringBash(maneuver, blockDuration,
+    // damageToCauseStagger, stunDuration)` (`:604366`). The shipped text agrees:
+    // `Ability.Maneuver.ShieldBash.Description` — *"The fighter **first blocks with
+    // their shield**, then slams it into the enemy."*
+    //
+    // Five abilities ship the field, all at 0.50 s at every rank: ShieldBash,
+    // HarryingBash, StaggeringBash, ReflectingBash, ShieldOfMania. We read it for the
+    // `_damageReduction` window below but never raised an actual guard, so the block
+    // half of a bash did not exist — which is the other half of the report ("a
+    // well-timed harrying/staggering bash does not stun either"). With this window up,
+    // an opponent's weapon swing that lands inside it is blocked HIGH and
+    // `stun_the_blocked_attacker` fires. Harrying Bash needs exactly this: it carries
+    // no `_damageToCauseStagger` and no `_stunDuration` at any of its 14 ranks, so it
+    // was never meant to stun through the ability gate.
+    //
+    // A fresh raise (`block_raised_at = now`) so the window opens in the OPTIMAL phase,
+    // subject to the normal `OPTIMAL_BLOCK_RECOVERY_SECS` cooldown in `block_phase` —
+    // a bash cannot launder a guard that was just dropped.
+    if let Some(window) = r.block_duration() {
+        if window > 0.0 && caster < viewers && !combat.fighters[caster].is_dead() {
+            let f = &mut combat.fighters[caster];
+            f.set_actor_state(ActorStateType::Blocking, now);
+            // Shipped `parameters.activeSide: 1` on every bash rank == Middle, the same
+            // facing every recorded manual guard carries. Presentational only.
+            f.blocking_side = ActiveSide::Middle;
+            f.blocking_until = Some(now + Duration::from_secs_f32(window));
+            f.block_raised_at = Some(now);
+            info!(
+                "combat: slot {caster} bash guard UP for {window:.2}s ({ability_uuid})"
+            );
         }
     }
 
@@ -1373,9 +1500,41 @@ fn apply_shipped_effects(
     // implies a landed hit, but a buff arm (Ward / Absorb / ResistElements / Perk)
     // sets `last_hit_total = 0.0`, and a future rank shipping threshold 0.0 must
     // not be able to stagger from a self-buff that never touched the target.
+    //
+    // **PER-ABILITY BLOCK CONDITION (tracker #31).** The 2026-08-17 move above applied
+    // ONE uniform "damage ≥ threshold → stagger" rule to all three carriers. The
+    // shipped descriptions say the two maneuvers are OPPOSITES, and both ship
+    // `damageToCauseStagger: 1` at every rank, so the uniform rule was wrong for each
+    // of them in a different direction:
+    //
+    // * `Ability.Maneuver.Guardbreaker.Description` — *"This Power Attack deals {0}
+    //   extra damage … and stuns a target that **blocks** it."*
+    // * `Ability.Maneuver.StaggeringBash.Description` — *"This Shield Bash deals {0}
+    //   extra bashing damage and stuns a target that **does not block** it."*
+    // * `Ability.Spell.IceSpike.Description` — *"Enemies that suffer more than {1}
+    //   damage are stunned."* — a pure damage threshold, no block condition. Its
+    //   behaviour is unchanged.
+    //
+    // Keyed on `editor_name`, not on a data field, because retail encodes the
+    // condition in CODE and not in data: `AbilityDoGuardbreaker`
+    // (`dump.cs:603647`) and `AbilityDoStaggeringBash` (`:604357`) are distinct
+    // classes, each overriding `ApplyAdditionalEffects` with its own body, and their
+    // shipped rank rows are otherwise identical (`damageToCauseStagger` 1.0,
+    // `stunDuration` 1.30 → 2.50). There is no field that separates them.
+    let target_blocked = block_flags
+        & (super::damage::flags::WAS_LATE_BLOCKING | super::damage::flags::WAS_OPTIMAL_BLOCKING)
+        != 0;
+    let block_condition_met = match super::gamedata::ability(ability_uuid)
+        .map(|a| a.editor_name)
+    {
+        Some("Guardbreaker") => target_blocked,
+        Some("StaggeringBash") => !target_blocked,
+        _ => true,
+    };
     if let Some(threshold) = r.damage_to_cause_stagger() {
         if last_hit_total > 0.0
             && last_hit_total >= threshold
+            && block_condition_met
             && target_slot < viewers
             && !combat.fighters[target_slot].is_dead()
         {
@@ -2409,6 +2568,10 @@ pub fn on_tick(combat: &mut MatchCombat, now: Instant, debug_hold: bool) -> Vec<
     // blocking with no inbound input to reconcile it).
     for f in combat.fighters.iter_mut() {
         f.reconcile_block(now);
+        // Clear a lapsed stagger/stun back to Idle. A BOT has no input path, so
+        // without this a bot stunned by a high block (tracker #31) would sit in
+        // `Staggered` on both clients until something else moved it.
+        f.reconcile_stagger(now);
         // Advance any in-flight swing: AutoAttack → FollowThrough → Recovery → Idle.
         // The tick is the ONLY thing that moves it for a player who stops sending
         // input mid-swing, so this must run here as well as on the input path.
@@ -2451,6 +2614,17 @@ pub fn on_tick(combat: &mut MatchCombat, now: Instant, debug_hold: bool) -> Vec<
             continue;
         };
         if combat.fighters[target].is_dead() {
+            continue;
+        }
+        // A STUNNED bot cannot act (tracker #31). The human input path has enforced
+        // this since Phase 3.13 (`is_staggered` gate in `on_c2s_input`), but the bot
+        // loop never did — so a bot stunned by a high block would keep swinging and
+        // the whole mechanic would be invisible for exactly the case the report
+        // describes ("the AI swings into my high block"). Its queued wind-up is
+        // dropped too: `apply_stagger_for` already cleared the scheduled actor states,
+        // and letting `bot_swing_at` survive would land a swing out of a stun.
+        if combat.fighters[bot].is_staggered(now) {
+            combat.fighters[bot].bot_swing_at = None;
             continue;
         }
         // A bot swings in TWO steps, because retail's swing is two steps.
@@ -3883,7 +4057,7 @@ mod shipped_effects_tests {
         let now = Instant::now();
         let mut c = combat2(now);
         let u = uuid_of("DodgingStrike");
-        let out = apply_shipped_effects(&mut c, 0, 1, u, 1, 500.0, now);
+        let out = apply_shipped_effects(&mut c, 0, 1, u, 1, 500.0, 0, now);
         let pools = &c.fighters[0].negation_pools;
         assert_eq!(pools.len(), 1, "one dodge pool");
         assert_eq!(pools[0].source, DamageNegationSource::Dodge);
@@ -3899,7 +4073,7 @@ mod shipped_effects_tests {
         let now = Instant::now();
         for name in ["FirestormArmor", "BlizzardArmor", "TempestArmor"] {
             let mut c = combat2(now);
-            let out = apply_shipped_effects(&mut c, 0, 1, uuid_of(name), 1, 500.0, now);
+            let out = apply_shipped_effects(&mut c, 0, 1, uuid_of(name), 1, 500.0, 0, now);
             assert_eq!(c.fighters[0].negation_pools.len(), 1, "{name}: a shield pool");
             assert!(c.fighters[0].negation_pools[0].remaining >= 100.0, "{name}: shipped ~116");
             assert_eq!(out.len(), 2, "{name}: emits its now-known status id");
@@ -3911,7 +4085,7 @@ mod shipped_effects_tests {
     fn flashfreeze_locks_the_target_for_its_shipped_duration() {
         let now = Instant::now();
         let mut c = combat2(now);
-        let out = apply_shipped_effects(&mut c, 0, 1, uuid_of("FlashFreeze"), 1, 500.0, now);
+        let out = apply_shipped_effects(&mut c, 0, 1, uuid_of("FlashFreeze"), 1, 500.0, 0, now);
         assert!(c.fighters[1].is_paralyzed(), "the TARGET is locked");
         assert!(!c.fighters[0].is_paralyzed(), "the caster is not");
         assert!(c.fighters[1].paralyze_secs >= 2.0, "the rank's own duration, not the default");
@@ -3928,7 +4102,7 @@ mod shipped_effects_tests {
         let now = Instant::now();
         for name in ["ShieldOfMania", "ReflectingBash"] {
             let mut c = combat2(now);
-            apply_shipped_effects(&mut c, 0, 1, uuid_of(name), 1, 500.0, now);
+            apply_shipped_effects(&mut c, 0, 1, uuid_of(name), 1, 500.0, 0, now);
             let tr = &c.fighters[0].transient_resistances;
             assert!(!tr.is_empty(), "{name}: a reduction must land");
             assert!(tr.iter().all(|(_, amt, _)| *amt >= 50.0), "{name}: flat rating, not a fraction");
@@ -3947,7 +4121,7 @@ mod shipped_effects_tests {
         let u = uuid_of("Blind");
         // A big hit → blinded.
         let mut c = combat2(now);
-        let out = apply_shipped_effects(&mut c, 0, 1, u, 1, 9_999.0, now);
+        let out = apply_shipped_effects(&mut c, 0, 1, u, 1, 9_999.0, 0, now);
         let blind = out.iter().filter(|(_, f)| {
             let nd = arena_proto::parse_netdata(&f[2..]);
             nd.int(3) == Some(51) && nd.int(5) == Some(8)
@@ -3957,7 +4131,7 @@ mod shipped_effects_tests {
         // A hit of zero → no blind. A threshold effect must not fire on a cast that
         // did not land.
         let mut c2 = combat2(now);
-        let out2 = apply_shipped_effects(&mut c2, 0, 1, u, 1, 0.0, now);
+        let out2 = apply_shipped_effects(&mut c2, 0, 1, u, 1, 0.0, 0, now);
         assert!(
             !out2.iter().any(|(_, f)| {
                 let nd = arena_proto::parse_netdata(&f[2..]);
@@ -3974,7 +4148,7 @@ mod shipped_effects_tests {
         let now = Instant::now();
         for name in ["FirestormArmor", "BlizzardArmor", "TempestArmor"] {
             let mut c = combat2(now);
-            let out = apply_shipped_effects(&mut c, 0, 1, uuid_of(name), 1, 0.0, now);
+            let out = apply_shipped_effects(&mut c, 0, 1, uuid_of(name), 1, 0.0, 0, now);
             let n = out.iter().filter(|(_, f)| {
                 let nd = arena_proto::parse_netdata(&f[2..]);
                 nd.int(3) == Some(51) && nd.int(5) == Some(16)
@@ -3988,7 +4162,7 @@ mod shipped_effects_tests {
     fn a_plain_damage_spell_gains_nothing() {
         let now = Instant::now();
         let mut c = combat2(now);
-        let out = apply_shipped_effects(&mut c, 0, 1, uuid_of("Fireball"), 1, 500.0, now);
+        let out = apply_shipped_effects(&mut c, 0, 1, uuid_of("Fireball"), 1, 500.0, 0, now);
         assert!(c.fighters[0].negation_pools.is_empty());
         assert!(!c.fighters[1].is_paralyzed());
         assert!(out.is_empty());
@@ -4055,10 +4229,17 @@ mod shipped_effects_tests {
     ///
     /// This is what the reporter never saw: gmid 51 fired 4x and 21x across his two
     /// sessions and `Staggered` was never sent once in either direction.
+    ///
+    /// tracker #31: each maneuver is now driven at the block state its own shipped
+    /// description names — Guardbreaker "stuns a target that blocks it", Staggering
+    /// Bash "stuns a target that does not block it".
     #[test]
     fn a_maneuver_that_ships_a_stagger_threshold_staggers_the_target() {
         use super::super::state::StatusEffectType;
-        for name in ["StaggeringBash", "Guardbreaker"] {
+        for (name, block_flags) in [
+            ("StaggeringBash", 0u8),
+            ("Guardbreaker", super::super::damage::flags::WAS_OPTIMAL_BLOCKING),
+        ] {
             let now = Instant::now();
             let mut c = combat2(now);
             let u = uuid_of(name);
@@ -4069,7 +4250,7 @@ mod shipped_effects_tests {
                 .and_then(|r| r.stun_duration())
                 .unwrap_or_else(|| panic!("{name} R1 ships _stunDuration"));
 
-            let out = apply_shipped_effects(&mut c, 0, 1, u, 1, threshold, now);
+            let out = apply_shipped_effects(&mut c, 0, 1, u, 1, threshold, block_flags, now);
             assert!(c.fighters[1].is_staggered(now), "{name}: the TARGET is staggered");
             assert!(!c.fighters[0].is_staggered(now), "{name}: the caster is not");
             assert_eq!(
@@ -4108,12 +4289,12 @@ mod shipped_effects_tests {
 
         let now = Instant::now();
         let mut hard = combat2(now);
-        let out = apply_shipped_effects(&mut hard, 0, 1, u, 1, threshold, now);
+        let out = apply_shipped_effects(&mut hard, 0, 1, u, 1, threshold, 0, now);
         assert!(hard.fighters[1].is_staggered(now), "a hit at the threshold staggers");
         assert_eq!(status_frames(&out, StatusEffectType::Staggered), hard.fighters.len());
 
         let mut soft = combat2(now);
-        let out = apply_shipped_effects(&mut soft, 0, 1, u, 1, threshold - 0.1, now);
+        let out = apply_shipped_effects(&mut soft, 0, 1, u, 1, threshold - 0.1, 0, now);
         assert!(!soft.fighters[1].is_staggered(now), "a hit under the threshold does not");
         assert_eq!(status_frames(&out, StatusEffectType::Staggered), 0);
     }
@@ -4126,7 +4307,7 @@ mod shipped_effects_tests {
     fn a_cast_that_dealt_no_damage_cannot_stagger() {
         let now = Instant::now();
         let mut c = combat2(now);
-        let out = apply_shipped_effects(&mut c, 0, 1, uuid_of("StaggeringBash"), 1, 0.0, now);
+        let out = apply_shipped_effects(&mut c, 0, 1, uuid_of("StaggeringBash"), 1, 0.0, 0, now);
         assert!(!c.fighters[1].is_staggered(now), "no damage → no stagger");
         assert_eq!(status_frames(&out, super::super::state::StatusEffectType::Staggered), 0);
     }
@@ -4137,7 +4318,7 @@ mod shipped_effects_tests {
         let now = Instant::now();
         let mut c = combat2(now);
         c.fighters[1].health = 0;
-        let out = apply_shipped_effects(&mut c, 0, 1, uuid_of("StaggeringBash"), 1, 500.0, now);
+        let out = apply_shipped_effects(&mut c, 0, 1, uuid_of("StaggeringBash"), 1, 500.0, 0, now);
         assert!(!c.fighters[1].is_staggered(now));
         assert_eq!(status_frames(&out, super::super::state::StatusEffectType::Staggered), 0);
     }
@@ -4267,5 +4448,431 @@ mod piercing_tests {
         cast.armor_piercing_rating += 225.0;
         assert_eq!(f.loadout.armor_piercing_rating, before, "the fighter is untouched");
         assert!(cast.armor_piercing_rating > before, "only the cast's clone pierces");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// tracker #31 — the high-block stun, the bash's own guard, and the two
+// maneuvers whose block conditions are opposites.
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod report_31_high_block_stun {
+    use super::*;
+    use super::super::damage::flags;
+    use super::super::loadout::starter;
+    use super::super::state::{
+        ActorStateType, BlockPhase, BASE_STAGGER_DURATION_SECS, BLOCK_OPTIMAL_TIME_SECS, Fighter,
+        FlowState, MatchCombat, StatusEffectType, WeaponProfile,
+    };
+
+    /// Two fighters with a plain 113.82 Slashing blade, live round.
+    /// `expected_peers` fighters are humans; the rest are bots.
+    fn combat(now: Instant, expected_peers: usize) -> MatchCombat {
+        let mut c = MatchCombat::new(2, expected_peers, now);
+        for slot in 0..2 {
+            let obj = c.alloc_net_object_id();
+            let mut f = Fighter::new(slot, obj, starter(), now);
+            f.loadout.weapon = WeaponProfile {
+                primary_type: Some(super::super::state::DamageType::Slashing),
+                base_by_type: vec![(super::super::state::DamageType::Slashing, 113.82)],
+                weight: Some(super::super::tables::Weight::Light),
+            };
+            f.loadout.weapon_template = None;
+            f.loadout.block_rating = 379.5;
+            c.fighters.push(f);
+        }
+        c.match_net_object_id = c.alloc_net_object_id();
+        c.phase = FlowState::StateTimeout;
+        c.phase_entered = now;
+        c
+    }
+
+    /// Raise `slot`'s guard at `at`, the way both production block-raise paths do.
+    fn raise_guard(c: &mut MatchCombat, slot: usize, at: Instant, window: Duration) {
+        let f = &mut c.fighters[slot];
+        f.set_actor_state(ActorStateType::Blocking, at);
+        f.blocking_side = ActiveSide::Middle;
+        f.blocking_until = Some(at + window);
+        f.block_raised_at = Some(at);
+    }
+
+    /// How many op51 `ChangeCombatStatusEffect` frames in `out` carry `status`.
+    fn status_frames(out: &[(usize, Vec<u8>)], status: StatusEffectType) -> usize {
+        out.iter()
+            .filter(|(_, f)| {
+                if f.len() <= 2 || f[1] != 0x36 {
+                    return false;
+                }
+                let nd = arena_proto::parse_netdata(&f[2..]);
+                nd.int(3) == Some(51) && nd.int(5) == Some(status as u16 as i64)
+            })
+            .count()
+    }
+
+    fn uuid_of(editor: &str) -> &'static str {
+        super::super::gamedata::ABILITIES
+            .iter()
+            .find(|a| a.editor_name == editor)
+            .map(|a| a.uuid)
+            .unwrap_or_else(|| panic!("{editor} missing from the shipped table"))
+    }
+
+    /// Commit slot `sender`'s swing and land it on the FollowThrough beat.
+    fn swing_and_land(
+        c: &mut MatchCombat,
+        sender: usize,
+        target: usize,
+        now: Instant,
+    ) -> (Vec<(usize, Vec<u8>)>, Instant) {
+        let mut out = super::resolve_swing(c, sender, target, 1.0, now);
+        let impact = now + super::FOLLOW_THROUGH_DELAY + Duration::from_millis(1);
+        out.extend(super::land_due_hits(c, impact));
+        (out, impact)
+    }
+
+    // -- (B) the stun itself -------------------------------------------------
+
+    /// `UI.Help.Blocking.Description`: *"When a weapon attack is blocked high, the
+    /// attacker gets stunned."* This is the whole of tracker #31's first half — the
+    /// reporter's "when the AI swings into my high block it does not get stunned".
+    #[test]
+    fn a_weapon_attack_blocked_high_stuns_the_attacker() {
+        let now = Instant::now();
+        let mut c = combat(now, 2);
+        raise_guard(&mut c, 0, now, Duration::from_secs(2));
+
+        let (out, impact) = swing_and_land(&mut c, 1, 0, now);
+
+        assert_eq!(
+            c.fighters[0].block_phase(impact),
+            Some(BlockPhase::Optimal),
+            "precondition: the guard is still HIGH when the swing lands",
+        );
+        assert!(
+            c.fighters[1].is_staggered(impact),
+            "the ATTACKER is stunned by the high block",
+        );
+        assert_eq!(
+            c.fighters[1].actor_state(),
+            ActorStateType::Staggered,
+            "and its actor state follows, so the client animates it",
+        );
+        assert!(!c.fighters[0].is_staggered(impact), "the BLOCKER is not stunned");
+        assert_eq!(
+            status_frames(&out, StatusEffectType::Staggered),
+            c.fighters.len(),
+            "op51 Staggered goes to both viewers",
+        );
+    }
+
+    /// The duration is shipped data: `PvpDefaultSettings.BASE_STAGGER_DURATION = 2.5`
+    /// (`dump.cs:427016`), which is also the arena help text's "stun opponents for
+    /// longer" — `CombatParameters.baseStaggerDuration` (PvE) is 1.5 s.
+    #[test]
+    fn the_high_block_stun_lasts_the_shipped_pvp_stagger_duration() {
+        assert!(
+            (BASE_STAGGER_DURATION_SECS - 2.5).abs() < 1e-6,
+            "PvpDefaultSettings.BASE_STAGGER_DURATION is 2.5 s, got {BASE_STAGGER_DURATION_SECS}",
+        );
+        let now = Instant::now();
+        let mut c = combat(now, 2);
+        raise_guard(&mut c, 0, now, Duration::from_secs(2));
+        let (_, impact) = swing_and_land(&mut c, 1, 0, now);
+
+        let d = Duration::from_secs_f32(BASE_STAGGER_DURATION_SECS);
+        assert!(
+            c.fighters[1].is_staggered(impact + d - Duration::from_millis(50)),
+            "still stunned just before {BASE_STAGGER_DURATION_SECS}s",
+        );
+        assert!(
+            !c.fighters[1].is_staggered(impact + d + Duration::from_millis(50)),
+            "recovered just after {BASE_STAGGER_DURATION_SECS}s",
+        );
+    }
+
+    /// A LOW block — the same guard, just held past `BLOCK_OPTIMAL_TIME` — must NOT
+    /// stun. "Blocking high ALSO protects you more effectively": the stun is the
+    /// high-block reward, not a blocking reward.
+    #[test]
+    fn a_weapon_attack_blocked_low_does_not_stun_the_attacker() {
+        let now = Instant::now();
+        let mut c = combat(now, 2);
+        raise_guard(&mut c, 0, now, Duration::from_secs(8));
+        let swing_at = now + Duration::from_secs_f32(BLOCK_OPTIMAL_TIME_SECS + 0.5);
+
+        let (out, impact) = swing_and_land(&mut c, 1, 0, swing_at);
+
+        assert_eq!(
+            c.fighters[0].block_phase(impact),
+            Some(BlockPhase::Late),
+            "precondition: the guard has dropped to LOW",
+        );
+        assert!(!c.fighters[1].is_staggered(impact), "a low block does not stun");
+        assert_eq!(status_frames(&out, StatusEffectType::Staggered), 0);
+    }
+
+    /// And an unblocked swing obviously does not stun its owner.
+    #[test]
+    fn an_unblocked_weapon_attack_does_not_stun_the_attacker() {
+        let now = Instant::now();
+        let mut c = combat(now, 2);
+        let (out, impact) = swing_and_land(&mut c, 1, 0, now);
+        assert!(!c.fighters[1].is_staggered(impact));
+        assert_eq!(status_frames(&out, StatusEffectType::Staggered), 0);
+    }
+
+    /// `UI.Help.Skills.Description`: *"You do not get stunned when your ability
+    /// attack is blocked high."* Driven through the real c2s cast path.
+    #[test]
+    fn a_maneuver_blocked_high_does_not_stun_its_caster() {
+        let now = Instant::now();
+        let mut c = combat(now, 2);
+        // Slot 1 holds a fresh HIGH guard; slot 0 bashes into it.
+        raise_guard(&mut c, 1, now, Duration::from_secs(2));
+        c.fighters[0].stamina = c.fighters[0].max_stamina;
+
+        let u = uuid_of("ShieldBash");
+        let mut frame = vec![
+            0xBE, 0x36, 0x04, 0x1F, 0x70, 0x77, 0x0A, 0x35, 0x02, 0x00, 0x00, 0x38, 0x03, 0x25,
+            0x24, 0x00,
+        ];
+        frame.extend_from_slice(u.as_bytes());
+        let out = super::on_c2s_input(&mut c, 0, &frame, now);
+
+        let blocked = out.iter().any(|(_, f)| {
+            if f.len() <= 2 || f[1] != 0x36 {
+                return false;
+            }
+            let nd = arena_proto::parse_netdata(&f[2..]);
+            nd.int(3) == Some(50)
+                && nd
+                    .int(7)
+                    .map(|v| v as u8 & flags::WAS_OPTIMAL_BLOCKING != 0)
+                    .unwrap_or(false)
+        });
+        assert!(blocked, "precondition: the bash was blocked HIGH (op50 carries the flag)");
+        assert!(
+            !c.fighters[0].is_staggered(now),
+            "an ability attack blocked high must NOT stun its caster",
+        );
+    }
+
+    /// The bot loop had no stagger gate, so a stunned bot kept swinging and the whole
+    /// mechanic was invisible for exactly the case in the report.
+    #[test]
+    fn a_stunned_bot_stops_swinging() {
+        let now = Instant::now();
+        // expected_peers = 1 → slot 1 is the bot.
+        let mut c = combat(now, 1);
+        c.fighters[1].apply_stagger_for(now, BASE_STAGGER_DURATION_SECS);
+
+        super::on_tick(&mut c, now + Duration::from_millis(10), false);
+        assert!(
+            c.fighters[1].bot_swing_at.is_none(),
+            "a stunned bot must not queue a wind-up",
+        );
+        assert_ne!(
+            c.fighters[1].actor_state(),
+            ActorStateType::Charging,
+            "…nor enter Charging",
+        );
+
+        // Once the stun lapses the bot resumes, and the tick clears it back to Idle.
+        let after = now + Duration::from_secs_f32(BASE_STAGGER_DURATION_SECS + 0.1);
+        super::on_tick(&mut c, after, false);
+        assert!(!c.fighters[1].is_staggered(after));
+        assert!(c.fighters[1].bot_swing_at.is_some(), "the bot swings again after the stun");
+    }
+
+    // -- (C) the bash's own 0.5 s guard window -------------------------------
+
+    /// Every ShieldBash-family maneuver ships `blockDuration: 0.5` at every rank, and
+    /// retail's `AbilityDoShieldBash` (`dump.cs:604149`) holds `_blockDuration`,
+    /// `_appliedBlock`, `_removedBlock` and a `_blockingEffect`. We now raise it.
+    #[test]
+    fn every_shield_bash_raises_its_own_guard_window() {
+        for name in [
+            "ShieldBash",
+            "HarryingBash",
+            "StaggeringBash",
+            "ReflectingBash",
+            "ShieldOfMania",
+        ] {
+            let u = uuid_of(name);
+            let window = super::super::gamedata::ability_rank_clamped(u, 1)
+                .and_then(|r| r.block_duration())
+                .unwrap_or_else(|| panic!("{name} R1 must ship _blockDuration"));
+            assert!(
+                (window - 0.5).abs() < 1e-6,
+                "{name} ships blockDuration 0.50, got {window}",
+            );
+
+            let now = Instant::now();
+            let mut c = combat(now, 2);
+            super::apply_shipped_effects(&mut c, 0, 1, u, 1, 0.0, 0, now);
+
+            assert_eq!(
+                c.fighters[0].actor_state(),
+                ActorStateType::Blocking,
+                "{name}: the caster's guard is up",
+            );
+            assert_eq!(
+                c.fighters[0].block_phase(now),
+                Some(BlockPhase::Optimal),
+                "{name}: and it opens HIGH",
+            );
+            let inside = now + Duration::from_secs_f32(window * 0.5);
+            assert_eq!(c.fighters[0].block_phase(inside), Some(BlockPhase::Optimal));
+            let outside = now + Duration::from_secs_f32(window + 0.05);
+            assert_eq!(
+                c.fighters[0].block_phase(outside),
+                None,
+                "{name}: the window is only {window}s long",
+            );
+        }
+    }
+
+    /// An ability with no `_blockDuration` must not raise a guard.
+    #[test]
+    fn a_non_bash_ability_raises_no_guard() {
+        let now = Instant::now();
+        let mut c = combat(now, 2);
+        super::apply_shipped_effects(&mut c, 0, 1, uuid_of("Guardbreaker"), 1, 5.0, 0, now);
+        assert_ne!(c.fighters[0].actor_state(), ActorStateType::Blocking);
+        assert_eq!(c.fighters[0].block_phase(now), None);
+    }
+
+    /// The reporter's second complaint, end to end: bash, then the opponent's weapon
+    /// swing lands inside the bash's own 0.5 s guard → the opponent is stunned.
+    /// Harrying Bash ships NO `_damageToCauseStagger` and NO `_stunDuration`, so this
+    /// (B)+(C) path — not the ability gate — is what satisfies the expectation.
+    #[test]
+    fn a_bash_guard_stuns_an_incoming_weapon_swing() {
+        for name in ["HarryingBash", "StaggeringBash"] {
+            let now = Instant::now();
+            let mut c = combat(now, 2);
+            super::apply_shipped_effects(&mut c, 0, 1, uuid_of(name), 1, 0.0, 0, now);
+
+            let (out, impact) = swing_and_land(&mut c, 1, 0, now);
+            assert!(
+                c.fighters[1].is_staggered(impact),
+                "{name}: a swing into the bash's guard stuns the swinger",
+            );
+            assert_eq!(status_frames(&out, StatusEffectType::Staggered), c.fighters.len());
+        }
+    }
+
+    /// NOT A BUG, asserted so nobody "fixes" it: Harrying Bash is not an ability-gate
+    /// stunner at any of its 14 ranks. Its shipped text is *"adds {1} seconds to all of
+    /// the target's skill cooldowns"*, and `damage_type` is `none`.
+    #[test]
+    fn harrying_bash_ships_no_stagger_fields_at_any_rank() {
+        let u = uuid_of("HarryingBash");
+        let a = super::super::gamedata::ability(u).expect("HarryingBash");
+        assert_eq!(a.maximum_level, 14);
+        for lvl in 1..=a.maximum_level {
+            let r = super::super::gamedata::ability_rank_clamped(u, lvl).expect("rank");
+            assert!(r.damage_to_cause_stagger().is_none(), "rank {lvl}");
+            assert!(r.stun_duration().is_none(), "rank {lvl}");
+        }
+    }
+
+    // -- (D) Guardbreaker vs Staggering Bash: opposite block conditions ------
+
+    /// `Ability.Maneuver.Guardbreaker.Description`: *"…stuns a target that **blocks**
+    /// it."* PR #25 applied a uniform damage-threshold rule, so it stunned an
+    /// unblocking target too.
+    #[test]
+    fn guardbreaker_stuns_only_a_target_that_blocks() {
+        let u = uuid_of("Guardbreaker");
+        let threshold = super::super::gamedata::ability_rank_clamped(u, 1)
+            .and_then(|r| r.damage_to_cause_stagger())
+            .expect("Guardbreaker R1 ships _damageToCauseStagger");
+
+        for (label, bits, want) in [
+            ("high block", flags::WAS_OPTIMAL_BLOCKING, true),
+            ("low block", flags::WAS_LATE_BLOCKING, true),
+            ("no block", 0u8, false),
+        ] {
+            let now = Instant::now();
+            let mut c = combat(now, 2);
+            let out = super::apply_shipped_effects(&mut c, 0, 1, u, 1, threshold, bits, now);
+            assert_eq!(
+                c.fighters[1].is_staggered(now),
+                want,
+                "Guardbreaker vs {label}: expected staggered = {want}",
+            );
+            assert_eq!(
+                status_frames(&out, StatusEffectType::Staggered),
+                if want { c.fighters.len() } else { 0 },
+                "Guardbreaker vs {label}: op51 count",
+            );
+        }
+    }
+
+    /// `Ability.Maneuver.StaggeringBash.Description`: *"…stuns a target that **does
+    /// not block** it."* The exact opposite, from the same `damageToCauseStagger: 1`.
+    #[test]
+    fn staggering_bash_stuns_only_a_target_that_does_not_block() {
+        let u = uuid_of("StaggeringBash");
+        let threshold = super::super::gamedata::ability_rank_clamped(u, 1)
+            .and_then(|r| r.damage_to_cause_stagger())
+            .expect("StaggeringBash R1 ships _damageToCauseStagger");
+
+        for (label, bits, want) in [
+            ("high block", flags::WAS_OPTIMAL_BLOCKING, false),
+            ("low block", flags::WAS_LATE_BLOCKING, false),
+            ("no block", 0u8, true),
+        ] {
+            let now = Instant::now();
+            let mut c = combat(now, 2);
+            let out = super::apply_shipped_effects(&mut c, 0, 1, u, 1, threshold, bits, now);
+            assert_eq!(
+                c.fighters[1].is_staggered(now),
+                want,
+                "StaggeringBash vs {label}: expected staggered = {want}",
+            );
+            assert_eq!(
+                status_frames(&out, StatusEffectType::Staggered),
+                if want { c.fighters.len() } else { 0 },
+                "StaggeringBash vs {label}: op51 count",
+            );
+        }
+    }
+
+    /// The two maneuvers ship IDENTICAL stagger data — so nothing in the data could
+    /// have told them apart, which is why the condition is keyed on the editor name
+    /// (retail keys it on the C# class: `AbilityDoGuardbreaker` vs
+    /// `AbilityDoStaggeringBash`).
+    #[test]
+    fn the_two_maneuvers_are_indistinguishable_in_the_shipped_data() {
+        let gb = super::super::gamedata::ability(uuid_of("Guardbreaker")).unwrap();
+        let sb = super::super::gamedata::ability(uuid_of("StaggeringBash")).unwrap();
+        for lvl in 1..=13u16 {
+            let g = super::super::gamedata::ability_rank_clamped(gb.uuid, lvl).unwrap();
+            let s = super::super::gamedata::ability_rank_clamped(sb.uuid, lvl).unwrap();
+            assert_eq!(g.damage_to_cause_stagger(), s.damage_to_cause_stagger(), "rank {lvl}");
+            assert_eq!(g.stun_duration(), s.stun_duration(), "rank {lvl}");
+        }
+    }
+
+    /// IceSpike carries the same field with NO block condition in its text — *"Enemies
+    /// that suffer more than {1} damage are stunned."* It must be unaffected by (D).
+    #[test]
+    fn icespike_is_unconditional_on_blocking() {
+        let u = uuid_of("IceSpike");
+        let threshold = super::super::gamedata::ability_rank_clamped(u, 1)
+            .and_then(|r| r.damage_to_cause_stagger())
+            .expect("IceSpike R1 ships _damageToCauseStagger");
+        for bits in [0u8, flags::WAS_LATE_BLOCKING, flags::WAS_OPTIMAL_BLOCKING] {
+            let now = Instant::now();
+            let mut c = combat(now, 2);
+            super::apply_shipped_effects(&mut c, 0, 1, u, 1, threshold, bits, now);
+            assert!(
+                c.fighters[1].is_staggered(now),
+                "IceSpike staggers on damage alone (bits {bits:#06b})",
+            );
+        }
     }
 }

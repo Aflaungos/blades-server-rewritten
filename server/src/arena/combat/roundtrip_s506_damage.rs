@@ -331,9 +331,11 @@ fn s506_optimal_block_negates_physical_halves_elemental() {
         def.block_rating(true),
         super::tables::block_reduction(def.block_rating(true), false),
     );
-    // A LATE / wrong-side guard does NOT negate physical.
+    // A LATE guard does NOT negate physical. Forced by TIMING (re-raised inside the
+    // OPTIMAL_BLOCK_RECOVERY cooldown) — tracker #31 removed the wrong-side gate,
+    // because high/low blocking is a phase and never a direction.
     let mut late = def.clone();
-    late.blocking_side = ActiveSide::Left;
+    late.last_block_dropped_at = Some(now);
     let l = m.resolve_attack(&lo, &late, DamageSource::Attack, ActiveSide::Right, 1.0, 0, now);
     assert!(l.flags & flags::WAS_LATE_BLOCKING != 0);
     assert!(slash_of(&l) > 1.0, "a late block only reduces, got {:.2}", slash_of(&l));

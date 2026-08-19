@@ -199,8 +199,24 @@ impl BlockOutcome {
 
 /// Resolve the block outcome for a hit on `target` swung on `active_side`.
 ///
-/// OPTIMAL requires BOTH: the defender is in the `Optimal` phase AND the defending
-/// side matches the attacking side. Wrong-side in the Optimal phase is still LATE.
+/// OPTIMAL is a **TIMING PHASE, NOT A DIRECTION** (tracker #31). "High" vs "low" is
+/// how long the guard has been up — `UI.Help.Blocking.Description`: *"At first, for a
+/// short time, you will block high, then lower your shield to block low."* That is
+/// `PvpDefaultSettings.BLOCK_OPTIMAL_TIME` (2.0 s, `dump.cs:427014`), which
+/// [`Fighter::block_phase`] already models. Retail's `PlayerBlockingState`
+/// (`dump.cs:597057-597068`) decides `IsOptimalBlocking` from `_blockOptimalTime` /
+/// `_couldBeOptimalBlocking` / `_consumedOptimalBlock` and compares no sides at all.
+///
+/// This function used to ALSO require `target.blocking_side == active_side`. That gate
+/// was ours, not retail's, and it made the optimal phase **unreachable for a weapon
+/// swing**: a guard is always raised on `ActiveSide::Middle` (propId 9 == 1 in 578/578
+/// recorded blocking-state frames, `resolve.rs`), while an auto-attack is always `Left`
+/// or `Right` (`classify_side_from_x` never returns `Middle`; 0 of 6 595 recorded
+/// attack hits carried Middle). So `side_matches` was false on every weapon hit and
+/// true on every maneuver — both halves wrong. The client also transmits no block
+/// direction: `PlayerCombatInputActivateMessage` (`dump.cs:589516-589526`) carries only
+/// `_held`, `_clientChargeTime`, `_isWithinBlockZone`.
+///
 /// `attacker` supplies the flat block-piercing ratings. **Additive:** they are 0.0 on
 /// every loadout unless an ability sets them, so a hit with no piercing produces the
 /// same numbers as before this parameter existed — which the s506 block differentials
@@ -233,8 +249,10 @@ pub fn block_outcome(
     let Some(phase) = target.block_phase(now) else {
         return none;
     };
-    let side_matches = target.blocking_side == active_side;
-    let optimal = matches!(phase, BlockPhase::Optimal) && side_matches;
+    // Timing only — see the note above. `target.blocking_side` is deliberately NOT
+    // consulted: it is the wire-visible facing of the guard animation
+    // (`PlayerBlockingState.Parameters.ActiveSide`), not a hit-test.
+    let optimal = matches!(phase, BlockPhase::Optimal);
     BlockOutcome {
         flag: if optimal { flags::WAS_OPTIMAL_BLOCKING } else { flags::WAS_LATE_BLOCKING },
         optimal,
@@ -664,9 +682,12 @@ mod tests {
             expect_elem
         );
 
-        // LATE / wrong-side: the plain (un-doubled) rating applies to BOTH categories.
+        // LATE: the plain (un-doubled) rating applies to BOTH categories.
+        // Forced by TIMING, not by a side mismatch — tracker #31 removed the side gate
+        // (high/low is a phase, never a direction), so this re-raises the guard inside
+        // the `OPTIMAL_BLOCK_RECOVERY_SECS` cooldown, which is a real way to be LATE.
         let mut late_t = def.clone();
-        late_t.blocking_side = ActiveSide::Left;
+        late_t.last_block_dropped_at = Some(now);
         let late = m.resolve_attack(&lo, &late_t, DamageSource::Attack, ActiveSide::Right, 1.0, 0, now);
         assert!(late.flags & flags::WAS_LATE_BLOCKING != 0);
         let expect_phys = comp(&open, DamageType::Slashing) * (1.0 - tables::block_reduction(379.5, true));
@@ -794,6 +815,83 @@ mod tests {
             "DoT {} should exceed the direct hit {} (resistance de-rated, block not)",
             comp(&dot, DamageType::Poison),
             comp(&hit, DamageType::Poison)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // tracker #31: "high block" is a TIMING PHASE, not a direction
+    // -----------------------------------------------------------------------
+
+    /// A guard raised the way the wire actually raises one — `ActiveSide::Middle`,
+    /// which is what propId 9 carries in 578 of 578 recorded blocking-state frames —
+    /// must block a LEFT or RIGHT weapon swing HIGH.
+    ///
+    /// Before tracker #31 `block_outcome` also required `blocking_side == active_side`.
+    /// `classify_side_from_x` never produces `Middle` for an auto-attack (0 of 6 595
+    /// recorded attack hits carried it), so that gate made the optimal phase
+    /// UNREACHABLE for every weapon swing in the game: no high block, no damage
+    /// negation, and nothing for the attacker-stun to hang off.
+    #[test]
+    fn a_high_block_is_side_independent_for_a_weapon_swing() {
+        let m = RetailDamageModel;
+        let lo = poison_dagger();
+        let now = Instant::now();
+
+        for swing in [ActiveSide::Left, ActiveSide::Right, ActiveSide::Middle] {
+            let mut def = target();
+            def.loadout.block_rating = 379.5;
+            def.set_actor_state(ActorStateType::Blocking, now);
+            // Exactly what `resolve.rs` sets on both block-raise paths.
+            def.blocking_side = ActiveSide::Middle;
+            def.block_raised_at = Some(now);
+            def.blocking_until = Some(now + Duration::from_secs(2));
+
+            let r = m.resolve_attack(&lo, &def, DamageSource::Attack, swing, 1.0, 0, now);
+            assert!(
+                r.flags & flags::WAS_OPTIMAL_BLOCKING != 0,
+                "{swing:?}: a Middle guard inside BLOCK_OPTIMAL_TIME must block HIGH",
+            );
+            assert_eq!(
+                comp(&r, DamageType::Slashing),
+                0.0,
+                "{swing:?}: a high block negates physical",
+            );
+        }
+    }
+
+    /// The phase, and only the phase, decides high vs low. Same Middle guard, same
+    /// Right swing — held past `BLOCK_OPTIMAL_TIME_SECS` it is LOW.
+    #[test]
+    fn the_same_guard_goes_low_purely_by_holding_it() {
+        use crate::arena::combat::state::BLOCK_OPTIMAL_TIME_SECS;
+        let m = RetailDamageModel;
+        let lo = poison_dagger();
+        let now = Instant::now();
+        let mut def = target();
+        def.loadout.block_rating = 379.5;
+        def.set_actor_state(ActorStateType::Blocking, now);
+        def.blocking_side = ActiveSide::Middle;
+        def.block_raised_at = Some(now);
+        def.blocking_until = Some(now + Duration::from_secs(8));
+
+        let early =
+            m.resolve_attack(&lo, &def, DamageSource::Attack, ActiveSide::Right, 1.0, 0, now);
+        assert!(early.flags & flags::WAS_OPTIMAL_BLOCKING != 0, "held briefly → HIGH");
+
+        let late_at = now + Duration::from_secs_f32(BLOCK_OPTIMAL_TIME_SECS + 0.1);
+        let held = m.resolve_attack(
+            &lo,
+            &def,
+            DamageSource::Attack,
+            ActiveSide::Right,
+            1.0,
+            0,
+            late_at,
+        );
+        assert!(held.flags & flags::WAS_LATE_BLOCKING != 0, "held too long → LOW");
+        assert!(
+            comp(&held, DamageType::Slashing) > 0.0,
+            "a low block only reduces, it does not negate",
         );
     }
 }
