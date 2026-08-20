@@ -2944,6 +2944,154 @@ pub(in crate::arena::combat) mod tests {
         assert_eq!(m.fighter_health(0), attacker_full, "paralysed target dealt no damage");
     }
 
+    /// Push a bare status onto a fighter, with no DoT and no transient resistance.
+    /// Used by the regen-suppression scenarios below, which care only about the
+    /// status being ACTIVE, not about anything it ticks.
+    #[cfg(test)]
+    fn push_status(
+        f: &mut crate::arena::combat::state::Fighter,
+        effect: crate::arena::combat::state::StatusEffectType,
+        now: Instant,
+        expires_at: Instant,
+    ) {
+        use crate::arena::combat::state::{ActiveEffect, DamageType};
+        f.effects.push(ActiveEffect {
+            effect,
+            damage_type: DamageType::None,
+            value: 0.0,
+            per_tick_damage: 0.0,
+            expires_at,
+            last_tick: now,
+            is_transient_resist: false,
+        });
+    }
+
+    /// Two ghosts, one frozen: STAMINA must stop regenerating for the duration.
+    ///
+    /// Measured in retail, session 615 actor 431, from the packed pools carried on
+    /// the wire — a controlled experiment inside a single actor:
+    ///
+    /// ```text
+    ///   frame     state      H     S     M
+    ///   4394351   —         414    70   523
+    ///   4394358   frozen    403    26   531
+    ///   4394366   frozen    404    26   535
+    ///   4394371   frozen    404    26   533
+    ///   4394520   REMOVED   205    10   204
+    ///   4394528   —         206    60   225
+    /// ```
+    ///
+    /// Stamina pinned at exactly 26 across five consecutive samples while health AND
+    /// magicka rise in the very same frames, then resumes the instant Frozen lapses.
+    /// Being stamina-specific, it is not a global regen pause.
+    ///
+    /// Retail never announces this. Across 7,051 op51 messages in six fully-walked
+    /// sessions `BlockStaminaRegen`(51) was sent ZERO times, so the suppression is an
+    /// intrinsic property of `Frozen` itself rather than a companion status —
+    /// emitting 51 would invent traffic retail never sent.
+    #[test]
+    fn a_frozen_fighter_does_not_regenerate_stamina() {
+        use crate::arena::combat::state::StatusEffectType;
+        let (mut m, _t0, live) = live_inst_at(2);
+
+        // Spend both pools so there is headroom to regenerate into, then let one tick
+        // pass to prove regen IS running before we freeze anything. Without this
+        // control the test would also pass on a fighter that simply never regenerates.
+        m.combat.fighters[1].stamina = m.combat.fighters[1].max_stamina / 2;
+        m.combat.fighters[1].magicka = m.combat.fighters[1].max_magicka / 2;
+        let baseline = m.combat.fighters[1].stamina;
+        let mut t = live + Duration::from_millis(1100);
+        m.on_tick(2, t);
+        assert!(
+            m.combat.fighters[1].stamina > baseline,
+            "control: an unfrozen fighter must regenerate stamina ({baseline} → {})",
+            m.combat.fighters[1].stamina
+        );
+
+        // 3.125 s is a real observed duration (s615 #4394357). Retail scales the
+        // shipped 5 s by resistance, so this is deliberately not the flat constant.
+        let frozen_until = t + Duration::from_secs_f32(3.125);
+        push_status(&mut m.combat.fighters[1], StatusEffectType::Frozen, t, frozen_until);
+        let stam_at = m.combat.fighters[1].stamina;
+        let mag_at = m.combat.fighters[1].magicka;
+
+        for _ in 0..3 {
+            t += Duration::from_millis(1000);
+            m.on_tick(2, t);
+            if t < frozen_until {
+                assert_eq!(
+                    m.combat.fighters[1].stamina, stam_at,
+                    "stamina must not regenerate while Frozen"
+                );
+            }
+        }
+
+        // MAGICKA is untouched — the suppression is per-channel, exactly as the
+        // capture shows (magicka rose 531→535 while stamina was pinned).
+        assert!(
+            m.combat.fighters[1].magicka > mag_at,
+            "Frozen must not suppress MAGICKA regen ({mag_at} → {})",
+            m.combat.fighters[1].magicka
+        );
+
+        // …and stamina resumes once the status lapses.
+        t += Duration::from_millis(2000);
+        m.on_tick(2, t);
+        assert!(
+            m.combat.fighters[1].stamina > stam_at,
+            "stamina must resume once Frozen lapses ({stam_at} → {})",
+            m.combat.fighters[1].stamina
+        );
+    }
+
+    /// The mirror for shock: `Enervated`(6) stops MAGICKA regeneration.
+    ///
+    /// Retail, s615 actor 806, `Enervated dur=2.515625`: magicka pinned at exactly 79
+    /// for nine consecutive samples over ~3 s while stamina in the identical rows
+    /// climbs 160→252, then resumes on removal. `BlockMagickaRegen`(52) was likewise
+    /// never sent in any captured session.
+    ///
+    /// A pool can still be SPENT while suppressed — retail shows magicka dropping
+    /// 577→134 on a cast mid-Enervated, then flat at 134. Only regeneration stops.
+    #[test]
+    fn an_enervated_fighter_does_not_regenerate_magicka() {
+        use crate::arena::combat::state::StatusEffectType;
+        let (mut m, _t0, live) = live_inst_at(2);
+
+        m.combat.fighters[1].magicka = m.combat.fighters[1].max_magicka / 2;
+        m.combat.fighters[1].stamina = m.combat.fighters[1].max_stamina / 2;
+        let baseline = m.combat.fighters[1].magicka;
+        let mut t = live + Duration::from_millis(1100);
+        m.on_tick(2, t);
+        assert!(
+            m.combat.fighters[1].magicka > baseline,
+            "control: an un-enervated fighter must regenerate magicka ({baseline} → {})",
+            m.combat.fighters[1].magicka
+        );
+
+        let until = t + Duration::from_secs_f32(2.515625);
+        push_status(&mut m.combat.fighters[1], StatusEffectType::Enervated, t, until);
+        let mag_at = m.combat.fighters[1].magicka;
+        let stam_at = m.combat.fighters[1].stamina;
+
+        for _ in 0..2 {
+            t += Duration::from_millis(1000);
+            m.on_tick(2, t);
+            if t < until {
+                assert_eq!(
+                    m.combat.fighters[1].magicka, mag_at,
+                    "magicka must not regenerate while Enervated"
+                );
+            }
+        }
+
+        assert!(
+            m.combat.fighters[1].stamina > stam_at,
+            "Enervated must not suppress STAMINA regen ({stam_at} → {})",
+            m.combat.fighters[1].stamina
+        );
+    }
+
     #[test]
     fn ability_cast_deals_spell_damage() {
         let (mut m, t0) = live_inst(2); // → live round

@@ -2375,14 +2375,44 @@ fn apply_regen_tick(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u
             continue;
         }
 
-        // Check which regen channels are suppressed by active status effects.
-        // BlockHealthRegen(50) is kept for future use but has no effect (rate = 0.0).
-        let block_stam = f.effects.iter().any(|e| {
-            e.effect == StatusEffectType::BlockStaminaRegen && now < e.expires_at
-        });
-        let block_mag = f.effects.iter().any(|e| {
-            e.effect == StatusEffectType::BlockMagickaRegen && now < e.expires_at
-        });
+        // Which regen channels are suppressed by an active status.
+        //
+        // Frozen(5) suppresses STAMINA and Enervated(6) suppresses MAGICKA as an
+        // INTRINSIC property of those statuses — retail does not send a companion
+        // status to say so. Measured over 7,051 op51 messages in six sessions,
+        // BlockHealthRegen(50)/BlockStaminaRegen(51)/BlockMagickaRegen(52) were
+        // never sent once, yet the packed pools prove the block is in force:
+        // during a Frozen window, stamina sat pinned at exactly 26 across five
+        // consecutive samples while health AND magicka rose in the very same
+        // frames, then resumed the instant Frozen was removed. Enervated mirrors
+        // it — magicka pinned at 79 for nine samples while stamina climbed
+        // 160→252. So the block is real; the announcement is not.
+        //
+        // 50/51/52 are still honoured because an item property can set them
+        // (BlockMagickaRegenerationPropertyLogic), but nothing in combat emits
+        // them, and nothing should — that would invent traffic retail never sent.
+        //
+        // Note a pool can still be SPENT while blocked; only regeneration stops.
+        let suppresses_stamina = |e: &super::state::ActiveEffect| {
+            matches!(
+                e.effect,
+                StatusEffectType::BlockStaminaRegen | StatusEffectType::Frozen
+            )
+        };
+        let suppresses_magicka = |e: &super::state::ActiveEffect| {
+            matches!(
+                e.effect,
+                StatusEffectType::BlockMagickaRegen | StatusEffectType::Enervated
+            )
+        };
+        let block_stam = f
+            .effects
+            .iter()
+            .any(|e| suppresses_stamina(e) && now < e.expires_at);
+        let block_mag = f
+            .effects
+            .iter()
+            .any(|e| suppresses_magicka(e) && now < e.expires_at);
 
         let before_s = f.stamina;
         let before_m = f.magicka;
