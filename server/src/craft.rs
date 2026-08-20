@@ -2285,6 +2285,103 @@ mod tests {
         }
     }
 
+    /// The forge half of production, verbatim: the owner's eleven broken forge rows as
+    /// `characters.server_state->'craftJobs'` actually held them on 2026-08-20, read off
+    /// arena PG. `(buildingId, recipeId)` in row order — note the two DIFFERENT buildings
+    /// and the repeated recipes, neither of which the single-building fixture above
+    /// reproduces. Three rows share `b949b05f` at one building, so a winner has to be
+    /// picked among identical recipes as well as among different ones.
+    const OWNER_FORGE_ROWS_2026_08_20: [(&str, &str); 11] = [
+        ("0e73f481-9efa-4dc8-a66b-46da95ff76ee", "5fe0e868-957e-47c2-a094-9c1daad097d5"),
+        ("0e73f481-9efa-4dc8-a66b-46da95ff76ee", "7ad4e3a0-49b0-4c2f-9a94-6158acbb51d9"),
+        ("0e73f481-9efa-4dc8-a66b-46da95ff76ee", "a57591a0-9354-411b-862a-5449dfbd335b"),
+        ("0e73f481-9efa-4dc8-a66b-46da95ff76ee", "b949b05f-2e46-4a0c-80e4-171c4aecb9e5"),
+        ("105c24bf-9e16-4cbb-bddd-514ad0b23e0e", "38671302-f4f1-4357-aef9-5f57972c423d"),
+        ("105c24bf-9e16-4cbb-bddd-514ad0b23e0e", "38671302-f4f1-4357-aef9-5f57972c423d"),
+        ("105c24bf-9e16-4cbb-bddd-514ad0b23e0e", "38671302-f4f1-4357-aef9-5f57972c423d"),
+        ("105c24bf-9e16-4cbb-bddd-514ad0b23e0e", "5fe0e868-957e-47c2-a094-9c1daad097d5"),
+        ("105c24bf-9e16-4cbb-bddd-514ad0b23e0e", "a57591a0-9354-411b-862a-5449dfbd335b"),
+        ("105c24bf-9e16-4cbb-bddd-514ad0b23e0e", "b949b05f-2e46-4a0c-80e4-171c4aecb9e5"),
+        ("105c24bf-9e16-4cbb-bddd-514ad0b23e0e", "b949b05f-2e46-4a0c-80e4-171c4aecb9e5"),
+    ];
+
+    /// The owner's real forge pile, on the real two buildings, must come out with one
+    /// honestly-named Smithing bench PER BUILDING and no crowded station anywhere. This
+    /// is the character that got stuck on the startup screen, so it is the one layout the
+    /// change has to be right about.
+    #[test]
+    fn the_owners_real_two_building_forge_pile_yields_one_bench_per_building() {
+        let sd = static_data_from_deploy();
+        let alchemy = Uuid::parse_str(ALCHEMY_CRAFTING_TYPE_ID).unwrap();
+        let jobs: Vec<CraftJob> = OWNER_FORGE_ROWS_2026_08_20
+            .iter()
+            .enumerate()
+            .map(|(n, (building, recipe))| CraftJob {
+                id: Uuid::from_u128(0xB000 + n as u128),
+                recipe_id: Uuid::parse_str(recipe).unwrap(),
+                building_id: Uuid::parse_str(building).unwrap(),
+                crafting_type_id: alchemy,
+                completed_at_ms: 1_785_999_240_168 + n as i64,
+                results: serde_json::json!({"stackableItems": { *recipe: 1 }}),
+            })
+            .collect();
+
+        let wires = wires_of(&jobs, &sd);
+        assert_eq!(wires.len(), 11, "no craft job may vanish from the list");
+
+        let mut occupancy: std::collections::HashMap<(String, String), usize> = Default::default();
+        for w in &wires {
+            assert_shape_consistent("owner forge pile", w, &sd);
+            *occupancy
+                .entry((
+                    w["buildingId"].as_str().unwrap().to_string(),
+                    w["craftingTypeId"].as_str().unwrap().to_string(),
+                ))
+                .or_default() += 1;
+        }
+
+        let mut smith_buildings: Vec<String> = wires
+            .iter()
+            .filter(|w| w["craftingTypeId"] == SMITHING_CRAFTING_TYPE_ID)
+            .map(|w| w["buildingId"].as_str().unwrap().to_string())
+            .collect();
+        smith_buildings.sort();
+        assert_eq!(
+            smith_buildings,
+            vec![
+                "0e73f481-9efa-4dc8-a66b-46da95ff76ee".to_string(),
+                "105c24bf-9e16-4cbb-bddd-514ad0b23e0e".to_string(),
+            ],
+            "each Forge gets exactly one honestly-named Smithing job"
+        );
+        for b in &smith_buildings {
+            assert_eq!(
+                occupancy[&(b.clone(), SMITHING_CRAFTING_TYPE_ID.to_string())], 1,
+                "the Smithing station at {b} must hold one job, not a crowd"
+            );
+        }
+        // Each promoted row carries a real instanced item the durability ladder knows.
+        for w in wires.iter().filter(|w| w["craftingTypeId"] == SMITHING_CRAFTING_TYPE_ID) {
+            let tpl = w["results"]["items"][0]["itemTemplateId"].as_str().expect("an item");
+            assert_ne!(tpl, w["recipeId"].as_str().unwrap(), "not the recipe id");
+            assert!(
+                repair_data_from_deploy()
+                    .max_durability(Uuid::parse_str(tpl).unwrap(), 0)
+                    .is_some(),
+                "{tpl} must be a template the durability ladder knows"
+            );
+        }
+        // The nine that stayed behind are byte-identical to what is stored, so this
+        // change cannot have made them worse than the state that loads today.
+        for (job, w) in jobs.iter().zip(&wires) {
+            if w["craftingTypeId"] == SMITHING_CRAFTING_TYPE_ID {
+                continue;
+            }
+            assert_eq!(w["craftingTypeId"].as_str().unwrap(), ALCHEMY_CRAFTING_TYPE_ID);
+            assert_eq!(w["results"], job.results);
+        }
+    }
+
     /// The gate itself, directly: a retail-impossible `(craftingTypeId, results)` pair
     /// must be refused whatever the caller asks for. Smithing never carries a stackable
     /// result in retail (26/26 carry `items`), so handing `reconcile_type_with_results`
