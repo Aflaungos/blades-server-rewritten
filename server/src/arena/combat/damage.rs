@@ -425,21 +425,22 @@ impl DamageModel for RetailDamageModel {
                 // `duration = 5`, so it is unchanged, and `ELEMENTAL_STATUS_DURATION`
                 // survives only as the last-resort default.
                 //
-                // CAVEAT, stated rather than hidden: retail TICKS this over the channel
-                // instead of landing it in one hit — capture s615 #4394011ff shows a
-                // Frostbite cast producing a stream of `ReceiveDamage` frames rather
-                // than one. Applying the shipped total as a lump is the honest floor;
-                // the tick schedule is the follow-up.
+                // Retail TICKS this over the channel rather than landing it in one
+                // hit, so this returns ONE TICK: `dps × CHANNEL_TICK_INTERVAL_SECS`.
+                // `resolve.rs` schedules the rest, calling back here once per tick, so
+                // block and resistance are re-read as the channel runs. The total over
+                // a full channel is still `dps × channelMaxLength` — see
+                // [`channel_ticks`] for the count and the capture behind the interval.
                 let dmg = tables::ability_damage(ability_uuid, ability_level).unwrap_or_else(|| {
                     super::gamedata::ability_rank_clamped(ability_uuid, ability_level.max(1) as u16)
-                        .and_then(|r| r.damage_per_second().map(|dps| (r, dps)))
-                        .map(|(r, dps)| {
+                        .and_then(|r| r.damage_per_second())
+                        .map(|dps| {
                             // A CHANNELLED spell is `ContinuousSpell` on the wire, not
                             // `Spell` — s615 #4394011 carries `damageSource = 8`. The
                             // client keys its channelled-damage presentation off this
                             // discriminator, so sending 2 renders a channel as nothing.
                             source = DamageSource::ContinuousSpell;
-                            dps * dot_span_secs(&r)
+                            dps * CHANNEL_TICK_INTERVAL_SECS
                         })
                         .unwrap_or(0.0)
                 });
@@ -473,6 +474,46 @@ impl DamageModel for RetailDamageModel {
 /// The fallback is `ELEMENTAL_STATUS_DURATION`, which is the *elemental-condition*
 /// DoT length and has nothing to do with a spell's channel — it was standing in for
 /// both, which is why Frostbite billed 5 s of damage for a 3 s channel.
+/// The interval between ticks of a channelled (`_damagePerSecond`) spell.
+///
+/// This is the shipped `GLOBAL_PVP_TICK_INTERVAL` (0.2 s, 5 Hz) — not a number
+/// chosen here. Measured against every channelled tick in the two fully-decrypted
+/// sessions (s615 + s616, 118 `DamageSource::ContinuousSpell` frames across 74 cast
+/// runs, all Frost + Stamina 1:1):
+///
+/// * **Span.** No cast run spans more than 3 wall-clock seconds, matching the shipped
+///   `channelMaxLength = 3`.
+/// * **Tick count.** The longest run observed is **13** ticks. That alone excludes a
+///   0.25 s interval, which could not produce more than 12.
+/// * **Magnitude.** `per_tick = dps × interval`, so each candidate interval implies a
+///   ceiling of `max_dps × interval`. Frostbite's top rank ships `dps = 231.01`. At
+///   1/6 s (6 Hz) the ceiling is **38.50**, but six observed per-tick values exceed it
+///   (39.33, 39.62, 40.86, 41.24, 42.48, 45.00) — damage is *reduced* by resistance,
+///   never inflated, so 6 Hz is refuted outright. At 0.2 s the ceiling is 46.20 and
+///   nothing exceeds it; two magnitudes land within 0.05 of a shipped rank
+///   (42.477 vs r13 42.498, 44.997 vs r15 44.948).
+///
+/// 0.2 s is therefore the only candidate consistent with both the tick count and the
+/// magnitudes, and it is a shipped constant rather than a fitted one.
+pub const CHANNEL_TICK_INTERVAL_SECS: f32 = super::gamedata::combat_params::GLOBAL_PVP_TICK_INTERVAL;
+
+/// How many ticks a channelled cast of `ability_uuid` at `ability_level` delivers,
+/// or `None` when the ability is not channelled (no `_damagePerSecond`).
+///
+/// `channelMaxLength / CHANNEL_TICK_INTERVAL_SECS` — 15 for a 3 s channel. The caster
+/// can release early, so this is the maximum, not a promise; the capture's 1..13 spread
+/// is exactly that (a full 15 also needs no frame to be dropped, and these are UDP
+/// captures).
+pub fn channel_ticks(ability_uuid: &str, ability_level: u8) -> Option<u32> {
+    let r = super::gamedata::ability_rank_clamped(ability_uuid, ability_level.max(1) as u16)?;
+    r.damage_per_second()?;
+    let span = dot_span_secs(&r);
+    if span <= 0.0 {
+        return None;
+    }
+    Some((span / CHANNEL_TICK_INTERVAL_SECS).round().max(1.0) as u32)
+}
+
 fn dot_span_secs(r: &super::gamedata::AbilityRank) -> f32 {
     r.get(super::gamedata::AbilityField::ChannelMaxLength)
         .or_else(|| r.duration())

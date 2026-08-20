@@ -665,6 +665,30 @@ pub struct ActiveEffect {
     pub is_transient_resist: bool,
 }
 
+/// A channelled (`_damagePerSecond`) spell still delivering ticks.
+///
+/// Retail streams a channel as a run of `ReceiveDamage` frames carrying
+/// `DamageSource::ContinuousSpell (8)`, one every
+/// [`damage::CHANNEL_TICK_INTERVAL_SECS`], for `channelMaxLength` seconds. This is the
+/// server-side schedule for the ticks after the first — the cast itself emits tick 1
+/// inline, exactly as a swing emits its own hit.
+///
+/// Only the identity of the cast is stored, never a precomputed damage number: each
+/// tick re-enters `resolve_ability`, so block, resistance and the mirrored stamina
+/// drain are all re-read against the target's state AT THAT TICK. A channel that
+/// starts against an unblocked target and ends against a raised guard is reduced for
+/// the part that lands late, which is what a streamed channel means.
+#[derive(Debug, Clone)]
+pub struct ActiveChannel {
+    pub caster_slot: usize,
+    pub target_slot: usize,
+    pub ability_uuid: String,
+    pub ability_level: u8,
+    /// Ticks still owed, EXCLUDING the one the cast already emitted.
+    pub remaining_ticks: u32,
+    pub next_tick_at: Instant,
+}
+
 // ---------------------------------------------------------------------------
 // Per-fighter authoritative state
 // ---------------------------------------------------------------------------
@@ -1567,6 +1591,8 @@ pub struct MatchCombat {
     /// from the registry; a nil UUID until then (the binding gate is propId5, not 9).
     pub game_session_id: String,
     /// Next Avatar net object id to hand out (captures used 564–566).
+    /// Channelled spells still delivering ticks — see [`ActiveChannel`].
+    pub channels: Vec<ActiveChannel>,
     pub next_net_object_id: i32,
     pub round: u8,
     pub rounds_won: [u8; 2],
@@ -1637,6 +1663,7 @@ impl MatchCombat {
             match_net_object_id: 0,  // assigned by MatchInstance::new
             match_state: MatchState::Idle,
             game_session_id: String::new(), // set by MatchInstance::new from the registry
+            channels: Vec::new(),
             next_net_object_id: 564, // matches captured combat-actor id range
             round: 0,
             rounds_won: [0; 2],

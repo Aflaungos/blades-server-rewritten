@@ -1252,6 +1252,21 @@ fn resolve_ability_cast(
             last_hit_total = resolved.total;
             block_flags = resolved.flags;
             out.extend(emit_damage(combat, sender, target_slot, &resolved, now));
+            // A CHANNELLED spell just emitted tick 1 of many. Schedule the rest;
+            // `apply_channel_ticks` delivers them on the shipped PvP tick.
+            if let Some(total_ticks) = super::damage::channel_ticks(&ea.ability_uuid, level) {
+                if total_ticks > 1 {
+                    combat.channels.push(super::state::ActiveChannel {
+                        caster_slot: sender,
+                        target_slot,
+                        ability_uuid: ea.ability_uuid.clone(),
+                        ability_level: level,
+                        remaining_ticks: total_ticks - 1,
+                        next_tick_at: now
+                            + Duration::from_secs_f32(super::damage::CHANNEL_TICK_INTERVAL_SECS),
+                    });
+                }
+            }
             // A landed Paralyze also carries its own paralyse threshold + duration
             // (`_damageToCauseParalyze` / `_duration`), applied by
             // `apply_status_conditioning` via the caster's `paralyze_rank`.
@@ -1997,6 +2012,72 @@ fn reconcile_paralysis(f: &mut super::state::Fighter, now: Instant) {
 ///
 /// **DoT tick magnitude**: `per_tick_damage` (= `_percentHealthDamage × maxHP`),
 /// game-data-driven at `DOT_PERCENT_HEALTH_PER_TICK`. [§Mechanic-4 calibration flag]
+/// Deliver the due ticks of every in-flight channelled spell.
+///
+/// Retail streams a `_damagePerSecond` spell as a run of `ReceiveDamage` frames with
+/// `DamageSource::ContinuousSpell (8)`, one per [`damage::CHANNEL_TICK_INTERVAL_SECS`]
+/// (the shipped `GLOBAL_PVP_TICK_INTERVAL`), for `channelMaxLength` seconds. We used to
+/// land the whole shipped total in ONE hit, which was wrong three ways: the damage
+/// shape, the stagger interaction (one big hit can cross a stagger threshold a stream
+/// never would), and the stamina trajectory, since Frost mirrors 1:1 onto stamina and
+/// a lump empties the bar in a single frame.
+///
+/// Each tick re-enters `resolve_ability`, so block, resistance and the mirrored drain
+/// are recomputed against the target's state at that instant rather than frozen at
+/// cast time.
+///
+/// A channel ends early when its target dies or leaves — there is no separate
+/// "release" input modelled, so a cast always runs its full `channelMaxLength`.
+fn apply_channel_ticks(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8>)> {
+    let mut out = Vec::new();
+    if combat.channels.is_empty() {
+        return out;
+    }
+
+    let due: Vec<usize> = combat
+        .channels
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| now >= c.next_tick_at)
+        .map(|(i, _)| i)
+        .collect();
+
+    for i in due {
+        let (caster, target, uuid, level) = {
+            let c = &combat.channels[i];
+            (c.caster_slot, c.target_slot, c.ability_uuid.clone(), c.ability_level)
+        };
+        if target >= combat.fighters.len()
+            || combat.fighters[target].is_dead()
+            || caster >= combat.fighters.len()
+            || combat.fighters[caster].is_dead()
+        {
+            combat.channels[i].remaining_ticks = 0;
+            continue;
+        }
+
+        let resolved = RetailDamageModel.resolve_ability(
+            &uuid,
+            level,
+            &combat.fighters[target],
+            ActiveSide::Middle,
+            now,
+        );
+        out.extend(emit_damage(combat, caster, target, &resolved, now));
+
+        let c = &mut combat.channels[i];
+        c.remaining_ticks = c.remaining_ticks.saturating_sub(1);
+        // Advance from the SCHEDULED time, never from `now`. `on_tick` fires a little
+        // after the instant a tick was due, and rebasing on the late arrival lets that
+        // slack compound: measured, it dropped 4 of 15 ticks outside the channel and
+        // stretched a 3.0 s cast to 3.6 s.
+        c.next_tick_at += Duration::from_secs_f32(super::damage::CHANNEL_TICK_INTERVAL_SECS);
+    }
+
+    combat.channels.retain(|c| c.remaining_ticks > 0);
+    out
+}
+
 fn apply_dot_ticks(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8>)> {
     use super::state::{DamageSource as DS, StatusEffectType};
     let mut out = Vec::new();
@@ -2707,6 +2788,7 @@ pub fn on_tick(combat: &mut MatchCombat, now: Instant, debug_hold: bool) -> Vec<
     // whether a bot or player is the source. Runs BEFORE bot swings so a DoT killing
     // blow is processed before the bot's turn. [§Mechanic-2]
     out.extend(apply_dot_ticks(combat, now));
+    out.extend(apply_channel_ticks(combat, now));
     if matches!(combat.phase, FlowState::RoundEnd | FlowState::NextState) {
         // A DoT killing blow just ended the round — no bot swings this tick.
         return out;
@@ -3591,6 +3673,20 @@ mod tests {
         out
     }
 
+    /// Drive `on_tick` across a full `channelMaxLength`, returning the frames the
+    /// channel emits AFTER its first tick. Steps at the real tick interval so the
+    /// schedule under test is the one production uses.
+    fn run_channel(combat: &mut MatchCombat, start: Instant) -> Vec<(usize, Vec<u8>)> {
+        let iv = super::super::damage::CHANNEL_TICK_INTERVAL_SECS;
+        let steps = (3.0 / iv).round() as u32 + 2; // channelMaxLength + slack
+        let mut out = Vec::new();
+        for i in 1..=steps {
+            let t = start + Duration::from_secs_f32(iv * i as f32);
+            out.extend(super::on_tick(combat, t, false));
+        }
+        out
+    }
+
     /// Decode every `ReceiveDamage` (50) frame in `out` into
     /// `(source, total, [(damage_type, value)])`.
     fn damage_frames(out: &[(usize, Vec<u8>)]) -> Vec<(u8, f32, Vec<(u8, f32)>)> {
@@ -3668,13 +3764,98 @@ mod tests {
 
         let now = Instant::now();
         let mut combat = make_prod_scale_combat(now);
-        let out = cast_frostbite(&mut combat, now);
+        let mut out = cast_frostbite(&mut combat, now);
+        out.extend(run_channel(&mut combat, now));
         let dmg = damage_frames(&out);
-        let frost: f32 = dmg[0].2.iter().filter(|(t, _)| *t == 5).map(|(_, v)| *v).sum();
+
+        // The channel is a STREAM, so the shipped total is the sum over its ticks —
+        // one frame carries dps × the tick interval, not the whole cast.
+        let ticks: Vec<&(u8, f32, Vec<(u8, f32)>)> = dmg
+            .iter()
+            .filter(|(src, _, _)| *src == super::super::state::DamageSource::ContinuousSpell as u8)
+            .collect();
+        let expected_ticks = super::super::damage::channel_ticks(FROSTBITE_UUID, FROSTBITE_RANK)
+            .expect("Frostbite is channelled");
+        // `emit_damage` sends each hit to BOTH viewers, so the frame count is
+        // ticks × fighters. Counting frames as ticks silently doubles it.
+        let viewers = combat.fighters.len();
+        assert_eq!(
+            ticks.len(),
+            expected_ticks as usize * viewers,
+            "a {channel}s channel at {}s per tick is {expected_ticks} ticks to {viewers} viewers, \
+             got {} frames",
+            super::super::damage::CHANNEL_TICK_INTERVAL_SECS,
+            ticks.len(),
+        );
+
+        // Sum one viewer's copy only, for the same reason.
+        let frost: f32 = ticks
+            .iter()
+            .flat_map(|(_, _, comps)| comps.iter())
+            .filter(|(t, _)| *t == 5)
+            .map(|(_, v)| *v)
+            .sum::<f32>()
+            / viewers as f32;
         assert!(
             (frost - dps * channel).abs() < 0.5,
-            "Frostbite R{FROSTBITE_RANK} must deal dps({dps}) × channelMaxLength({channel}) = {}, got {frost}",
+            "Frostbite R{FROSTBITE_RANK} must deal dps({dps}) × channelMaxLength({channel}) = {} \
+             summed over its {expected_ticks} ticks, got {frost}",
             dps * channel
+        );
+    }
+
+    /// **The channel is a STREAM, at the shipped PvP tick.**
+    ///
+    /// The engine used to land a channelled spell's whole total in ONE hit. Retail
+    /// sends a run of `ContinuousSpell` frames — s615/s616 carry 118 of them across 74
+    /// cast runs, none spanning more than the shipped `channelMaxLength = 3 s`, the
+    /// longest run 13 ticks.
+    ///
+    /// This pins the two properties that make it a stream rather than a lump: more
+    /// than one tick, and every tick the same size (`dps x the tick interval`). It
+    /// also pins the SCHEDULE, which is where the first cut was wrong — advancing
+    /// `next_tick_at` from the delivery instant instead of the scheduled one let slack
+    /// compound, dropping 4 of 15 ticks and stretching a 3.0 s channel to 3.6 s.
+    #[test]
+    fn report31_frostbite_streams_evenly_over_its_channel() {
+        use super::super::gamedata;
+        let r = gamedata::ability_rank_clamped(FROSTBITE_UUID, FROSTBITE_RANK as u16).unwrap();
+        let dps = r.damage_per_second().unwrap();
+        let iv = super::super::damage::CHANNEL_TICK_INTERVAL_SECS;
+
+        let now = Instant::now();
+        let mut combat = make_prod_scale_combat(now);
+        let mut out = cast_frostbite(&mut combat, now);
+        out.extend(run_channel(&mut combat, now));
+
+        let viewers = combat.fighters.len();
+        let per_tick: Vec<f32> = damage_frames(&out)
+            .iter()
+            .filter(|(src, _, _)| *src == super::super::state::DamageSource::ContinuousSpell as u8)
+            .map(|(_, _, comps)| comps.iter().filter(|(t, _)| *t == 5).map(|(_, v)| *v).sum())
+            .collect();
+
+        assert!(
+            per_tick.len() > viewers,
+            "a channel must be MORE than one hit — got {} frame(s), i.e. {} tick(s)",
+            per_tick.len(),
+            per_tick.len() / viewers,
+        );
+        let want = dps * iv;
+        for (i, v) in per_tick.iter().enumerate() {
+            assert!(
+                (v - want).abs() < 0.5,
+                "tick {i} carried {v}, expected dps({dps}) x interval({iv}) = {want} — \
+                 every tick of a channel is the same size",
+            );
+        }
+
+        // And the channel must be DONE by its shipped length: nothing may still be
+        // owed once `channelMaxLength` has passed.
+        assert!(
+            combat.channels.is_empty(),
+            "{} channel(s) still owed ticks after channelMaxLength elapsed",
+            combat.channels.len(),
         );
     }
 
@@ -3727,7 +3908,13 @@ mod tests {
     fn report31_frostbite_lands_the_frozen_status() {
         let now = Instant::now();
         let mut combat = make_prod_scale_combat(now);
-        let out = cast_frostbite(&mut combat, now);
+        let mut out = cast_frostbite(&mut combat, now);
+        // Frozen is the ELEMENTAL-STATUS accumulator crossing 25% of the target's max
+        // HP. A lump crossed it on the cast frame; a stream has to build up to it, so
+        // the channel must actually run. That is the retail shape: s615 casts at
+        // 21:00:19 / 21:00:32 land op51 Frozen at 21:00:20 / 21:00:33 — about a second
+        // IN, not on the cast.
+        out.extend(run_channel(&mut combat, now));
 
         let frozen: Vec<_> = out
             .iter()
