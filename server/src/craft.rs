@@ -27,7 +27,7 @@ use actix_web::{
 };
 use blades_lib::economy::{RewardGrant, RewardItem, apply_reward, remove_backpack_item};
 use blades_lib::server_state::CraftJob;
-use blades_lib::static_data::ItemModRecipe;
+use blades_lib::static_data::{CraftResultShape, ItemModRecipe};
 use blades_lib::user_data::{
     CompleteCharacterWithIdWithoutData, CompleteInventoryUpdate, CompleteWallet,
     InventoryChangeTracker, Item, ItemPropertiesAll,
@@ -445,6 +445,10 @@ pub async fn finish_craft(
 ///     Alchemy when its recipe was not one of the ~34 captured ones, so the live DB
 ///     holds forge crafts (Iron Hand Axe, Iron Greatsword, Dragonbone Longsword, …)
 ///     stored as ALCHEMY jobs. They load fine and name the wrong bench forever.
+///     **Correcting one of these is only safe when the corrected record is still a
+///     record retail could have emitted** — see [`reconcile_type_with_results`]. It
+///     was not, and shipping the correction hung the loading screen for every player
+///     holding such a row.
 ///
 /// All three are repaired here with the SAME resolution order the create path uses,
 /// and only from mappings that already exist in the extracted game data: the APK's
@@ -491,7 +495,7 @@ fn repaired_craft_fields<'a>(
     let known_recipe = static_data.recipes.get(&job.recipe_id);
     let smith_craftable = static_data.smith_craftables.resolve(&job.recipe_id);
 
-    let crafting_type_id = if crafting_type_is_mislabelled {
+    let candidate_crafting_type = if crafting_type_is_mislabelled {
         from_apk.expect("mislabelled implies the APK has an answer")
     } else if !crafting_type_is_unmappable {
         job.crafting_type_id
@@ -524,7 +528,107 @@ fn repaired_craft_fields<'a>(
         Cow::Owned(serde_json::json!({ "stackableItems": { job.recipe_id.to_string(): 1 } }))
     };
 
-    (crafting_type_id, results)
+    reconcile_type_with_results(
+        job,
+        candidate_crafting_type,
+        results,
+        static_data,
+        crafting_type_is_unmappable,
+    )
+}
+
+/// The shape of a `results` object as it will go on the wire, or `None` when it is
+/// empty / neither shape (the caller then has nothing to check against).
+fn observed_result_shape(results: &Value) -> Option<CraftResultShape> {
+    let obj = results.as_object()?;
+    if obj.get("items").and_then(Value::as_array).map_or(false, |a| !a.is_empty()) {
+        return Some(CraftResultShape::Instanced);
+    }
+    if obj
+        .get("stackableItems")
+        .and_then(Value::as_object)
+        .map_or(false, |m| !m.is_empty())
+    {
+        return Some(CraftResultShape::Stackable);
+    }
+    None
+}
+
+/// Refuse to emit a `(craftingTypeId, results)` pair that retail never emitted.
+///
+/// ## Why this exists
+///
+/// `craftingTypeId` does not merely *name a bench for the UI*. The client binds the
+/// job to the `CraftingStation` of that type and then restores the station's
+/// in-progress craft FROM `results` — and each station knows only one result shape.
+/// The captures are unambiguous (482/482 retail craft records, see
+/// [`blades_lib::static_data::RecipeCraftingTypes::result_shape_of_type`]): Smithing,
+/// Tempering and Enchanting always carry `results.items`; Alchemy and
+/// DecorationCrafting always carry `results.stackableItems`.
+///
+/// Report #35 relabelled a "mappable but wrong" stored type from the APK table and
+/// deliberately left `results` alone ("only the bench changes"). For the eleven live
+/// forge crafts stored as Alchemy that meant emitting **Smithing + `stackableItems`**,
+/// a pair that appears nowhere in retail. The affected characters stalled in loading
+/// pass 2 with `town_level == -1`: the same stall site as report #34, reached a
+/// different way. As Alchemy those rows were inert — the Forge (building type
+/// `26fdb92f-…`, whose stations are Smithing / Tempering / Repair / Salvaging) has no
+/// Alchemy station for them to bind to — so relabelling them is what *activated* a
+/// malformed record that had been harmlessly ignored for weeks.
+///
+/// ## The rule
+///
+/// If the type we are about to emit expects a different result shape than the results
+/// we actually have, the type loses, not the results — we can always fabricate a
+/// plausible bench NAME, but we cannot fabricate the item a Smithing station wants
+/// (`smith_craftables.json` resolves none of the live forge recipes, and the recipe id
+/// is not an `itemTemplateId`: `items.json` has no entry for `b949b05f-…`). So:
+///
+///   * stored type still **mappable** → keep it. Wrong bench name, working game. This
+///     is exactly what production has been serving, and it loads.
+///   * stored type **unmappable** (report #34 — it cannot be served at all) → pick a
+///     mappable type whose shape matches the results we have, which is what the
+///     pre-table build did and what unblocked #34 in the first place.
+///
+/// The cost is cosmetic and bounded: some forge crafts keep saying "Alchemy". Naming
+/// them correctly needs a recipe→`itemTemplateId` mapping so the results can be
+/// rebuilt into `items` alongside the relabel; that is a data-extraction change, not
+/// something to guess at here.
+///
+/// With no table loaded `result_shape_of_type` returns `None` and this is a no-op, so
+/// the gate can never make an un-tabled deployment worse.
+fn reconcile_type_with_results<'a>(
+    job: &'a CraftJob,
+    candidate: Uuid,
+    results: Cow<'a, Value>,
+    static_data: &blades_lib::static_data::StaticData,
+    stored_type_is_unmappable: bool,
+) -> (Uuid, Cow<'a, Value>) {
+    let (Some(wanted), Some(have)) = (
+        static_data.recipe_crafting_types.result_shape_of_type(&candidate),
+        observed_result_shape(&results),
+    ) else {
+        return (candidate, results);
+    };
+    if wanted == have {
+        return (candidate, results);
+    }
+
+    if !stored_type_is_unmappable {
+        // A real CraftingType is already stored; the only thing wrong with it is the
+        // name. Leave it — the player loads.
+        return (job.crafting_type_id, results);
+    }
+
+    // The stored type cannot be served at all, so something must be chosen. Choose one
+    // that matches the results, rather than one that matches the recipe.
+    let fallback = match have {
+        CraftResultShape::Stackable => derive_plain_craft_type(job.building_id, static_data),
+        // Not observed in production (an instanced result under a stackable-producing
+        // type), but the same rule applies in the mirror direction.
+        CraftResultShape::Instanced => smithing_crafting_type(static_data),
+    };
+    (fallback, results)
 }
 
 /// The bench a recipe belongs to, from the APK-extracted `recipe_crafting_types.json`
@@ -1136,6 +1240,120 @@ mod tests {
         .unwrap()
     }
 
+    /// The forge recipes sitting in production `craftJobs` labelled Alchemy, with the
+    /// stackable approximation as their results (owner character
+    /// `5d1a3b4c-…-98e7e367beb7` holds twelve such rows across five of them; character
+    /// `30581f3e-…` holds the sixth).
+    const LIVE_FORGE_RECIPES_STORED_AS_ALCHEMY: [(&str, &str); 6] = [
+        ("Iron Hand Axe", "b949b05f-2e46-4a0c-80e4-171c4aecb9e5"),
+        ("Iron Light Hammer", "38671302-f4f1-4357-aef9-5f57972c423d"),
+        ("Iron Dagger", "a57591a0-9354-411b-862a-5449dfbd335b"),
+        ("Iron Greatsword", "5fe0e868-957e-47c2-a094-9c1daad097d5"),
+        ("Iron Warhammer", "7ad4e3a0-49b0-4c2f-9a94-6158acbb51d9"),
+        ("Dragonbone Longsword", "668a077b-2a2e-477b-894d-cb0878fa7dd3"),
+    ];
+
+    /// The owner's forge row, verbatim: Alchemy in the `craftingTypeId` slot, the
+    /// unknown-recipe stackable approximation in `results`, and the FORGE building
+    /// (`105c24bf-…`, building type `26fdb92f-…`) it was actually crafted at.
+    fn live_forge_row(recipe_id: Uuid, recipe_str: &str) -> CraftJob {
+        CraftJob {
+            id: Uuid::from_u128(0xF0),
+            recipe_id,
+            building_id: Uuid::parse_str("105c24bf-9e16-4cbb-bddd-514ad0b23e0e").unwrap(),
+            crafting_type_id: Uuid::parse_str(ALCHEMY_CRAFTING_TYPE_ID).unwrap(),
+            completed_at_ms: 1_785_999_240_168,
+            results: serde_json::json!({"stackableItems": { recipe_str: 1 }}),
+        }
+    }
+
+    /// Every distinct `(recipeId, craftingTypeId, results)` shape in production
+    /// `craftJobs`, read off arena PG on 2026-08-20 (19 rows, 8 distinct shapes,
+    /// 6 characters). This is the set the table has to survive contact with.
+    fn live_craft_rows() -> Vec<(&'static str, CraftJob)> {
+        let alchemy = Uuid::parse_str(ALCHEMY_CRAFTING_TYPE_ID).unwrap();
+        let mut rows: Vec<(&'static str, CraftJob)> = LIVE_FORGE_RECIPES_STORED_AS_ALCHEMY
+            .iter()
+            .map(|(name, id)| (*name, live_forge_row(Uuid::parse_str(id).unwrap(), id)))
+            .collect();
+
+        // N'wah: an alchemy recipe stored as Alchemy — the table agrees, nothing to do.
+        let potion = "7a8600f2-24af-4a8e-8615-bc4d036825f3";
+        rows.push((
+            "Solution of Resist Fire (Alchemy, agrees)",
+            CraftJob {
+                id: Uuid::from_u128(0xF3),
+                recipe_id: Uuid::parse_str(potion).unwrap(),
+                building_id: Uuid::parse_str("faab4865-1657-484e-89e6-295fd0d0260f").unwrap(),
+                crafting_type_id: alchemy,
+                completed_at_ms: 1_785_038_215_000,
+                results: serde_json::json!({"stackableItems": { potion: 1 }}),
+            },
+        ));
+        // RonnieRaider (report #34) — the two unmappable rows and the healthy third.
+        rows.push(("report #34 alchemy row", poisoned_alchemy_job()));
+        rows.push(("report #34 forge row", poisoned_smith_job()));
+        rows.push(("report #34 healthy row", healthy_alchemy_job()));
+        // The Trickster: a stored Enchanting with the mutated item — must be untouched.
+        rows.push((
+            "stored enchant with instanced results",
+            CraftJob {
+                id: Uuid::from_u128(0xF4),
+                recipe_id: Uuid::parse_str("a4dfdf4f-cf18-4be5-b706-91aadb0c1bea").unwrap(),
+                building_id: Uuid::parse_str("26f35cbd-080c-4360-95d4-958797076ddc").unwrap(),
+                crafting_type_id: item_mod_crafting_type(0),
+                completed_at_ms: 1_782_775_391_000,
+                results: serde_json::json!({"items":[{
+                    "id": "066a599a-d6dd-40cf-b336-e4ea87e6e4ab",
+                    "itemTemplateId": "dc2c3bd9-fb5a-4203-ad29-30c9d1724b75",
+                    "temperingLevel": 0, "durability": 100.0
+                }]}),
+            },
+        ));
+        // WolfWalker: an UNMAPPABLE temper row that DOES carry its mutated item, so the
+        // table's answer (Tempering) is both right and shapeable.
+        rows.push((
+            "unmappable temper with instanced results",
+            CraftJob {
+                id: Uuid::from_u128(0xF5),
+                recipe_id: Uuid::parse_str("308f8752-518e-4e50-a5ce-12b20a4f871f").unwrap(),
+                building_id: Uuid::parse_str("0e73f481-9efa-4dc8-a66b-46da95ff76ee").unwrap(),
+                crafting_type_id: Uuid::parse_str("308f8752-518e-4e50-a5ce-12b20a4f871f").unwrap(),
+                completed_at_ms: 1_782_511_435_000,
+                results: serde_json::json!({"items":[{
+                    "id": "a3891cfd-b131-48c1-a48a-4a6032b24f9d",
+                    "itemTemplateId": "73c9bef2-2c2d-4a49-843c-a973fb7c3ee6",
+                    "temperingLevel": 1, "durability": 100.0
+                }]}),
+            },
+        ));
+        rows
+    }
+
+    /// The invariant the pre-existing tests were missing: a serialized craft record's
+    /// `craftingTypeId` and `results` must be a pair retail actually emitted. Checking
+    /// that `craftingTypeId` is merely *mappable* is not enough — a mappable type
+    /// bound to the wrong result shape stalls the town build just as dead.
+    fn assert_shape_consistent(
+        label: &str,
+        wire: &Value,
+        sd: &blades_lib::static_data::StaticData,
+    ) {
+        let ctid = Uuid::parse_str(wire["craftingTypeId"].as_str().unwrap()).unwrap();
+        let wanted = sd
+            .recipe_crafting_types
+            .result_shape_of_type(&ctid)
+            .unwrap_or_else(|| panic!("{label}: emitted craftingTypeId {ctid} is not a CraftingType"));
+        let have = observed_result_shape(&wire["results"])
+            .unwrap_or_else(|| panic!("{label}: emitted results have no recognisable shape"));
+        assert_eq!(
+            wanted, have,
+            "{label}: retail never pairs {ctid} with {:?} results — this is the shape \
+             that stalls loading pass 2 at town_level -1",
+            have
+        );
+    }
+
     /// The Alchemy leg: a stored job whose `craftingTypeId` is an ITEM uuid must be
     /// repaired to a real CraftingType before it reaches the client.
     #[test]
@@ -1264,31 +1482,50 @@ mod tests {
         crate::static_loader::load(&dir)
     }
 
-    /// Report #34's acceptance test. The Dragonbone War Axe craft
-    /// (`fd13cfa0-…-b3d08852f673`) is a FORGE craft; it must repair to the Smithing
-    /// bench, not to the Alchemy fallback.
+    /// Report #34's acceptance test, re-baselined.
+    ///
+    /// The Dragonbone War Axe craft (`fd13cfa0-…-b3d08852f673`) IS a forge craft and the
+    /// APK table says so — but its stored `results` are empty and neither
+    /// `recipes.json` nor `smith_craftables.json` can mint the axe, so the only result
+    /// this repair can build is the stackable approximation. A Smithing job carrying
+    /// `stackableItems` is a record retail never emitted (26/26 retail Smithing rows
+    /// carry `items`), and emitting it is what hung the loading screen. So the bench
+    /// follows the results: a mappable, shape-consistent Alchemy row, which is exactly
+    /// what unblocked report #34 before the table existed.
+    ///
+    /// Naming this row "Smithing" honestly requires a recipe -> itemTemplateId mapping
+    /// so `results` can be rebuilt as `items` at the same time. Until then the name is
+    /// wrong and the game loads, which is the right way round.
     #[test]
-    fn report_34_forge_craft_repairs_to_smithing_not_alchemy() {
+    fn report_34_forge_row_repairs_to_a_bench_whose_results_it_can_produce() {
         let sd = static_data_from_deploy();
         let job = poisoned_smith_job();
 
-        // The premise: this recipe is in NEITHER of the two tables the pre-table
-        // resolution order consulted, so nothing but the APK table can answer it.
+        // The premise: this recipe is in NEITHER of the two tables that could mint the
+        // real item, so the repair cannot produce an instanced result for it.
         assert!(sd.recipes.get(&job.recipe_id).is_none(), "not a captured recipe");
         assert!(
             sd.smith_craftables.resolve(&job.recipe_id).is_none(),
             "not a resolvable smith craftable"
+        );
+        // …while the table does know the bench, which is what makes this the tempting
+        // and wrong relabel.
+        assert_eq!(
+            apk_crafting_type(&job.recipe_id, &sd).map(|u| u.to_string()).as_deref(),
+            Some(SMITHING_CRAFTING_TYPE_ID),
+            "the APK table says Smithing"
         );
 
         let wire = wire_of(&job, &sd);
         let ctid = wire["craftingTypeId"].as_str().unwrap();
         assert_ne!(ctid, wire["recipeId"].as_str().unwrap(), "must never echo the recipe id");
         assert_ne!(
-            ctid, ALCHEMY_CRAFTING_TYPE_ID,
-            "a forge craft must not be reported as an Alchemy craft — it unblocks the \
-             loading screen but names the wrong bench to the player"
+            ctid, SMITHING_CRAFTING_TYPE_ID,
+            "a Smithing job may not carry stackable results — retail never emits that \
+             pair and the client stalls the town build on it"
         );
-        assert_eq!(ctid, SMITHING_CRAFTING_TYPE_ID, "Dragonbone War Axe is forged at the Smithy");
+        assert_eq!(ctid, ALCHEMY_CRAFTING_TYPE_ID, "a mappable bench that matches the results");
+        assert_shape_consistent("report #34 forge row", &wire, &sd);
     }
 
     /// Both report-#34 rows resolve from the table, each to its own bench — the alchemy
@@ -1310,29 +1547,40 @@ mod tests {
         );
     }
 
-    /// The table is not smithing-only: an un-captured ENCHANTING recipe must report the
-    /// Enchanter, where the alchemy fallback would have said Alchemist.
-    #[test]
-    fn an_uncaptured_enchanting_recipe_reports_the_enchanter() {
-        let sd = static_data_from_deploy();
+    /// An un-captured ENCHANTING recipe the capture never saw.
+    fn an_uncaptured_enchanting_recipe(sd: &blades_lib::static_data::StaticData) -> (Uuid, Uuid) {
         let enchanting = sd
             .recipe_crafting_types
             .type_by_name("Enchanting")
             .expect("Enchanting crafting type in the table");
-        // Any enchanting recipe the capture never saw.
         let (recipe_id, _) = sd
             .recipe_crafting_types
             .recipes
             .iter()
             .find(|(id, r)| r.crafting_type_id == enchanting && !sd.recipes.contains_key(id))
             .expect("an un-captured enchanting recipe exists");
+        (*recipe_id, enchanting)
+    }
+
+    /// The table is not smithing-only: an un-captured ENCHANTING recipe must report the
+    /// Enchanter, where the alchemy fallback would have said Alchemist. The job carries
+    /// the mutated item an enchant really stores (297/297 retail enchant rows carry
+    /// `items`), so naming the Enchanter produces a record retail could have emitted.
+    #[test]
+    fn an_uncaptured_enchanting_recipe_reports_the_enchanter() {
+        let sd = static_data_from_deploy();
+        let (recipe_id, enchanting) = an_uncaptured_enchanting_recipe(&sd);
         let job = CraftJob {
             id: Uuid::from_u128(0xE0),
-            recipe_id: *recipe_id,
+            recipe_id,
             building_id: Uuid::from_u128(0xB2),
-            crafting_type_id: *recipe_id, // poisoned exactly like report #34
+            crafting_type_id: recipe_id, // poisoned exactly like report #34
             completed_at_ms: 1_783_204_348_637,
-            results: serde_json::json!({}),
+            results: serde_json::json!({"items":[{
+                "id": "fad31819-b941-4446-a229-e22b3647b142",
+                "itemTemplateId": "616b64ef-4184-4efb-af55-1a3f122431dc",
+                "temperingLevel": 0, "durability": 100.0
+            }]}),
         };
         let wire = wire_of(&job, &sd);
         assert_eq!(
@@ -1340,6 +1588,35 @@ mod tests {
             enchanting.to_string(),
             "an enchanting recipe belongs to the Enchanter, not the Alchemist"
         );
+        assert_shape_consistent("uncaptured enchant", &wire, &sd);
+    }
+
+    /// …but the bench is only named when the record can be SHAPED like that bench's
+    /// craft. An enchant whose mutated item was never stored cannot be rebuilt (the
+    /// original item left the backpack), so an `items` result is unavailable and the
+    /// Enchanter cannot honestly be named. The repair must not paper over that with an
+    /// Enchanting job carrying `stackableItems` — the pair that stalls the town build.
+    #[test]
+    fn an_enchant_whose_results_cannot_be_rebuilt_does_not_claim_the_enchanter() {
+        let sd = static_data_from_deploy();
+        let (recipe_id, enchanting) = an_uncaptured_enchanting_recipe(&sd);
+        let job = CraftJob {
+            id: Uuid::from_u128(0xE1),
+            recipe_id,
+            building_id: Uuid::from_u128(0xB2),
+            crafting_type_id: recipe_id,
+            completed_at_ms: 1_783_204_348_637,
+            results: serde_json::json!({}),
+        };
+        let wire = wire_of(&job, &sd);
+        let ctid = wire["craftingTypeId"].as_str().unwrap();
+        assert_ne!(ctid, wire["recipeId"].as_str().unwrap(), "must never echo the recipe id");
+        assert_ne!(
+            ctid,
+            enchanting.to_string(),
+            "an Enchanting job may not carry stackable results"
+        );
+        assert_shape_consistent("un-rebuildable enchant", &wire, &sd);
     }
 
     /// The committed table covers everything the server already knew about, and agrees
@@ -1370,48 +1647,90 @@ mod tests {
         }
     }
 
-    /// The third defect the table exposes: a MAPPABLE but WRONG stored type. Every
-    /// craft written before the table fell back to Alchemy when its recipe was not one
-    /// of the ~34 captured ones, so the live DB holds forge crafts stored as ALCHEMY
-    /// jobs. They never hung the client — they just name the wrong bench forever.
-    ///
-    /// These six recipe ids are the ones actually sitting in production `craftJobs`
-    /// with `craftingTypeId = c9d3b3aa…` (Alchemy); all six are Smithing in the APK.
+    // ── The relabel that hung the town build ──────────────────────────────────
+    //
+    // Report #35 corrected a MAPPABLE but WRONG stored type from the APK table and
+    // left `results` alone, on the reasoning that such rows "never hung the client —
+    // they just name the wrong bench forever". The first half was true only for as
+    // long as the rows stayed labelled Alchemy.
+    //
+    // `craftingTypeId` binds the job to a CraftingStation, and each station restores
+    // its in-progress craft from `results` in the one shape it understands. In the
+    // retail captures the pairing is total and exceptionless (482/482 craft records):
+    // Smithing 26/26, Enchanting 297/297 and Tempering 51/51 carry `results.items`;
+    // Alchemy 100/100 and DecorationCrafting 8/8 carry `results.stackableItems`.
+    //
+    // The live forge rows carry the unknown-recipe approximation
+    // `{"stackableItems": {"<recipeId>": 1}}` — and the recipe id is not even an item
+    // template (`items.json` has no `b949b05f-…`). Relabelled to Smithing they became
+    // Smithing + stackableItems: a pair retail never emitted. As Alchemy they had been
+    // inert, because their building is the Forge (type `26fdb92f-…`, whose stations
+    // are Smithing / Tempering / Repair / Salvaging) and there is no Alchemy station
+    // there to bind them to. The relabel is what ACTIVATED a malformed record that had
+    // been harmlessly ignored, and loading pass 2 stalled with `town_level == -1`.
+
+    /// The six recipe ids actually sitting in production `craftJobs` with
+    /// `craftingTypeId = c9d3b3aa…` (Alchemy) and the stackable approximation as their
+    /// results. All six are Smithing in the APK, and none of them may be relabelled
+    /// while that is all the result we can offer.
     #[test]
-    fn a_forge_craft_stored_as_alchemy_is_relabelled_to_the_smithy() {
+    fn the_live_forge_rows_stored_as_alchemy_keep_the_bench_that_loads() {
         let sd = static_data_from_deploy();
         let alchemy = Uuid::parse_str(ALCHEMY_CRAFTING_TYPE_ID).unwrap();
         let smithing = Uuid::parse_str(SMITHING_CRAFTING_TYPE_ID).unwrap();
-        let live_forge_crafts_stored_as_alchemy = [
-            ("Iron Hand Axe", "b949b05f-2e46-4a0c-80e4-171c4aecb9e5"),
-            ("Iron Light Hammer", "38671302-f4f1-4357-aef9-5f57972c423d"),
-            ("Iron Dagger", "a57591a0-9354-411b-862a-5449dfbd335b"),
-            ("Iron Greatsword", "5fe0e868-957e-47c2-a094-9c1daad097d5"),
-            ("Iron Warhammer", "7ad4e3a0-49b0-4c2f-9a94-6158acbb51d9"),
-            ("Dragonbone Longsword", "668a077b-2a2e-477b-894d-cb0878fa7dd3"),
-        ];
-        for (name, id) in live_forge_crafts_stored_as_alchemy {
+        for (name, id) in LIVE_FORGE_RECIPES_STORED_AS_ALCHEMY {
             let recipe_id = Uuid::parse_str(id).unwrap();
             assert_eq!(
                 apk_crafting_type(&recipe_id, &sd),
                 Some(smithing),
                 "{name} is forged at the Smithy"
             );
+            assert!(
+                sd.smith_craftables.resolve(&recipe_id).is_none(),
+                "{name}: still unmintable, so a Smithing-shaped result is unavailable"
+            );
+            let job = live_forge_row(recipe_id, id);
+            let wire = wire_of(&job, &sd);
+            assert_eq!(
+                wire["craftingTypeId"].as_str().unwrap(),
+                alchemy.to_string(),
+                "{name}: relabelling this row to the Smithy stalls the town build — the \
+                 Smithing station cannot restore a stackable result"
+            );
+            assert_eq!(wire["results"], job.results, "results must not be touched either");
+            assert_shape_consistent(name, &wire, &sd);
+        }
+    }
+
+    /// The relabel is not abandoned — it is conditioned. The same six recipes, stored
+    /// as Alchemy but carrying the instanced result a forge craft really produces, are
+    /// still corrected to the Smithy: that record is one retail could have emitted, so
+    /// naming the right bench costs nothing.
+    #[test]
+    fn a_forge_craft_with_instanced_results_is_still_relabelled_to_the_smithy() {
+        let sd = static_data_from_deploy();
+        let alchemy = Uuid::parse_str(ALCHEMY_CRAFTING_TYPE_ID).unwrap();
+        for (name, id) in LIVE_FORGE_RECIPES_STORED_AS_ALCHEMY {
             let job = CraftJob {
                 id: Uuid::from_u128(0xF0),
-                recipe_id,
+                recipe_id: Uuid::parse_str(id).unwrap(),
                 building_id: Uuid::from_u128(0xB4),
-                crafting_type_id: alchemy, // what the pre-table create path stored
+                crafting_type_id: alchemy,
                 completed_at_ms: 1_783_204_348_637,
-                results: serde_json::json!({"stackableItems": { id: 1 }}),
+                results: serde_json::json!({"items":[{
+                    "id": "6f2b8f66-2c0a-4a2f-9f9f-1d5d3b7a1f11",
+                    "itemTemplateId": "606c8bf6-9dc7-4c5f-b44b-36eb02306c96",
+                    "temperingLevel": 0, "durability": 150.0
+                }]}),
             };
             let wire = wire_of(&job, &sd);
             assert_eq!(
                 wire["craftingTypeId"].as_str().unwrap(),
                 SMITHING_CRAFTING_TYPE_ID,
-                "{name}: a forge craft stored as Alchemy must be relabelled"
+                "{name}: a forge craft that CAN be shaped like one names the Smithy"
             );
-            assert_eq!(wire["results"], job.results, "a mislabel must not touch the results");
+            assert_eq!(wire["results"], job.results, "a safe relabel still leaves results alone");
+            assert_shape_consistent(name, &wire, &sd);
         }
     }
 
@@ -1442,6 +1761,91 @@ mod tests {
                 wire["craftingTypeId"].as_str().unwrap(),
                 stored.to_string(),
                 "a stored mod-craft type must survive (temperingLevel is not in the table)"
+            );
+        }
+    }
+
+    /// The regression net. Every distinct craft row in production, through the real
+    /// loaded static data, asserting the whole emission contract at once: mappable
+    /// CraftingType, non-empty grantable results, AND the two of them paired the way
+    /// retail paired them.
+    ///
+    /// The last clause is the one that was missing. `#35` shipped with its own live-row
+    /// test — the same six recipes, the same stackable results — and it passed, because
+    /// it asserted only that the type had been rewritten to Smithing. It even pinned
+    /// the defect as intended behaviour: `assert_eq!(wire["results"], job.results, "a
+    /// mislabel must not touch the results")`. The oracle came from report #34's
+    /// post-mortem ("an UNMAPPABLE craftingTypeId hangs") and was never widened to the
+    /// real invariant, which is that the client must be handed a record it has seen
+    /// the shape of before.
+    #[test]
+    fn no_emitted_craft_record_pairs_a_type_with_results_retail_never_paired() {
+        let sd = static_data_from_deploy();
+        for (label, job) in live_craft_rows() {
+            let wire = wire_of(&job, &sd);
+            assert_ne!(
+                wire["craftingTypeId"], wire["recipeId"],
+                "{label}: craftingTypeId == recipeId"
+            );
+            assert_ne!(
+                wire["craftingTypeId"].as_str().unwrap(),
+                Uuid::nil().to_string(),
+                "{label}: craftingTypeId is nil"
+            );
+            let results = &wire["results"];
+            assert!(
+                results.is_object() && !results.as_object().unwrap().is_empty(),
+                "{label}: empty results"
+            );
+            assert_shape_consistent(label, &wire, &sd);
+        }
+    }
+
+    /// `finish` runs the same repair, so a row that cannot be relabelled safely must
+    /// still grant something. Pins that the shape gate did not reintroduce the empty
+    /// grant report #34's second half was about.
+    #[test]
+    fn every_live_row_still_grants_something_on_finish() {
+        let sd = static_data_from_deploy();
+        for (label, job) in live_craft_rows() {
+            let (_, results) = repaired_craft_fields(&job, &sd);
+            let reward = reward_from_results(&results);
+            assert!(
+                !reward.items.is_empty() || !reward.stackable_items.is_empty(),
+                "{label}: finish would grant nothing"
+            );
+        }
+    }
+
+    /// The classification behind the gate, pinned against what the captures show, so a
+    /// re-extraction that renames or adds a CraftingType fails here rather than in
+    /// someone's loading screen.
+    #[test]
+    fn every_crafting_type_classifies_as_the_captures_show_it() {
+        let sd = static_data_from_deploy();
+        let expected = [
+            ("Smithing", CraftResultShape::Instanced),
+            ("Tempering", CraftResultShape::Instanced),
+            ("Enchanting", CraftResultShape::Instanced),
+            ("Repairing", CraftResultShape::Instanced),
+            ("Salvaging", CraftResultShape::Instanced),
+            ("Alchemy", CraftResultShape::Stackable),
+            ("DecorationCrafting", CraftResultShape::Stackable),
+        ];
+        assert_eq!(
+            expected.len(),
+            sd.recipe_crafting_types.crafting_types.len(),
+            "a CraftingType was added or removed — classify it before shipping"
+        );
+        for (name, shape) in expected {
+            let id = sd
+                .recipe_crafting_types
+                .type_by_name(name)
+                .unwrap_or_else(|| panic!("{name} missing from the table"));
+            assert_eq!(
+                sd.recipe_crafting_types.result_shape_of_type(&id),
+                Some(shape),
+                "{name} classified against the captured result shape"
             );
         }
     }
