@@ -2966,6 +2966,76 @@ pub(in crate::arena::combat) mod tests {
         });
     }
 
+    /// A gmid-46 `PlayerCombatInputActivate` carrying `_isWithinBlockZone` — the
+    /// ONLY way a real client raises a guard. Mirrors `roundtrip_s506::act_frame_zone`,
+    /// kept local because that module is private.
+    #[cfg(test)]
+    fn zone_frame(held: bool, block_zone: bool) -> Vec<u8> {
+        let mut w = arena_proto::NetDataWriter::new();
+        w.int(0, 565)
+            .byte(1, 56)
+            .byte(2, 3)
+            .byte(3, 46)
+            .bool(4, held)
+            .float(5, 0.0)
+            .bool(6, block_zone);
+        let mut f = crate::arena::combat::messages::frame_for_test(w.finish());
+        f[0] = 0x84;
+        f
+    }
+
+    /// THE PRODUCTION PATH: a guard raised the way a real client raises one, held
+    /// for a realistic time, then swung into.
+    ///
+    /// Every existing high-block test raises the guard by writing
+    /// `actor_state`/`blocking_side`/`blocking_until`/`block_raised_at` directly
+    /// (`resolve::report_31_high_block_stun::raise_guard`). That skips `on_c2s`, and
+    /// with it the only question that matters in play: how long has the guard been up
+    /// when the swing lands?
+    ///
+    /// `block_phase` returns Optimal only while `held < BLOCK_OPTIMAL_TIME_SECS`
+    /// (2.0 s), and a block-zone press sets `blocking_until = now + BLOCK_LEAK_GUARD`
+    /// (8 s). A player who presses block and waits — the normal way anyone plays —
+    /// is therefore LATE from 2 s onward, and a late block does not stun.
+    ///
+    /// Retail disagrees sharply: across session 615, genuinely blocked hits split
+    /// **292 optimal to 15 late**. Optimal is the ordinary case there, not a timing
+    /// feat. This test pins the discrepancy so it is measured rather than argued.
+    #[test]
+    fn a_held_guard_raised_through_the_real_input_path() {
+        use crate::arena::combat::state::{ActorStateType, BlockPhase};
+        let (mut m, _t0, live) = live_inst_at(2);
+
+        // Slot 0 presses block exactly as the client does.
+        let press = live + Duration::from_millis(100);
+        m.on_c2s(0, &zone_frame(true, true), press);
+        assert_eq!(
+            m.combat.fighters[0].actor_state(),
+            ActorStateType::Blocking,
+            "the block-zone press must raise the guard"
+        );
+
+        // Immediately: Optimal.
+        assert_eq!(
+            m.combat.fighters[0].block_phase(press + Duration::from_millis(300)),
+            Some(BlockPhase::Optimal),
+            "a freshly raised guard is Optimal"
+        );
+
+        // Still holding 2.5 s later — the guard is still UP (the 8 s leak guard has
+        // not expired), but the phase has decayed to Late.
+        let later = press + Duration::from_millis(2500);
+        assert!(
+            m.combat.fighters[0].blocking_until.is_some_and(|u| later < u),
+            "the guard is still up at +2.5 s"
+        );
+        assert_eq!(
+            m.combat.fighters[0].block_phase(later),
+            Some(BlockPhase::Late),
+            "a guard HELD for 2.5 s decays to Late — this is why holding block never stuns"
+        );
+    }
+
     /// Two ghosts, one frozen: STAMINA must stop regenerating for the duration.
     ///
     /// Measured in retail, session 615 actor 431, from the packed pools carried on
