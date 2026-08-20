@@ -308,8 +308,9 @@ async fn load_loadout(db: &Option<DbPool>, user_id: Uuid) -> crate::arena::comba
 /// The profile MUST include `data.customization` (the opponent's avatar visual) or the
 /// client's resource-load hangs at "Connecting"; `build_profile_character_json` also
 /// trims it to retail's exact schema (dropping keys retail never sends, which the
-/// client's deserializer would reject). `equippedItems` shape still diverges slightly
-/// from retail (missing per-item `grade`/`arcaneTier`) — a separate data-model follow-up.
+/// client's deserializer would reject). `equippedItems` now carries retail's per-item
+/// `grade` and `arcaneTier` (`Item`), both omitted when absent so an item that has
+/// neither serializes byte-identically to before they were modelled.
 fn loadout_from_row(
     r: &CharacterDbEntryCharacterWalletInventory,
 ) -> crate::arena::combat::Loadout {

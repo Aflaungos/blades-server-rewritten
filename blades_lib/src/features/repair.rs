@@ -384,6 +384,8 @@ mod tests {
             item_template_id: template,
             tempering_level: temper,
             durability,
+            grade: None,
+            arcane_tier: None,
             properties: ItemPropertiesAll::default(),
         }
     }

@@ -137,6 +137,10 @@ async fn create_characters(
                 durability: 75.0,
                 tempering_level: 0,
                 properties: ItemPropertiesAll::default(),
+                // Starter gear: retail's own starter loadout carries neither key, and
+                // both are omitted-when-absent on the wire (see `Item`).
+                grade: None,
+                arcane_tier: None,
             },
         },
     );
@@ -152,6 +156,10 @@ async fn create_characters(
                 tempering_level: 0,
                 durability: 100.0,
                 properties: ItemPropertiesAll::default(),
+                // Starter gear: retail's own starter loadout carries neither key, and
+                // both are omitted-when-absent on the wire (see `Item`).
+                grade: None,
+                arcane_tier: None,
             },
         },
     );
@@ -167,6 +175,10 @@ async fn create_characters(
                 durability: 0.0,
                 tempering_level: 0,
                 properties: ItemPropertiesAll::default(),
+                // Starter gear: retail's own starter loadout carries neither key, and
+                // both are omitted-when-absent on the wire (see `Item`).
+                grade: None,
+                arcane_tier: None,
             },
         },
     );
@@ -182,6 +194,10 @@ async fn create_characters(
                 tempering_level: 0,
                 durability: 0.0,
                 properties: ItemPropertiesAll::default(),
+                // Starter gear: retail's own starter loadout carries neither key, and
+                // both are omitted-when-absent on the wire (see `Item`).
+                grade: None,
+                arcane_tier: None,
             },
         },
     );

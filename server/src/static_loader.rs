@@ -217,4 +217,49 @@ mod tests {
             "quests_daily.json levelScaling"
         );
     }
+
+    /// The capture-derived `global_shop_grants.json` carries retail's per-item `grade`
+    /// and `arcaneTier`, and until `Item` had fields for them serde threw both on the
+    /// floor on load — silently, because `Item` cannot use `deny_unknown_fields` (it is
+    /// `flatten`ed by `RewardItem`). The file was right; the struct was lossy.
+    ///
+    /// This asserts against the REAL committed file rather than a fixture, so it fails if
+    /// the fields are removed from `Item`, if the flatten path stops carrying them, or if
+    /// a future re-extraction drops them from the data.
+    #[test]
+    fn committed_grants_keep_retail_grade_and_arcane_tier() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../deploy/static");
+        let sd = load(&dir);
+
+        let graded = sd
+            .global_shop_grants
+            .values()
+            .flat_map(|g| &g.items)
+            .filter(|i| i.item.grade.is_some())
+            .count();
+        let arcane = sd
+            .global_shop_grants
+            .values()
+            .flat_map(|g| &g.items)
+            .filter(|i| i.item.arcane_tier.is_some())
+            .count();
+        // Counts as committed at the time of writing. They are lower bounds: a
+        // re-extraction may add more, but going DOWN means the plumbing broke.
+        assert!(graded >= 8, "global_shop_grants.json lost item grades (found {graded})");
+        assert!(arcane >= 19, "global_shop_grants.json lost item arcaneTiers (found {arcane})");
+
+        // The one grant that carries BOTH, pinned by id so the values are checked and not
+        // just counted.
+        let id: Uuid = "79995d29-eac2-49a3-bfec-ce9e547b98de".parse().unwrap();
+        let grant = sd.global_shop_grants.get(&id).expect("grant 79995d29 present");
+        let item = grant
+            .items
+            .iter()
+            .find(|i| i.item.grade.is_some())
+            .expect("grant 79995d29 has a graded item");
+        assert_eq!(item.item.grade, Some(4), "grant 79995d29 item grade");
+        assert_eq!(item.item.arcane_tier, Some(2), "grant 79995d29 item arcaneTier");
+        // Retail's graded items carry GRADING affixes and no tempering/durability.
+        assert!(!item.item.properties.grading.is_empty(), "graded item keeps its GRADING affixes");
+    }
 }

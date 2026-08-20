@@ -142,8 +142,9 @@ pub struct Recipe {
 pub struct EnchantOutcome {
     #[serde(default)]
     pub enchanting: Vec<ItemSingleProperty>,
-    /// Arcane tier the item ends at. Not modelled on [`crate::user_data::Item`] (the
-    /// server drops `arcaneTier` for every item), kept here for completeness.
+    /// Arcane tier the item ends at, applied to [`crate::user_data::Item::arcane_tier`]
+    /// by the enchant branch of `apply_item_mod`. `None` leaves the item without one —
+    /// retail omits the key rather than sending `arcaneTier: 0`.
     #[serde(default)]
     pub arcane_tier: Option<u64>,
 }
