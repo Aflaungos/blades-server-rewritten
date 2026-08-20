@@ -579,6 +579,8 @@ mod tests {
             item_template_id: TPL,
             tempering_level: temper,
             durability: 100.0,
+            grade: None,
+            arcane_tier: None,
             properties: ItemPropertiesAll {
                 enchanting: enchants
                     .iter()

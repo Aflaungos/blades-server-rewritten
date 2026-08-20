@@ -13,7 +13,8 @@
 //! and re-added (mutated) by `/finish`. `temperingLevel > 0` tempers (sets the level,
 //! keeping existing enchants); otherwise it enchants — applying one of the recipe's
 //! observed `ENCHANTING` outcomes (`item_mod_recipes.json`), picked deterministically per
-//! item. `arcaneTier` is not modelled on `Item` (the server drops it for every item).
+//! item, whose `arcaneTier` is then stamped onto the item (retail's enchanted items
+//! carry the tier they end at; `Item::arcane_tier` holds it, absent staying absent).
 
 use std::{
     borrow::Cow,
@@ -710,11 +711,19 @@ const SMITH_MINT_DURABILITY: f64 = 150.0;
 /// Mint a smith craftable into a well-formed `{"items":[...]}` results object: a fresh
 /// instanced item at the craftable's `itemTemplateId`, with the requested `temperingLevel`
 /// and full durability — mirroring how a known smithing recipe's result is shaped
-/// (`{id, itemTemplateId, temperingLevel, durability}`). The `gradeIndex` is intrinsic to
-/// the chosen `itemTemplateId` (each material+grade is a distinct client template), so it
-/// is not a separate wire field; grade-specific `GRADING` affix property UUIDs are not in
-/// this config, so no (malformed) synthetic grading is attached. A unique id is minted now
-/// so repeated crafts of the same template never collide when `finish` preserves the id.
+/// (`{id, itemTemplateId, temperingLevel, durability}`). Grade-specific `GRADING` affix
+/// property UUIDs are not in this config, so no (malformed) synthetic grading is attached.
+/// A unique id is minted now so repeated crafts of the same template never collide when
+/// `finish` preserves the id.
+///
+/// DELIBERATELY still emits no `grade`, and the older claim that grade "is not a separate
+/// wire field" was wrong: retail plainly sends a per-item `grade` (32 of the 131 instanced
+/// items in `reference/capture-599.jsonl` carry one), and `Item` now models it. What is
+/// still missing is the MAPPING. `smith_craftables.json`'s `gradeIndex` runs 0..=8 across
+/// its 137 entries while every observed wire `grade` is 1..=6, so they are on different
+/// scales and equating them would stamp values retail never emitted onto forge output —
+/// worse than omitting the key, which at least matches the pre-existing shape. Resolving
+/// this needs either a captured forge result carrying both, or the client's grade table.
 fn mint_smith_craftable(craftable: &blades_lib::static_data::SmithCraftable, tempering_level: u64) -> Value {
     serde_json::json!({
         "items": [{
@@ -798,6 +807,11 @@ fn apply_item_mod(
         if !rec.outcomes.is_empty() {
             let idx = (item_id.as_u128() % rec.outcomes.len() as u128) as usize;
             item.properties.enchanting = rec.outcomes[idx].enchanting.clone();
+            // The captured outcome carries the arcane tier the item ENDS at, and it was
+            // parsed into `EnchantOutcome::arcane_tier` all along — there was simply no
+            // field on `Item` to assign it to, so every enchant produced an item retail
+            // would have stamped with an arcaneTier and we returned without one.
+            item.arcane_tier = rec.outcomes[idx].arcane_tier;
         }
     }
     item
@@ -839,9 +853,23 @@ fn reward_from_results(results: &Value) -> RewardGrant {
                 .and_then(|v| v.as_str())
                 .and_then(|s| s.parse::<Uuid>().ok())
                 .unwrap_or_else(Uuid::new_v4);
+            // `grade` / `arcaneTier` ride through VERBATIM, absent staying absent. Both
+            // are real captured keys in `recipes.json`'s results (5 grades, 6 arcane
+            // tiers) and were silently dropped here for as long as `Item` had no field
+            // to put them in — the craft handed the client back a rarer item than the
+            // capture said it was.
+            let grade = item_val.get("grade").and_then(|v| v.as_u64());
+            let arcane_tier = item_val.get("arcaneTier").and_then(|v| v.as_u64());
             reward.items.push(RewardItem {
                 id, // preserve the stored id (temper/enchant keep the item's own id)
-                item: Item { item_template_id: template_id, tempering_level, durability, properties },
+                item: Item {
+                    item_template_id: template_id,
+                    grade,
+                    tempering_level,
+                    durability,
+                    properties,
+                    arcane_tier,
+                },
             });
         }
     }
@@ -906,6 +934,8 @@ mod tests {
             item_template_id: Uuid::from_u128(0xABCD),
             tempering_level: tempering,
             durability: 300.0,
+            grade: None,
+            arcane_tier: None,
             properties: ItemPropertiesAll { enchanting: enchants, grading: vec![] },
         }
     }
@@ -939,6 +969,59 @@ mod tests {
         let out = apply_item_mod(&existing, 0, Some(&recipe), Uuid::from_u128(0x7));
         assert_eq!(out.properties.enchanting.len(), 3, "enchants applied from outcome");
         assert_eq!(out.tempering_level, 5, "tempering preserved on enchant");
+        // The outcome's arcane tier must land ON THE ITEM. This fixture already declared
+        // `arcane_tier: Some(2)` before the field existed on `Item`, so the value was
+        // parsed out of `item_mod_recipes.json` and then dropped: retail stamps an
+        // enchanted item with the tier it ends at, and we returned it bare.
+        assert_eq!(out.arcane_tier, Some(2), "enchant must stamp the outcome's arcaneTier");
+    }
+
+    /// An enchant outcome with NO arcane tier must leave the item without one, rather
+    /// than defaulting it to 0 — `arcaneTier: 0` is a value retail never sent.
+    #[test]
+    fn enchant_without_an_arcane_tier_leaves_the_item_bare() {
+        let existing = item_with(5, vec![]);
+        let recipe = enchant_recipe(vec![EnchantOutcome {
+            enchanting: vec![prop(0xAA)],
+            arcane_tier: None,
+        }]);
+        let out = apply_item_mod(&existing, 0, Some(&recipe), Uuid::from_u128(0x7));
+        assert_eq!(out.arcane_tier, None);
+        let j = serde_json::to_string(&out).unwrap();
+        assert!(!j.contains("arcaneTier"), "absent arcane tier must be omitted: {j}");
+    }
+
+    /// `reward_from_results` hand-rolls an `Item` out of the stored results `Value`, so it
+    /// is its own drop risk independent of the struct: a captured result carrying a grade
+    /// and an arcane tier must arrive with both. `recipes.json` really does carry these (5
+    /// grades, 6 arcane tiers), and every one of them was lost here.
+    #[test]
+    fn reward_from_results_carries_grade_and_arcane_tier() {
+        let results = serde_json::json!({
+            "items": [{
+                "id": "3ad24023-f66f-4ef4-8f96-63166533bce5",
+                "itemTemplateId": "9e0714d7-2a10-406d-a3eb-9b8ca95e14ad",
+                "grade": 4,
+                "arcaneTier": 2
+            }]
+        });
+        let reward = reward_from_results(&results);
+        assert_eq!(reward.items.len(), 1);
+        assert_eq!(reward.items[0].item.grade, Some(4), "grade lost in reward_from_results");
+        assert_eq!(reward.items[0].item.arcane_tier, Some(2), "arcaneTier lost in reward_from_results");
+
+        // A gear result with neither key stays bare (no invented zeros).
+        let plain = serde_json::json!({
+            "items": [{
+                "id": "3ad24023-f66f-4ef4-8f96-63166533bce5",
+                "itemTemplateId": "9e0714d7-2a10-406d-a3eb-9b8ca95e14ad",
+                "temperingLevel": 3,
+                "durability": 90.0
+            }]
+        });
+        let bare = reward_from_results(&plain);
+        assert_eq!(bare.items[0].item.grade, None);
+        assert_eq!(bare.items[0].item.arcane_tier, None);
     }
 
     #[test]

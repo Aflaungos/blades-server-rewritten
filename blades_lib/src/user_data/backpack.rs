@@ -88,6 +88,19 @@ pub struct ItemPropertiesAll {
 #[serde(rename_all = "camelCase")]
 pub struct Item {
     pub item_template_id: Uuid,
+    /// Jewelry's quality axis, retail's `grade`. Declared here because that is where
+    /// retail put it: the captured field order is `id, itemTemplateId, grade,
+    /// temperingLevel, durability, properties, arcaneTier, slot`.
+    ///
+    /// `Option` + `skip_serializing_if` is the FAITHFUL shape, not a convenience. Across
+    /// the 131 instanced items in the capture repo's `reference/capture-599.jsonl`,
+    /// `grade` and `temperingLevel`/`durability` never once co-occur: 32 items carry a
+    /// grade and no tempering/durability, 86 carry tempering/durability and no grade.
+    /// Retail omits the key entirely rather than sending `null` (not one explicit null in
+    /// the captures), so a plain `u64` would invent `"grade": 0` on every weapon and every
+    /// piece of armour — a shape retail never sent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grade: Option<u64>,
     // Defaulted so capture-derived reward items that omit them (special/consumable
     // items carrying only a grade) still deserialize; normal gear always sends them.
     #[serde(default)]
@@ -97,6 +110,16 @@ pub struct Item {
     //TODO: do not serialize if there is no property
     #[serde(default)]
     pub properties: ItemPropertiesAll,
+    /// Retail's `arcaneTier` — the enchant tier an item ends at. Orthogonal to `grade`:
+    /// unlike grade it rides on BOTH item kinds (in the captures 11 arcane items also
+    /// carry tempering/durability and 8 do not).
+    ///
+    /// Omitted-when-absent for the same reason as `grade`, and it matters more here: this
+    /// struct is serialized into the arena op54 round-start PROFILE
+    /// (`arena::matchmaker`'s `profile_equipped_json`), so an always-emitted key would
+    /// change the ENet wire for every item that has no arcane tier.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arcane_tier: Option<u64>,
 }
 
 generate_map_to_vec_serialization!(items_serde, Item, id);
@@ -438,5 +461,131 @@ mod wire_camelcase_tests {
         let tracker = LoadoutChangeTracker { consumables_changed: true, ..Default::default() };
         let changed = lo.generate_client_update(&tracker);
         assert_eq!(changed.equipped_consumables, Some(vec![uuid::Uuid::nil()]));
+    }
+}
+
+/// `grade` and `arcaneTier` — the two item keys retail always sent and we stored
+/// nowhere. 0 of 64 captured characters had either field anywhere in our data before
+/// this, so the client was handed items stripped of the axis that decides what they are:
+/// a grade-6 ring arrived indistinguishable from a grade-1 one.
+///
+/// Every fixture below is a VERBATIM item object from real pre-shutdown retail traffic
+/// (`reference/capture-599.jsonl` in the capture repo), not a hand-written guess.
+#[cfg(test)]
+mod item_grade_arcane_tier_tests {
+    use super::*;
+
+    /// One real equipped item, copied byte-for-byte out of the captures: a graded ring
+    /// that is ALSO enchanted, so it carries `grade`, `arcaneTier` and `ENCHANTING` at
+    /// once — and carries neither `temperingLevel` nor `durability`.
+    const RETAIL_GRADED_RING: &str = r#"{
+        "id": "3ad24023-f66f-4ef4-8f96-63166533bce5",
+        "slot": "58b6d121-2e23-4fa4-b892-c92ae2e2c4c5",
+        "itemTemplateId": "9e0714d7-2a10-406d-a3eb-9b8ca95e14ad",
+        "grade": 4,
+        "properties": { "ENCHANTING": [ { "id": "2fc55741-1c89-46cd-85e2-a8a27f6cea38", "tier": 1 } ] },
+        "arcaneTier": 2
+    }"#;
+
+    /// THE test that has to exist. It fails the moment either field stops being modelled
+    /// on `Item`: serde has no `deny_unknown_fields` here (it cannot have — `Item` is
+    /// `flatten`ed by `SingleEquippedItem`, `RewardItem` and the `items_serde` macro), so
+    /// a dropped field is not a parse ERROR, it is a SILENT discard. Reading the value
+    /// back out is the only thing that notices.
+    #[test]
+    fn retail_grade_and_arcane_tier_survive_the_flattened_round_trip() {
+        let eq: SingleEquippedItem = serde_json::from_str(RETAIL_GRADED_RING).unwrap();
+        assert_eq!(eq.item.grade, Some(4), "retail sent grade 4; we must keep it");
+        assert_eq!(eq.item.arcane_tier, Some(2), "retail sent arcaneTier 2; we must keep it");
+
+        // ...and hand them back on the wire under retail's exact camelCase keys.
+        let j = serde_json::to_string(&eq).unwrap();
+        assert!(j.contains(r#""grade":4"#), "grade must round-trip to the wire: {j}");
+        assert!(j.contains(r#""arcaneTier":2"#), "arcaneTier must round-trip: {j}");
+        assert!(!j.contains("arcane_tier"), "must be camelCase, not snake: {j}");
+    }
+
+    /// The same round-trip through `Items`, which serializes a map as an ARRAY via
+    /// `generate_map_to_vec_serialization!` — a different code path from the flatten
+    /// above, and the one `/inventories/current` actually uses for the backpack.
+    #[test]
+    fn grade_and_arcane_tier_survive_the_map_to_vec_backpack_path() {
+        let id = Uuid::from_u128(0x1234);
+        let mut items = Items::default();
+        items.0.insert(
+            id,
+            Item {
+                item_template_id: Uuid::from_u128(9),
+                grade: Some(6),
+                tempering_level: 0,
+                durability: 0.0,
+                properties: ItemPropertiesAll::default(),
+                arcane_tier: Some(1),
+            },
+        );
+        let j = serde_json::to_string(&items).unwrap();
+        assert!(j.contains(r#""grade":6"#), "backpack item lost its grade: {j}");
+        assert!(j.contains(r#""arcaneTier":1"#), "backpack item lost its arcaneTier: {j}");
+
+        let back: Items = serde_json::from_str(&j).unwrap();
+        assert_eq!(back.0[&id].grade, Some(6));
+        assert_eq!(back.0[&id].arcane_tier, Some(1));
+    }
+
+    /// Absent must stay ABSENT, never `"grade":0`. Retail omits the key — there is not a
+    /// single explicit null or zero-valued grade in the captures — and this struct feeds
+    /// the arena op54 round-start profile, so an always-emitted key would change the ENet
+    /// wire for every weapon and every piece of armour in the game.
+    ///
+    /// This is the assertion that fails if someone "simplifies" the fields to plain
+    /// `u64` + `#[serde(default)]`.
+    #[test]
+    fn ungraded_gear_stays_wire_identical_to_before() {
+        let gear = Item {
+            item_template_id: Uuid::from_u128(9),
+            grade: None,
+            tempering_level: 3,
+            durability: 75.0,
+            properties: ItemPropertiesAll::default(),
+            arcane_tier: None,
+        };
+        let j = serde_json::to_string(&gear).unwrap();
+        assert!(!j.contains("grade"), "absent grade must be omitted, not 0: {j}");
+        assert!(!j.contains("arcaneTier"), "absent arcaneTier must be omitted: {j}");
+        // The pre-existing keys are untouched.
+        assert!(j.contains(r#""temperingLevel":3"#), "{j}");
+        assert!(j.contains(r#""durability":75.0"#), "{j}");
+    }
+
+    /// Retail's item model has two mutually exclusive quality axes: `grade` (jewelry,
+    /// which cannot be tempered or broken) and `temperingLevel` + `durability` (gear).
+    /// Across the 131 instanced items in `capture-599.jsonl` they never co-occur once —
+    /// 32 carry a grade and neither of the other two, 86 the reverse. `arcaneTier` is
+    /// orthogonal and rides on both (11 with tempering, 8 without).
+    ///
+    /// Encoded here so the invariant is written down where the model lives: a future
+    /// change that starts stamping a grade onto tempered gear is inventing a shape retail
+    /// never sent.
+    #[test]
+    fn a_graded_retail_item_carries_no_tempering_or_durability() {
+        let eq: SingleEquippedItem = serde_json::from_str(RETAIL_GRADED_RING).unwrap();
+        assert_eq!(eq.item.grade, Some(4));
+        // The capture omits both, so they land on their serde defaults.
+        assert_eq!(eq.item.tempering_level, 0, "retail sent no temperingLevel for a graded item");
+        assert_eq!(eq.item.durability, 0.0, "retail sent no durability for a graded item");
+    }
+
+    /// Stored Postgres rows written before this change have no `grade`/`arcaneTier` keys.
+    /// They must still deserialize, or every existing character 500s on load — which is
+    /// why both fields are `#[serde(default)]` and not merely `skip_serializing_if`.
+    #[test]
+    fn a_stored_item_predating_the_fields_still_deserializes() {
+        let legacy: Item = serde_json::from_str(
+            r#"{"itemTemplateId":"00000000-0000-0000-0000-000000000009","temperingLevel":2,"durability":50.0}"#,
+        )
+        .unwrap();
+        assert_eq!(legacy.grade, None);
+        assert_eq!(legacy.arcane_tier, None);
+        assert_eq!(legacy.tempering_level, 2);
     }
 }

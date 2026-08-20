@@ -216,6 +216,8 @@ mod tests {
             item_template_id: Uuid::from_u128(9),
             tempering_level: 0,
             durability: 75.0,
+            grade: None,
+            arcane_tier: None,
             properties: ItemPropertiesAll::default(),
         }
     }
