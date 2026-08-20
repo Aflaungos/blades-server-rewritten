@@ -3036,6 +3036,66 @@ pub(in crate::arena::combat) mod tests {
         );
     }
 
+    /// TWO GHOSTS: one times a high block, the other swings into it — and the
+    /// attacker is stunned. End to end, through the real input path.
+    ///
+    /// This is the mechanic as retail intends it. Optimal is a TIMING FEAT: the
+    /// defender raises the guard just as the swing is expected, and
+    /// `BLOCK_OPTIMAL_TIME_SECS` (2.0 s) is the window that earns the stun. Held
+    /// longer, the guard decays to Late and stuns nothing — see
+    /// `a_held_guard_raised_through_the_real_input_path`.
+    ///
+    /// The block goes up via c2s gmid 46 with `_isWithinBlockZone`, which is the only
+    /// way a real client raises a guard. Every other high-block test writes the
+    /// fighter's fields directly and therefore cannot tell whether the production
+    /// path works at all.
+    #[test]
+    fn a_timed_high_block_through_the_real_input_path_stuns_the_attacker() {
+        use crate::arena::combat::state::{ActorStateType, BlockPhase, StatusEffectType};
+        let (mut m, _t0, live) = live_inst_at(2);
+
+        // Slot 1 is about to swing. Slot 0 times its guard to go up just before —
+        // this is the press a skilled player makes when they read the wind-up.
+        let raise = live + Duration::from_millis(500);
+        m.on_c2s(0, &zone_frame(true, true), raise);
+        assert_eq!(m.combat.fighters[0].actor_state(), ActorStateType::Blocking);
+
+        // The swing lands 300 ms later — comfortably inside the 2 s optimal window,
+        // and about the wind-up a real attacker telegraphs (BOT_CHARGE_WINDUP 350 ms
+        // + FOLLOW_THROUGH_DELAY 50 ms = 400 ms, matching retail's 383 ms median).
+        let swing_at = raise + Duration::from_millis(300);
+        assert_eq!(
+            m.combat.fighters[0].block_phase(swing_at),
+            Some(BlockPhase::Optimal),
+            "the timed guard must still be OPTIMAL when the swing arrives"
+        );
+
+        let attacker_obj = m.fighter_avatar_id(1) as i64;
+        let out = swing(&mut m, 1, swing_at);
+
+        // The ATTACKER is staggered — op51 status 3 addressed to its own actor id.
+        // Retail agrees on who: across 292 genuinely optimal-blocked hits in session
+        // 615, 103 staggered the attacker against 13 the defender.
+        let staggered_attacker = out.iter().any(|(_, f)| {
+            f.len() > 5 && f[1] == 0x36 && {
+                let nd = arena_proto::parse_netdata(&f[2..]);
+                nd.int(3) == Some(51)
+                    && nd.int(5) == Some(StatusEffectType::Staggered as u16 as i64)
+                    && nd.int(0) == Some(attacker_obj)
+            }
+        });
+        assert!(
+            staggered_attacker,
+            "a swing into a TIMED high block must stun the attacker (op51 status 3 on the attacker)"
+        );
+
+        // And the engine agrees internally, not just on the wire.
+        assert!(
+            m.combat.fighters[1].is_staggered(swing_at + Duration::from_millis(100)),
+            "the attacker is in the staggered state after being blocked"
+        );
+    }
+
     /// Two ghosts, one frozen: STAMINA must stop regenerating for the duration.
     ///
     /// Measured in retail, session 615 actor 431, from the packed pools carried on
