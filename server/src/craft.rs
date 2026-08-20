@@ -27,6 +27,7 @@ use actix_web::{
     web::{self, Json},
 };
 use blades_lib::economy::{RewardGrant, RewardItem, apply_reward, remove_backpack_item};
+use blades_lib::features::repair::RepairData;
 use blades_lib::server_state::CraftJob;
 use blades_lib::static_data::{CraftResultShape, ItemModRecipe};
 use blades_lib::user_data::{
@@ -76,8 +77,9 @@ impl<'a> CraftJobWire<'a> {
         user_id: Uuid,
         character_id: Uuid,
         static_data: &blades_lib::static_data::StaticData,
+        repair_data: &RepairData,
     ) -> Self {
-        let (crafting_type_id, results) = repaired_craft_fields(job, static_data);
+        let (crafting_type_id, results) = repaired_craft_fields(job, static_data, repair_data);
         CraftJobWire {
             id: job.id,
             user_id,
@@ -91,6 +93,127 @@ impl<'a> CraftJobWire<'a> {
             version: 1,
         }
     }
+}
+
+/// Build the wire records for a character's craft jobs, then enforce the one invariant
+/// that only the whole list can see: **retail never showed two craft jobs on the same
+/// station.**
+///
+/// Across the 135 captured retail `GET /crafts` snapshots, every single
+/// `(buildingId, craftingTypeId)` group holds exactly one job — 238 groups, 238
+/// singletons, no exceptions. Our own snapshots reach EIGHT on one group, because the
+/// owner's Forge holds a pile of forge crafts that older builds all stored as Alchemy.
+///
+/// While they say "Alchemy" that pile is inert: their building is the Forge, whose
+/// stations are Smithing / Tempering / Repair / Salvaging, so there is no Alchemy station
+/// for the client to bind them to and it never looks at them. Correcting each one
+/// individually — which [`repaired_craft_fields`] now can, since the results can be
+/// rebuilt as `items` — would bind all eight to the Forge's one real Smithing station at
+/// once. That is a second shape retail never emitted, on top of the pair mismatch that
+/// PR #40 was about, and it would be reached on exactly the character that got stuck on
+/// the startup screen. Making the `(craftingTypeId, results)` pair legal is not licence
+/// to invent a station occupancy instead.
+///
+/// So the correction is rationed rather than abandoned. The guarantee is precisely: **a
+/// job we corrected is always alone on the station we moved it to.**
+///
+///   * A job whose type we did NOT change always wins — it is the one the client stored,
+///     and a repair may not shoulder a real job off its own bench.
+///   * Among corrected jobs, the deterministic winner is the earliest `completedAt`,
+///     tie-broken by job id, so the same list renders the same way on every poll instead
+///     of following whatever order the rows came back from Postgres in.
+///   * Every other corrected job reverts to its stored `craftingTypeId` AND its stored
+///     `results` together — back to the inert pile that loads today. Both fields revert,
+///     never one: reverting the name alone would emit Alchemy + `items`, the original
+///     defect wearing the other shoe.
+///
+/// What this deliberately does NOT do is thin out the inert pile itself. After one row is
+/// promoted the others are still five jobs nominally on "Alchemy" at the Forge — exactly
+/// the state production serves today, and it loads, because that station does not exist
+/// there for them to bind to. The only way to reduce that group further would be to drop
+/// craft jobs from the response, which would delete a player's crafts to tidy a number.
+/// So the bar here is "never make a bindable station hold more than retail did, and never
+/// make any group worse than it already is", not "force every group to one".
+///
+/// The player therefore gets one honestly-named forge bench where they had none, and no
+/// station the client can actually bind ends up holding a crowd.
+/// True when a job's STORED `craftingTypeId` cannot be served to the client at all: an
+/// item uuid (the recipe's own id) or nil in the `CraftingStation` slot. Never a
+/// legitimate value — a CraftingType and a Recipe are different game-data objects and
+/// never share an id — and emitting one is report #34's hang, because the client's
+/// `GetCraftingStation(<uuid>)` returns null and the town-build coroutine never completes.
+fn stored_crafting_type_is_unserveable(job: &CraftJob) -> bool {
+    job.crafting_type_id == job.recipe_id || job.crafting_type_id.is_nil()
+}
+
+fn craft_wires<'a>(
+    jobs: &'a [CraftJob],
+    user_id: Uuid,
+    character_id: Uuid,
+    static_data: &blades_lib::static_data::StaticData,
+    repair_data: &RepairData,
+) -> Vec<CraftJobWire<'a>> {
+    let mut wires: Vec<CraftJobWire<'a>> = jobs
+        .iter()
+        .map(|job| CraftJobWire::from_job(job, user_id, character_id, static_data, repair_data))
+        .collect();
+
+    // Demoting a job puts it back on its STORED station, and that station may be one
+    // another job was corrected onto — so this runs to a fixed point rather than in a
+    // single pass. Each round demotes at least one job and a demoted job is never
+    // re-promoted, so it settles within `jobs.len()` rounds.
+    for _ in 0..=jobs.len() {
+        // (buildingId, emitted craftingTypeId) -> indices, in a stable order.
+        let mut groups: std::collections::BTreeMap<(Uuid, Uuid), Vec<usize>> = Default::default();
+        for (i, w) in wires.iter().enumerate() {
+            groups.entry((w.building_id, w.crafting_type_id)).or_default().push(i);
+        }
+
+        let mut demote: Vec<usize> = Vec::new();
+        for (_, members) in groups {
+            if members.len() < 2 {
+                continue;
+            }
+            // Anything we did not relabel holds its station unconditionally: it is what
+            // the client stored, and a repair may not shoulder a real job aside.
+            let untouched_present = members
+                .iter()
+                .any(|&i| wires[i].crafting_type_id == jobs[i].crafting_type_id);
+            let mut corrected: Vec<usize> = members
+                .iter()
+                .copied()
+                .filter(|&i| wires[i].crafting_type_id != jobs[i].crafting_type_id)
+                .collect();
+            corrected.sort_by_key(|&i| (jobs[i].completed_at_ms, jobs[i].id));
+
+            // A job whose STORED type cannot be served at all has nowhere safe to go
+            // back to: reverting it would put the unmappable `craftingTypeId` back on the
+            // wire, which is report #34's hang — `GetCraftingStation` returns null and the
+            // town-build coroutine never finishes. A crowded station is an unproven risk;
+            // an unmappable type is a measured one. So these keep their correction and
+            // only the genuinely demotable rows yield.
+            let (pinned, demotable): (Vec<usize>, Vec<usize>) = corrected
+                .into_iter()
+                .partition(|&i| stored_crafting_type_is_unserveable(&jobs[i]));
+
+            // `.iter().copied().next()` rather than `.first()`: diesel's prelude puts its
+            // own `first` in scope and it shadows the slice method.
+            let keep = if untouched_present || !pinned.is_empty() {
+                None
+            } else {
+                demotable.iter().copied().next()
+            };
+            demote.extend(demotable.into_iter().filter(|&i| Some(i) != keep));
+        }
+        if demote.is_empty() {
+            break;
+        }
+        for i in demote {
+            wires[i].crafting_type_id = jobs[i].crafting_type_id;
+            wires[i].results = Cow::Borrowed(&jobs[i].results);
+        }
+    }
+    wires
 }
 
 // ── GET /crafts ───────────────────────────────────────────────────────────────
@@ -117,21 +240,16 @@ pub async fn get_crafts(
     conn.transaction(move |mut conn| {
         async move {
             let entry = load_owned(&mut conn, character_id, user_id).await?;
-            let crafts = entry
-                .server_state
-                .0
-                .craft_jobs
-                .iter()
-                .map(|job| {
-                    serde_json::to_value(CraftJobWire::from_job(
-                        job,
-                        user_id,
-                        character_id,
-                        &globals.static_data,
-                    ))
-                    .unwrap_or(Value::Null)
-                })
-                .collect();
+            let crafts = craft_wires(
+                &entry.server_state.0.craft_jobs,
+                user_id,
+                character_id,
+                &globals.static_data,
+                &globals.repair_data,
+            )
+            .into_iter()
+            .map(|w| serde_json::to_value(w).unwrap_or(Value::Null))
+            .collect();
             Ok::<_, BladeApiError>(Json(GetCraftsResponse { crafts }))
         }
         .scope_boxed()
@@ -319,6 +437,7 @@ pub async fn create_craft(
                 user_id,
                 character_id,
                 &globals.static_data,
+                &globals.repair_data,
             ))
             .unwrap_or(Value::Null);
             let inventory = entry.inventory.0.generate_client_update(&tracker);
@@ -393,7 +512,7 @@ pub async fn finish_craft(
             // first, for the same reason `GET /crafts` does: a pre-fix job stored
             // `results: {}`, so collecting it granted nothing and left the player with a
             // permanently uncollectable craft.
-            let (_, repaired_results) = repaired_craft_fields(&job, &globals.static_data);
+            let (_, repaired_results) = repaired_craft_fields(&job, &globals.static_data, &globals.repair_data);
             let reward = reward_from_results(&repaired_results);
 
             let mut tracker = InventoryChangeTracker::default();
@@ -467,11 +586,11 @@ pub async fn finish_craft(
 fn repaired_craft_fields<'a>(
     job: &'a CraftJob,
     static_data: &blades_lib::static_data::StaticData,
+    repair_data: &RepairData,
 ) -> (Uuid, Cow<'a, Value>) {
     // An item uuid (or nil) in the CraftingStation slot — never a legitimate value:
     // a CraftingType and a Recipe are different game-data objects and never share an id.
-    let crafting_type_is_unmappable =
-        job.crafting_type_id == job.recipe_id || job.crafting_type_id.is_nil();
+    let crafting_type_is_unmappable = stored_crafting_type_is_unserveable(job);
     let from_apk = apk_crafting_type(&job.recipe_id, static_data);
     // A stored type the APK contradicts is a MISLABEL — written by a build that had no
     // recipe→station table and guessed. Correct it, except for the two mod-craft types,
@@ -514,7 +633,20 @@ fn repaired_craft_fields<'a>(
         derive_plain_craft_type(job.building_id, static_data)
     };
 
-    let results = if !results_are_empty {
+    // The recipe's real output, from the APK. Lets a forge row whose results are only
+    // our own approximation be rebuilt into the shape its bench can actually restore,
+    // which is the one thing that makes correcting the bench name safe.
+    let output_template = static_data
+        .recipe_crafting_types
+        .output_template_of(&job.recipe_id);
+    let rebuildable = results_are_our_own_approximation(job)
+        && output_template.is_some()
+        && static_data
+            .recipe_crafting_types
+            .result_shape_of_type(&candidate_crafting_type)
+            == Some(CraftResultShape::Instanced);
+
+    let results = if !results_are_empty && !rebuildable {
         Cow::Borrowed(&job.results)
     } else if let Some(recipe) = known_recipe {
         // Fresh instanced ids, exactly as a newly-created job would get.
@@ -523,6 +655,16 @@ fn repaired_craft_fields<'a>(
         // Tempering level is not stored on the job, so a repaired forge result mints at
         // the base level; the item itself is real and finish-able.
         Cow::Owned(mint_smith_craftable(craftable, 0))
+    } else if let Some(template) = output_template {
+        // Reached only when the results are empty or rebuildable, both of which mean we
+        // are free to mint: the recipe's REAL output, in the shape its bench restores.
+        Cow::Owned(mint_recipe_output(
+            job,
+            template,
+            candidate_crafting_type,
+            static_data,
+            repair_data,
+        ))
     } else {
         // Same approximation the unknown-recipe create path makes: one stackable of the
         // recipe's own id — well-formed and grantable, so the completion flow can finish.
@@ -536,6 +678,87 @@ fn repaired_craft_fields<'a>(
         static_data,
         crafting_type_is_unmappable,
     )
+}
+
+/// True when a job's `results` are OUR OWN unknown-recipe approximation rather than
+/// anything retail sent — i.e. a single `stackableItems` entry keyed by the job's own
+/// `recipeId`.
+///
+/// This is the discriminator that makes rebuilding safe, and it is exact rather than
+/// heuristic. A recipe id in a `stackableItems` key is a category error — that slot holds
+/// an `itemTemplateId`, and the two are disjoint namespaces — so it can only have been
+/// written by our own fallback. Measured over every captured craft record:
+///
+/// | source                              | stackable entries | keyed by the recipe id |
+/// |-------------------------------------|-------------------|------------------------|
+/// | retail (`blades.bgs.services`)      | 108               | **0**                  |
+/// | ours (`127.0.0.1:8087`)             | 328               | **328**                |
+///
+/// So a self-keyed stackable is never data we must preserve, and a stackable keyed by
+/// anything else is never ours to overwrite. Rebuilding is gated on this and nothing
+/// else: a genuine retail Alchemy result keyed by a real template is left untouched even
+/// though it is also "a stackable on a job we are relabelling".
+fn results_are_our_own_approximation(job: &CraftJob) -> bool {
+    job.results
+        .get("stackableItems")
+        .and_then(Value::as_object)
+        .is_some_and(|m| {
+            m.len() == 1 && m.contains_key(&job.recipe_id.to_string())
+        })
+}
+
+/// Mint a recipe's REAL output into the `results` shape its bench restores.
+///
+/// The APK's `Recipe._outputs[]._itemTemplate` gives the item template a recipe produces
+/// (`recipe_crafting_types.json`, 617/617 Smithing recipes). With it we can finally do
+/// what [`reconcile_type_with_results`] had to refuse: correct a forge craft's bench name
+/// AND give it results the Smithing station can actually restore, instead of choosing
+/// between a wrong name and a shape retail never sent.
+///
+/// Which shape depends on the station, exactly as retail paired them (482/482 captured
+/// craft records, no exceptions):
+///
+///   * Instanced (Smithing / Tempering / Enchanting) → `{"items":[{id, itemTemplateId,
+///     temperingLevel, durability}]}`, matching both the captured smithing records and
+///     `recipes.json`.
+///   * Stackable (Alchemy / DecorationCrafting) → `{"stackableItems":{"<template>": 1}}`
+///     — the template id, which is what retail keyed it by, not the recipe id.
+///
+/// The instanced item's `id` is derived deterministically from the craft job id, NOT
+/// randomly. We are reconstructing a record whose real item id was never stored, and this
+/// function runs on every read: a fresh `v4` would hand the client a different item id on
+/// every `GET /crafts` poll for the same job. A v8 uuid over the job id is stable, unique
+/// per job, and self-evidently synthesized.
+///
+/// `temperingLevel` is 0 because a job does not store the level it was crafted at, and
+/// `durability` is that template's real level-0 maximum from the APK's own
+/// `item_durability.json` ladder rather than a constant — a flat 150.0 on an Iron Dagger
+/// (max 50.0) would hand the client an item at 300% condition. An unknown template falls
+/// back to [`SMITH_MINT_DURABILITY`], the value the existing forge mint already ships.
+fn mint_recipe_output(
+    job: &CraftJob,
+    template: Uuid,
+    crafting_type_id: Uuid,
+    static_data: &blades_lib::static_data::StaticData,
+    repair_data: &RepairData,
+) -> Value {
+    if static_data
+        .recipe_crafting_types
+        .result_shape_of_type(&crafting_type_id)
+        == Some(CraftResultShape::Stackable)
+    {
+        return serde_json::json!({ "stackableItems": { template.to_string(): 1 } });
+    }
+    serde_json::json!({
+        "items": [{
+            "id": Uuid::new_v8(job.id.into_bytes()).to_string(),
+            "itemTemplateId": template.to_string(),
+            "temperingLevel": 0,
+            "durability": repair_data
+                .max_durability(template, 0)
+                .unwrap_or(SMITH_MINT_DURABILITY),
+        }]
+    })
 }
 
 /// The shape of a `results` object as it will go on the wire, or `None` when it is
@@ -1313,12 +1536,30 @@ mod tests {
         sd
     }
 
+    /// The committed APK durability ladder, as the server loads it. Real values matter
+    /// here: a rebuilt forge item carries its template's own level-0 maximum, so a test
+    /// running against an empty table would silently assert the fallback constant.
+    fn repair_data_from_deploy() -> &'static RepairData {
+        static CELL: std::sync::OnceLock<RepairData> = std::sync::OnceLock::new();
+        CELL.get_or_init(|| {
+            let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../deploy/static");
+            let read = |name: &str| -> Value {
+                std::fs::File::open(dir.join(name))
+                    .ok()
+                    .and_then(|f| serde_json::from_reader(std::io::BufReader::new(f)).ok())
+                    .unwrap_or(Value::Null)
+            };
+            RepairData::from_json(&read("item_durability.json"), &read("repair_costs.json"))
+        })
+    }
+
     fn wire_of(job: &CraftJob, sd: &blades_lib::static_data::StaticData) -> Value {
         serde_json::to_value(CraftJobWire::from_job(
             job,
             Uuid::from_u128(0x11D),
             Uuid::from_u128(0xC1D),
             sd,
+            repair_data_from_deploy(),
         ))
         .unwrap()
     }
@@ -1565,34 +1806,35 @@ mod tests {
         crate::static_loader::load(&dir)
     }
 
-    /// Report #34's acceptance test, re-baselined.
+    /// Report #34's acceptance test, re-baselined a second time — and this time against
+    /// retail rather than against what we could manage.
     ///
-    /// The Dragonbone War Axe craft (`fd13cfa0-…-b3d08852f673`) IS a forge craft and the
-    /// APK table says so — but its stored `results` are empty and neither
-    /// `recipes.json` nor `smith_craftables.json` can mint the axe, so the only result
-    /// this repair can build is the stackable approximation. A Smithing job carrying
-    /// `stackableItems` is a record retail never emitted (26/26 retail Smithing rows
-    /// carry `items`), and emitting it is what hung the loading screen. So the bench
-    /// follows the results: a mappable, shape-consistent Alchemy row, which is exactly
-    /// what unblocked report #34 before the table existed.
+    /// The Dragonbone War Axe craft (`fd13cfa0-…-b3d08852f673`) is a forge craft with
+    /// EMPTY stored results, and neither `recipes.json` nor `smith_craftables.json` can
+    /// mint the axe. Until the recipe -> output mapping existed the only result this
+    /// repair could build was the stackable approximation, so the bench had to follow
+    /// the results down to Alchemy: a wrong name on a loading game, which was the right
+    /// way round while it was the only choice.
     ///
-    /// Naming this row "Smithing" honestly requires a recipe -> itemTemplateId mapping
-    /// so `results` can be rebuilt as `items` at the same time. Until then the name is
-    /// wrong and the game loads, which is the right way round.
+    /// It is no longer the only choice. `recipe_crafting_types.json` now carries the
+    /// recipe's own output template, so the axe can be minted and the bench named
+    /// honestly at the same time. The expected item id is not a guess either: retail
+    /// itself served this exact recipe as Smithing with
+    /// `results.items[0].itemTemplateId = efb6d38f-…` (capture_id 79683-era rows on
+    /// `blades.bgs.services`), so the record this test now demands is byte-for-byte the
+    /// kind of record retail emitted for this very recipe.
     #[test]
-    fn report_34_forge_row_repairs_to_a_bench_whose_results_it_can_produce() {
+    fn report_34_forge_row_is_named_smithing_with_the_item_retail_itself_sent() {
         let sd = static_data_from_deploy();
         let job = poisoned_smith_job();
 
-        // The premise: this recipe is in NEITHER of the two tables that could mint the
-        // real item, so the repair cannot produce an instanced result for it.
+        // The premise still holds: neither table that mints a REAL item knows this
+        // recipe. The repair no longer depends on them.
         assert!(sd.recipes.get(&job.recipe_id).is_none(), "not a captured recipe");
         assert!(
             sd.smith_craftables.resolve(&job.recipe_id).is_none(),
             "not a resolvable smith craftable"
         );
-        // …while the table does know the bench, which is what makes this the tempting
-        // and wrong relabel.
         assert_eq!(
             apk_crafting_type(&job.recipe_id, &sd).map(|u| u.to_string()).as_deref(),
             Some(SMITHING_CRAFTING_TYPE_ID),
@@ -1602,12 +1844,17 @@ mod tests {
         let wire = wire_of(&job, &sd);
         let ctid = wire["craftingTypeId"].as_str().unwrap();
         assert_ne!(ctid, wire["recipeId"].as_str().unwrap(), "must never echo the recipe id");
-        assert_ne!(
+        assert_eq!(
             ctid, SMITHING_CRAFTING_TYPE_ID,
-            "a Smithing job may not carry stackable results — retail never emits that \
-             pair and the client stalls the town build on it"
+            "the Dragonbone War Axe is forged at the Smithy and its results can now be \
+             built in the shape a Smithing station restores, so the bench is finally \
+             named honestly"
         );
-        assert_eq!(ctid, ALCHEMY_CRAFTING_TYPE_ID, "a mappable bench that matches the results");
+        assert_eq!(
+            wire["results"]["items"][0]["itemTemplateId"].as_str(),
+            Some("efb6d38f-ecc9-47bd-bde2-397cd35d888b"),
+            "the item retail served for this recipe"
+        );
         assert_shape_consistent("report #34 forge row", &wire, &sd);
     }
 
@@ -1754,12 +2001,19 @@ mod tests {
 
     /// The six recipe ids actually sitting in production `craftJobs` with
     /// `craftingTypeId = c9d3b3aa…` (Alchemy) and the stackable approximation as their
-    /// results. All six are Smithing in the APK, and none of them may be relabelled
-    /// while that is all the result we can offer.
+    /// results. All six are Smithing in the APK. This is the test the whole change
+    /// exists for: each row is rebuilt into the `items` shape a Smithing station
+    /// restores, and only then relabelled to the Smithy.
+    ///
+    /// Before the recipe -> output mapping this asserted the opposite — that the bench
+    /// must stay Alchemy — because moving the name without the results emitted Smithing
+    /// + `stackableItems`, a pair absent from all 482 retail craft records, and stalled
+    /// loading pass 2 at `town_level == -1`. That constraint is satisfied here rather
+    /// than dodged: the pair being emitted is Smithing + `items`, which is 26/26 of what
+    /// retail sent for Smithing.
     #[test]
-    fn the_live_forge_rows_stored_as_alchemy_keep_the_bench_that_loads() {
+    fn the_live_forge_rows_are_rebuilt_as_items_and_named_smithing() {
         let sd = static_data_from_deploy();
-        let alchemy = Uuid::parse_str(ALCHEMY_CRAFTING_TYPE_ID).unwrap();
         let smithing = Uuid::parse_str(SMITHING_CRAFTING_TYPE_ID).unwrap();
         for (name, id) in LIVE_FORGE_RECIPES_STORED_AS_ALCHEMY {
             let recipe_id = Uuid::parse_str(id).unwrap();
@@ -1768,21 +2022,479 @@ mod tests {
                 Some(smithing),
                 "{name} is forged at the Smithy"
             );
+            // The premise of the old behaviour: still unmintable from the two tables
+            // that hold captured results. The output mapping is what replaced them.
             assert!(
                 sd.smith_craftables.resolve(&recipe_id).is_none(),
-                "{name}: still unmintable, so a Smithing-shaped result is unavailable"
+                "{name}: still not a resolvable smith craftable"
             );
+            let template = sd
+                .recipe_crafting_types
+                .output_template_of(&recipe_id)
+                .unwrap_or_else(|| panic!("{name}: the APK table must know its output"));
+
             let job = live_forge_row(recipe_id, id);
             let wire = wire_of(&job, &sd);
+
             assert_eq!(
                 wire["craftingTypeId"].as_str().unwrap(),
-                alchemy.to_string(),
-                "{name}: relabelling this row to the Smithy stalls the town build — the \
-                 Smithing station cannot restore a stackable result"
+                smithing.to_string(),
+                "{name}: the bench is finally named honestly"
             );
-            assert_eq!(wire["results"], job.results, "results must not be touched either");
+            let items = wire["results"]["items"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{name}: results must carry `items`, got {}", wire["results"]));
+            assert_eq!(items.len(), 1, "{name}: a Recipe has exactly one output");
+            assert_eq!(
+                items[0]["itemTemplateId"].as_str(),
+                Some(template.to_string().as_str()),
+                "{name}: the real output item, not the recipe id"
+            );
+            assert!(
+                wire["results"].get("stackableItems").is_none(),
+                "{name}: the approximation must be gone, not merely accompanied"
+            );
+            // The recipe id must never survive into an item-template slot — that
+            // category error is the original defect.
+            assert_ne!(
+                items[0]["itemTemplateId"].as_str(),
+                Some(id),
+                "{name}: recipe id leaked into itemTemplateId"
+            );
+            // Real durability from the APK ladder, not the 150.0 fallback constant.
+            let want_durability = repair_data_from_deploy()
+                .max_durability(template, 0)
+                .unwrap_or_else(|| panic!("{name}: durability ladder must know {template}"));
+            assert_eq!(
+                items[0]["durability"].as_f64(),
+                Some(want_durability),
+                "{name}: durability must be this template's own level-0 maximum"
+            );
+            assert_eq!(items[0]["temperingLevel"].as_u64(), Some(0), "{name}: base level");
             assert_shape_consistent(name, &wire, &sd);
         }
+    }
+
+    /// The synthesized item id must be STABLE. `repaired_craft_fields` runs on every
+    /// read, so a random id would hand the client a different `results.items[0].id` on
+    /// each `GET /crafts` poll for the same job — and `finish` grants whatever id was
+    /// last read. Two independent renders of the same job must agree; two different
+    /// jobs must not collide.
+    #[test]
+    fn a_rebuilt_forge_item_keeps_the_same_id_across_reads() {
+        let sd = static_data_from_deploy();
+        let (_, id) = LIVE_FORGE_RECIPES_STORED_AS_ALCHEMY[0];
+        let recipe_id = Uuid::parse_str(id).unwrap();
+        let job = live_forge_row(recipe_id, id);
+
+        let first = wire_of(&job, &sd)["results"]["items"][0]["id"].clone();
+        let second = wire_of(&job, &sd)["results"]["items"][0]["id"].clone();
+        assert!(first.is_string(), "an instanced result carries an id");
+        assert_eq!(first, second, "the same job must render the same item id every read");
+
+        let other = CraftJob { id: Uuid::from_u128(0xF1), ..live_forge_row(recipe_id, id) };
+        assert_ne!(
+            wire_of(&other, &sd)["results"]["items"][0]["id"],
+            first,
+            "two different jobs must not share an item id"
+        );
+    }
+
+    /// A GENUINE retail stackable result — keyed by a real item template rather than by
+    /// the job's own recipe id — is never rewritten, even on a row whose bench is being
+    /// corrected. The rebuild is gated on the results being provably our own
+    /// approximation: across the captures, retail produced 0 self-keyed stackables out
+    /// of 108, and our server produced 328 out of 328.
+    #[test]
+    fn a_real_retail_stackable_result_is_never_rewritten() {
+        let sd = static_data_from_deploy();
+        let (_, id) = LIVE_FORGE_RECIPES_STORED_AS_ALCHEMY[0];
+        let recipe_id = Uuid::parse_str(id).unwrap();
+        // Same forge row, except the stackable is keyed by a real item template.
+        let real_template = "cdbabba6-a6a2-46ed-a086-93d77acc274a";
+        let job = CraftJob {
+            results: serde_json::json!({"stackableItems": { real_template: 2 }}),
+            ..live_forge_row(recipe_id, id)
+        };
+        assert!(
+            !results_are_our_own_approximation(&job),
+            "a template-keyed stackable is not our approximation"
+        );
+        let wire = wire_of(&job, &sd);
+        assert_eq!(wire["results"], job.results, "retail data must be passed through untouched");
+        assert_shape_consistent("real stackable", &wire, &sd);
+    }
+
+    /// The safety net is still there for a recipe the APK table has never heard of: no
+    /// output template means no instanced result can be built, so the bench must once
+    /// again follow the results rather than the recipe. This is the behaviour the
+    /// rewritten tests above replaced, kept for the case that still needs it.
+    #[test]
+    fn a_recipe_absent_from_the_table_still_keeps_the_bench_that_loads() {
+        let sd = static_data_from_deploy();
+        let unknown = Uuid::from_u128(0xDEADBEEF);
+        assert!(
+            sd.recipe_crafting_types.output_template_of(&unknown).is_none(),
+            "premise: the table cannot mint this recipe"
+        );
+        let job = live_forge_row(unknown, &unknown.to_string());
+        let wire = wire_of(&job, &sd);
+        assert_eq!(
+            wire["craftingTypeId"].as_str().unwrap(),
+            ALCHEMY_CRAFTING_TYPE_ID,
+            "with no mintable output the stackable result keeps its matching bench"
+        );
+        assert_shape_consistent("untabled recipe", &wire, &sd);
+    }
+
+    /// The whole list, as `GET /crafts` builds it.
+    fn wires_of(jobs: &[CraftJob], sd: &blades_lib::static_data::StaticData) -> Vec<Value> {
+        craft_wires(
+            jobs,
+            Uuid::from_u128(0x11D),
+            Uuid::from_u128(0xC1D),
+            sd,
+            repair_data_from_deploy(),
+        )
+        .into_iter()
+        .map(|w| serde_json::to_value(w).unwrap())
+        .collect()
+    }
+
+    /// All six live forge recipes as separate jobs at the SAME building — the owner's
+    /// Forge, which is how production actually holds them.
+    fn live_forge_pile() -> Vec<CraftJob> {
+        LIVE_FORGE_RECIPES_STORED_AS_ALCHEMY
+            .iter()
+            .enumerate()
+            .map(|(n, (_, id))| CraftJob {
+                id: Uuid::from_u128(0xF00 + n as u128),
+                completed_at_ms: 1_785_999_240_168 + n as i64,
+                ..live_forge_row(Uuid::parse_str(id).unwrap(), id)
+            })
+            .collect()
+    }
+
+    /// Retail never showed two craft jobs on one station: 238 of 238
+    /// `(buildingId, craftingTypeId)` groups across the 135 captured retail
+    /// `GET /crafts` snapshots hold exactly one job. Correcting each of the owner's six
+    /// forge rows on its own merits would bind all six to the Forge's single Smithing
+    /// station, so the correction is rationed to one and the rest stay inert.
+    #[test]
+    fn one_station_holds_one_job_even_when_six_rows_could_be_corrected() {
+        let sd = static_data_from_deploy();
+        let jobs = live_forge_pile();
+        let wires = wires_of(&jobs, &sd);
+        assert_eq!(wires.len(), jobs.len(), "no job may be dropped from the list");
+
+        // The guarantee: a job we corrected is ALONE on the station we moved it to. The
+        // rows we left alone stay as production serves them today (nominally on an
+        // Alchemy station the Forge does not have, which is why they are inert) — thinning
+        // that pile further would mean dropping the player's crafts.
+        let mut per_station: std::collections::HashMap<(String, String), usize> = Default::default();
+        for w in &wires {
+            *per_station
+                .entry((
+                    w["buildingId"].as_str().unwrap().to_string(),
+                    w["craftingTypeId"].as_str().unwrap().to_string(),
+                ))
+                .or_default() += 1;
+        }
+        for (job, w) in jobs.iter().zip(&wires) {
+            let ctid = w["craftingTypeId"].as_str().unwrap();
+            if ctid == job.crafting_type_id.to_string() {
+                continue; // not corrected — it holds whatever station it was stored on
+            }
+            let building = w["buildingId"].as_str().unwrap().to_string();
+            assert_eq!(
+                per_station[&(building.clone(), ctid.to_string())], 1,
+                "corrected job {} shares station {ctid} at building {building} with another; \
+                 retail showed 238/238 singletons",
+                w["id"]
+            );
+        }
+        // And no group may be bigger than it was before the repair ran.
+        let mut before: std::collections::HashMap<(Uuid, Uuid), usize> = Default::default();
+        for job in &jobs {
+            *before.entry((job.building_id, job.crafting_type_id)).or_default() += 1;
+        }
+        for ((building, ctid), n) in &per_station {
+            let key = (Uuid::parse_str(building).unwrap(), Uuid::parse_str(ctid).unwrap());
+            assert!(
+                *n <= before.get(&key).copied().unwrap_or(0).max(1),
+                "station {ctid} at building {building} went from {:?} to {n} jobs",
+                before.get(&key)
+            );
+        }
+
+        let smithing: Vec<&Value> = wires
+            .iter()
+            .filter(|w| w["craftingTypeId"] == SMITHING_CRAFTING_TYPE_ID)
+            .collect();
+        assert_eq!(smithing.len(), 1, "exactly one row gets the honest bench");
+        assert!(
+            smithing[0]["results"]["items"].is_array(),
+            "and it carries the instanced result that makes the bench legal"
+        );
+
+        // Every demoted row is back to exactly what it was stored as — both fields, so
+        // the pair stays one retail emitted.
+        for (job, w) in jobs.iter().zip(&wires) {
+            if w["craftingTypeId"] == SMITHING_CRAFTING_TYPE_ID {
+                continue;
+            }
+            assert_eq!(
+                w["craftingTypeId"].as_str().unwrap(),
+                ALCHEMY_CRAFTING_TYPE_ID,
+                "a demoted row keeps the bench that leaves it inert"
+            );
+            assert_eq!(w["results"], job.results, "and its stored results, untouched");
+        }
+
+        // The invariant that this whole change is downstream of, over the full list.
+        for w in &wires {
+            assert_shape_consistent("forge pile", w, &sd);
+        }
+    }
+
+    /// The choice of which row is corrected must not depend on the order Postgres
+    /// returned the rows in, or the same character would see the bench move between
+    /// polls.
+    #[test]
+    fn which_row_gets_the_bench_does_not_depend_on_list_order() {
+        let sd = static_data_from_deploy();
+        let jobs = live_forge_pile();
+        let winner = |js: &[CraftJob]| -> String {
+            wires_of(js, &sd)
+                .into_iter()
+                .find(|w| w["craftingTypeId"] == SMITHING_CRAFTING_TYPE_ID)
+                .map(|w| w["id"].as_str().unwrap().to_string())
+                .expect("one row is corrected")
+        };
+        let forward = winner(&jobs);
+        let mut reversed = jobs.clone();
+        reversed.reverse();
+        assert_eq!(forward, winner(&reversed), "the same job must win either way");
+    }
+
+    /// A job already sitting on that station — one whose type we did not touch — outranks
+    /// any repair. The repair must not shoulder a real job off its own bench.
+    #[test]
+    fn a_job_already_on_the_station_outranks_a_corrected_one() {
+        let sd = static_data_from_deploy();
+        let smithing = Uuid::parse_str(SMITHING_CRAFTING_TYPE_ID).unwrap();
+        let mut jobs = live_forge_pile();
+        // A well-formed Smithing job at the same building: correct type, instanced
+        // result, nothing for the repair to do.
+        let real = CraftJob {
+            id: Uuid::from_u128(0xBEE),
+            recipe_id: Uuid::parse_str("04730542-db74-46a8-89e9-c8c6bf951ee7").unwrap(),
+            building_id: jobs[0].building_id,
+            crafting_type_id: smithing,
+            completed_at_ms: 1_786_000_000_000,
+            results: serde_json::json!({"items": [{
+                "id": "036d7be2-06ef-4a77-87c9-7d895327c708",
+                "itemTemplateId": "bacb3089-2378-45d2-b717-2dd3f01e5939",
+                "temperingLevel": 0,
+                "durability": 162.5
+            }]}),
+        };
+        jobs.push(real.clone());
+
+        let wires = wires_of(&jobs, &sd);
+        let smiths: Vec<&Value> = wires
+            .iter()
+            .filter(|w| w["craftingTypeId"] == SMITHING_CRAFTING_TYPE_ID)
+            .collect();
+        assert_eq!(smiths.len(), 1, "the station still holds exactly one job");
+        assert_eq!(
+            smiths[0]["id"].as_str().unwrap(),
+            real.id.to_string(),
+            "and it is the real job, not a repaired one"
+        );
+        for w in &wires {
+            assert_shape_consistent("forge pile + real smith job", w, &sd);
+        }
+    }
+
+    /// Every distinct production craft row, as one list: no station may end up holding
+    /// two jobs and no record may pair a type with results retail never paired.
+    #[test]
+    fn the_whole_production_row_set_keeps_both_retail_invariants() {
+        let sd = static_data_from_deploy();
+        let jobs: Vec<CraftJob> = live_craft_rows()
+            .into_iter()
+            .enumerate()
+            // live_craft_rows reuses fixture ids; a real list has distinct ones.
+            .map(|(n, (_, job))| CraftJob { id: Uuid::from_u128(0xA000 + n as u128), ..job })
+            .collect();
+        let wires = wires_of(&jobs, &sd);
+
+        let mut occupancy: std::collections::HashMap<(String, String), usize> = Default::default();
+        for w in &wires {
+            assert_shape_consistent("production row set", w, &sd);
+            *occupancy
+                .entry((
+                    w["buildingId"].as_str().unwrap().to_string(),
+                    w["craftingTypeId"].as_str().unwrap().to_string(),
+                ))
+                .or_default() += 1;
+        }
+        // No station this repair MOVED a job onto may hold more than the one job retail
+        // would have shown there — with one documented exception. A job whose STORED type
+        // is unserveable has nowhere safe to be sent back to: reverting it would put
+        // report #34's unmappable `craftingTypeId` back on the wire, which is a MEASURED
+        // hang, whereas a shared station is an unproven one. Those keep their correction.
+        for (job, w) in jobs.iter().zip(&wires) {
+            let ctid = w["craftingTypeId"].as_str().unwrap().to_string();
+            if ctid == job.crafting_type_id.to_string() {
+                continue;
+            }
+            let building = w["buildingId"].as_str().unwrap().to_string();
+            let n = occupancy[&(building.clone(), ctid.clone())];
+            if stored_crafting_type_is_unserveable(job) {
+                assert!(
+                    n >= 1,
+                    "a pinned row must still be present on the station it was moved to"
+                );
+                continue;
+            }
+            assert_eq!(
+                n, 1,
+                "repair put job {} onto station {ctid} at building {building} alongside \
+                 another; retail showed 238/238 singletons",
+                w["id"]
+            );
+        }
+    }
+
+    /// The forge half of production, verbatim: the owner's eleven broken forge rows as
+    /// `characters.server_state->'craftJobs'` actually held them on 2026-08-20, read off
+    /// arena PG. `(buildingId, recipeId)` in row order — note the two DIFFERENT buildings
+    /// and the repeated recipes, neither of which the single-building fixture above
+    /// reproduces. Three rows share `b949b05f` at one building, so a winner has to be
+    /// picked among identical recipes as well as among different ones.
+    const OWNER_FORGE_ROWS_2026_08_20: [(&str, &str); 11] = [
+        ("0e73f481-9efa-4dc8-a66b-46da95ff76ee", "5fe0e868-957e-47c2-a094-9c1daad097d5"),
+        ("0e73f481-9efa-4dc8-a66b-46da95ff76ee", "7ad4e3a0-49b0-4c2f-9a94-6158acbb51d9"),
+        ("0e73f481-9efa-4dc8-a66b-46da95ff76ee", "a57591a0-9354-411b-862a-5449dfbd335b"),
+        ("0e73f481-9efa-4dc8-a66b-46da95ff76ee", "b949b05f-2e46-4a0c-80e4-171c4aecb9e5"),
+        ("105c24bf-9e16-4cbb-bddd-514ad0b23e0e", "38671302-f4f1-4357-aef9-5f57972c423d"),
+        ("105c24bf-9e16-4cbb-bddd-514ad0b23e0e", "38671302-f4f1-4357-aef9-5f57972c423d"),
+        ("105c24bf-9e16-4cbb-bddd-514ad0b23e0e", "38671302-f4f1-4357-aef9-5f57972c423d"),
+        ("105c24bf-9e16-4cbb-bddd-514ad0b23e0e", "5fe0e868-957e-47c2-a094-9c1daad097d5"),
+        ("105c24bf-9e16-4cbb-bddd-514ad0b23e0e", "a57591a0-9354-411b-862a-5449dfbd335b"),
+        ("105c24bf-9e16-4cbb-bddd-514ad0b23e0e", "b949b05f-2e46-4a0c-80e4-171c4aecb9e5"),
+        ("105c24bf-9e16-4cbb-bddd-514ad0b23e0e", "b949b05f-2e46-4a0c-80e4-171c4aecb9e5"),
+    ];
+
+    /// The owner's real forge pile, on the real two buildings, must come out with one
+    /// honestly-named Smithing bench PER BUILDING and no crowded station anywhere. This
+    /// is the character that got stuck on the startup screen, so it is the one layout the
+    /// change has to be right about.
+    #[test]
+    fn the_owners_real_two_building_forge_pile_yields_one_bench_per_building() {
+        let sd = static_data_from_deploy();
+        let alchemy = Uuid::parse_str(ALCHEMY_CRAFTING_TYPE_ID).unwrap();
+        let jobs: Vec<CraftJob> = OWNER_FORGE_ROWS_2026_08_20
+            .iter()
+            .enumerate()
+            .map(|(n, (building, recipe))| CraftJob {
+                id: Uuid::from_u128(0xB000 + n as u128),
+                recipe_id: Uuid::parse_str(recipe).unwrap(),
+                building_id: Uuid::parse_str(building).unwrap(),
+                crafting_type_id: alchemy,
+                completed_at_ms: 1_785_999_240_168 + n as i64,
+                results: serde_json::json!({"stackableItems": { *recipe: 1 }}),
+            })
+            .collect();
+
+        let wires = wires_of(&jobs, &sd);
+        assert_eq!(wires.len(), 11, "no craft job may vanish from the list");
+
+        let mut occupancy: std::collections::HashMap<(String, String), usize> = Default::default();
+        for w in &wires {
+            assert_shape_consistent("owner forge pile", w, &sd);
+            *occupancy
+                .entry((
+                    w["buildingId"].as_str().unwrap().to_string(),
+                    w["craftingTypeId"].as_str().unwrap().to_string(),
+                ))
+                .or_default() += 1;
+        }
+
+        let mut smith_buildings: Vec<String> = wires
+            .iter()
+            .filter(|w| w["craftingTypeId"] == SMITHING_CRAFTING_TYPE_ID)
+            .map(|w| w["buildingId"].as_str().unwrap().to_string())
+            .collect();
+        smith_buildings.sort();
+        assert_eq!(
+            smith_buildings,
+            vec![
+                "0e73f481-9efa-4dc8-a66b-46da95ff76ee".to_string(),
+                "105c24bf-9e16-4cbb-bddd-514ad0b23e0e".to_string(),
+            ],
+            "each Forge gets exactly one honestly-named Smithing job"
+        );
+        for b in &smith_buildings {
+            assert_eq!(
+                occupancy[&(b.clone(), SMITHING_CRAFTING_TYPE_ID.to_string())], 1,
+                "the Smithing station at {b} must hold one job, not a crowd"
+            );
+        }
+        // Each promoted row carries a real instanced item the durability ladder knows.
+        for w in wires.iter().filter(|w| w["craftingTypeId"] == SMITHING_CRAFTING_TYPE_ID) {
+            let tpl = w["results"]["items"][0]["itemTemplateId"].as_str().expect("an item");
+            assert_ne!(tpl, w["recipeId"].as_str().unwrap(), "not the recipe id");
+            assert!(
+                repair_data_from_deploy()
+                    .max_durability(Uuid::parse_str(tpl).unwrap(), 0)
+                    .is_some(),
+                "{tpl} must be a template the durability ladder knows"
+            );
+        }
+        // The nine that stayed behind are byte-identical to what is stored, so this
+        // change cannot have made them worse than the state that loads today.
+        for (job, w) in jobs.iter().zip(&wires) {
+            if w["craftingTypeId"] == SMITHING_CRAFTING_TYPE_ID {
+                continue;
+            }
+            assert_eq!(w["craftingTypeId"].as_str().unwrap(), ALCHEMY_CRAFTING_TYPE_ID);
+            assert_eq!(w["results"], job.results);
+        }
+    }
+
+    /// The gate itself, directly: a retail-impossible `(craftingTypeId, results)` pair
+    /// must be refused whatever the caller asks for. Smithing never carries a stackable
+    /// result in retail (26/26 carry `items`), so handing `reconcile_type_with_results`
+    /// that pair must not yield it back.
+    #[test]
+    fn reconcile_refuses_a_pairing_retail_never_emitted() {
+        let sd = static_data_from_deploy();
+        let smithing = Uuid::parse_str(SMITHING_CRAFTING_TYPE_ID).unwrap();
+        let (_, id) = LIVE_FORGE_RECIPES_STORED_AS_ALCHEMY[0];
+        let job = live_forge_row(Uuid::parse_str(id).unwrap(), id);
+
+        let stackable = Cow::Owned(serde_json::json!({"stackableItems": { id: 1 }}));
+        let (ctid, results) = reconcile_type_with_results(&job, smithing, stackable, &sd, false);
+        assert_ne!(
+            ctid, smithing,
+            "Smithing + stackableItems is the pair that stalled the town build"
+        );
+        assert!(
+            results.get("stackableItems").is_some(),
+            "the results are the evidence and must survive; only the bench name yields"
+        );
+
+        // And the mirror direction: an instanced result under Alchemy, which retail
+        // also never sent (100/100 Alchemy rows carry `stackableItems`).
+        let alchemy = Uuid::parse_str(ALCHEMY_CRAFTING_TYPE_ID).unwrap();
+        let instanced = Cow::Owned(serde_json::json!({
+            "items": [{ "id": Uuid::from_u128(7).to_string(), "itemTemplateId": id }]
+        }));
+        let (ctid, _) = reconcile_type_with_results(&job, alchemy, instanced, &sd, true);
+        assert_ne!(ctid, alchemy, "Alchemy + items is equally absent from retail");
     }
 
     /// The relabel is not abandoned — it is conditioned. The same six recipes, stored
@@ -1891,7 +2603,7 @@ mod tests {
     fn every_live_row_still_grants_something_on_finish() {
         let sd = static_data_from_deploy();
         for (label, job) in live_craft_rows() {
-            let (_, results) = repaired_craft_fields(&job, &sd);
+            let (_, results) = repaired_craft_fields(&job, &sd, repair_data_from_deploy());
             let reward = reward_from_results(&results);
             assert!(
                 !reward.items.is_empty() || !reward.stackable_items.is_empty(),

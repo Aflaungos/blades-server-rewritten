@@ -345,6 +345,16 @@ impl RecipeCraftingTypes {
         self.recipes.get(recipe_id).map(|r| r.crafting_type_id)
     }
 
+    /// The item template a recipe mints, or `None` when the shipped client data has no
+    /// output for it (Enchanting / Tempering / Repairing / Salvaging — see
+    /// [`RecipeCraftingType::output_item_template_id`]) or the recipe is not in the
+    /// table at all. Never returns the recipe id: recipe uuids and item-template uuids
+    /// are disjoint namespaces, and confusing the two is what put a recipe id in a
+    /// `stackableItems` key and hung town load.
+    pub fn output_template_of(&self, recipe_id: &Uuid) -> Option<Uuid> {
+        self.recipes.get(recipe_id)?.output_item_template_id
+    }
+
     /// The uuid of the crafting type with the given `editorName` (e.g. `"Smithing"`).
     pub fn type_by_name(&self, editor_name: &str) -> Option<Uuid> {
         self.crafting_types
@@ -428,6 +438,19 @@ pub struct RecipeCraftingType {
     pub name_key: Option<String>,
     #[serde(default)]
     pub name: Option<String>,
+    /// The item template this recipe OUTPUTS, from the APK's
+    /// `Recipe._outputs[]._itemTemplate` (`RecipeOutput` has no other serialized field,
+    /// so the quantity is the constant 1).
+    ///
+    /// Present for exactly the three stations whose recipes mint a NEW item — Smithing
+    /// (617/617), Alchemy (140/140), DecorationCrafting (141/141). `None` for
+    /// Enchanting, whose outputs are item *properties* with a null template pointer, and
+    /// for Tempering / Repairing / Salvaging, which mutate their input item and ship no
+    /// `_outputs` at all. `None` therefore means "the shipped client data has no output
+    /// for this recipe", never "we did not look", so a caller must read it as a reason to
+    /// keep its existing fallback rather than to invent a result.
+    #[serde(default)]
+    pub output_item_template_id: Option<Uuid>,
 }
 
 /// One craftable the Forge's Smithing station can mint, from `smith_craftables.json`.
