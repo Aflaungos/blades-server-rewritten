@@ -11,7 +11,7 @@ use actix_web::{
     dev::Service,
     http::header::{HeaderName, HeaderValue},
     main,
-    web::Data,
+    web::{Data, JsonConfig},
 };
 use anyhow::{Context, Result};
 use bb8::Pool;
@@ -326,6 +326,19 @@ async fn main() -> Result<()> {
             HttpServer::new(move || {
                 App::new()
                     .app_data(Data::new(server_global.clone()))
+                    // A character transfer POSTs the whole CompleteCharacter, and
+                    // actix's default JSON limit is 2 MiB — which is smaller than a
+                    // real progressed character. A level-28 import was rejected with
+                    // `JSON payload (3094666 bytes) is larger than allowed
+                    // (limit: 2097152 bytes)`, leaving that player unable to be
+                    // restored while 54 others succeeded.
+                    //
+                    // The stored document is only ~390 KiB at its largest across all
+                    // 101 captured alts; the transfer payload inflates it roughly 8x
+                    // by expanding inventory and quest state. 16 MiB is ~5x the
+                    // largest payload actually observed, so it clears real characters
+                    // with room to spare while still bounding an unbounded body.
+                    .app_data(JsonConfig::default().limit(16 * 1024 * 1024))
                     .wrap_fn(|mut req, srv| {
                         let start_timestamp = SystemTime::now();
                         let is_from_blades_api =
