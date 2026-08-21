@@ -133,6 +133,13 @@ pub fn from_character(character: &CompleteCharacter, inventory: &CompleteInvento
 
     let mut weapon: Option<(&'static gamedata::WeaponStats, u64)> = None;
 
+    // ability uuid -> total bonus ranks from jewellery, summed across slots
+
+    let mut grade_bonus: std::collections::HashMap<String, u16> =
+
+        std::collections::HashMap::new();
+
+
     for eq in inventory.loadout.equipped_items.0.values() {
         let template = eq.item.item_template_id.as_hyphenated().to_string();
 
@@ -152,6 +159,11 @@ pub fn from_character(character: &CompleteCharacter, inventory: &CompleteInvento
             lo.shield_optimal_block_boost = lo.shield_optimal_block_boost.max(s.optimal_block_boost);
         }
 
+        // --- jewellery GRADING affixes: +N ranks to a named ability ------------
+        // Collected here and applied AFTER `parse_equipped_abilities` below, because
+        // the abilities they raise do not exist on the loadout yet at this point.
+        collect_grade_bonus(&eq.item.properties.grading, &mut grade_bonus);
+
         // --- enchantments, dispatched on the family's LOGIC CLASS (Phase 3.6/3.7) ---
         for prop in &eq.item.properties.enchanting {
             let tier = prop.tier.min(u8::MAX as u64) as u8;
@@ -165,6 +177,14 @@ pub fn from_character(character: &CompleteCharacter, inventory: &CompleteInvento
     }
 
     lo.abilities = parse_equipped_abilities(&character.equipped_abilities, &character.abilities);
+
+    // Gear-granted ability ranks. Until this existed EVERY ability resolved at its
+    // base rank — a ~2.3x damage shortfall. The owner's Frostbite produced rank-4
+    // numbers on the wire while his skills menu read 4+10.
+    //
+    // Additive across slots (the same ring in both hands gives +5+5), clamped to the
+    // ability's own `maximum_level`.
+    apply_grade_bonuses(&mut lo.abilities, &grade_bonus);
     lo.paralyze_rank = lo
         .abilities
         .iter()
@@ -314,6 +334,79 @@ fn push_enchant(lo: &mut Loadout, ty: DamageType, tier: u8) {
     lo.enchants.push((ty, tier));
 }
 
+/// Bonus ranks a jewellery GRADING affix grants at `tier`.
+///
+/// The shipped data carries NO magnitude for these —
+/// `AbilityBonusRanksStaticData` has exactly one field, `_abilityUid` — so the
+/// number is not extractable and had to be measured.
+///
+/// Two independent sources agree on the ceiling of 5 per slot:
+///   * observed in game on a mixed-tier ring — tier 2 grants +5, tier 1 grants +4;
+///   * the shipped headroom `maximum_level - maximum_purchaseable_level` equals
+///     `5 x slots` for 46 of the 49 abilities that carry a grade property (two
+///     ring slots, one necklace slot).
+///
+/// Only tiers 1 and 2 occur in the whole captured corpus (365 and 239 entries),
+/// so the curve beyond them is unobserved; anything higher is clamped to the
+/// measured ceiling rather than extrapolated.
+///
+/// A previous attempt derived this from the ability's rank COUNT
+/// (`floor(n_ranks / 3)`). It fits all three observations exactly and is WRONG:
+/// it contradicts the shipped headroom on 36 of 49 abilities — under it Ice
+/// Spike's ceiling would be 12, but the game ships 14. Do not reintroduce it.
+fn grade_bonus_ranks(tier: u8) -> u8 {
+    match tier {
+        0 => 0,
+        1 => 4,
+        _ => 5,
+    }
+}
+
+/// Sum a jewellery item's GRADING affixes into `out`, keyed by boosted ability.
+///
+/// Split out from `from_character` so it is testable without constructing a whole
+/// character: the collection half and the application half are where the bugs live,
+/// and neither is reachable from a test of the tier rule alone.
+fn collect_grade_bonus(
+    grading: &[blades_lib::user_data::ItemSingleProperty],
+    out: &mut std::collections::HashMap<String, u16>,
+) {
+    for prop in grading {
+        let guid = prop.id.as_hyphenated().to_string();
+        let Some(g) = gamedata::grade_property(&guid) else {
+            continue;
+        };
+        let tier = prop.tier.min(u8::MAX as u64) as u8;
+        *out.entry(g.ability_uuid.to_string()).or_insert(0) +=
+            u16::from(grade_bonus_ranks(tier));
+    }
+}
+
+/// Raise each equipped ability by its accumulated jewellery bonus, clamped to the
+/// ability's shipped `maximum_level`.
+fn apply_grade_bonuses(
+    abilities: &mut [EquippedAbility],
+    bonus: &std::collections::HashMap<String, u16>,
+) {
+    for a in abilities.iter_mut() {
+        let Some(extra) = bonus.get(&a.instance_uuid) else {
+            continue;
+        };
+        let cap = gamedata::ability(&a.instance_uuid)
+            .map(|ab| ab.maximum_level)
+            .unwrap_or_else(|| u16::from(a.level));
+        let raised = (u16::from(a.level) + *extra).min(cap);
+        if raised != u16::from(a.level) {
+            log::debug!(
+                "loadout: ability {} rank {} -> {raised} (+{extra} from jewellery, cap {cap})",
+                a.instance_uuid,
+                a.level,
+            );
+        }
+        a.level = raised.min(u16::from(u8::MAX)) as u8;
+    }
+}
+
 fn push_resist(lo: &mut Loadout, ty: DamageType, rating: f32) {
     lo.resistances.push((ty, rating));
 }
@@ -394,6 +487,138 @@ fn parse_equipped_abilities(equipped: &Value, levels: &Value) -> Vec<EquippedAbi
 
 #[cfg(test)]
 mod tests {
+
+    /// Collection: a ring's GRADING affixes become per-ability bonus ranks.
+    ///
+    /// This half is what a test of `grade_bonus_ranks` alone cannot reach — zeroing
+    /// the accumulation leaves the tier rule perfectly correct and the mechanic dead.
+    #[test]
+    fn grading_affixes_collect_into_per_ability_bonuses() {
+        use blades_lib::user_data::ItemSingleProperty;
+        let mut out = std::collections::HashMap::new();
+        // FrostbiteBonusRanks at tier 2 -> +5 on Frostbite.
+        super::collect_grade_bonus(
+            &[ItemSingleProperty {
+                id: Uuid::parse_str("d5676014-c4f7-4da6-a6e7-3a5e3d495da9").unwrap(),
+                tier: 2,
+            }],
+            &mut out,
+        );
+        assert_eq!(out.get("4be1d681-c35d-4540-b255-c2910ac80664"), Some(&5));
+    }
+
+    /// The owner's actual gear: the SAME ring in both hands, so Frostbite gets +10.
+    ///
+    /// His skills menu reads "Frostbite 4+10" — base 4 plus two rings at +5. This is
+    /// the end-to-end fixture for the whole mechanic: additive stacking across slots,
+    /// then the per-ability clamp.
+    #[test]
+    fn the_same_ring_in_both_hands_stacks_additively() {
+        use blades_lib::user_data::ItemSingleProperty;
+        let frostbite_affix = || ItemSingleProperty {
+            id: Uuid::parse_str("d5676014-c4f7-4da6-a6e7-3a5e3d495da9").unwrap(),
+            tier: 2,
+        };
+        let mut bonus = std::collections::HashMap::new();
+        super::collect_grade_bonus(&[frostbite_affix()], &mut bonus); // ring 1
+        super::collect_grade_bonus(&[frostbite_affix()], &mut bonus); // ring 2
+        assert_eq!(bonus.get("4be1d681-c35d-4540-b255-c2910ac80664"), Some(&10));
+
+        let mut abilities = vec![EquippedAbility {
+            instance_uuid: "4be1d681-c35d-4540-b255-c2910ac80664".into(),
+            level: 4,
+            tag: AbilityTag::Damage,
+        }];
+        super::apply_grade_bonuses(&mut abilities, &bonus);
+        assert_eq!(abilities[0].level, 14, "base 4 + two rings at +5 = 14");
+    }
+
+    /// The bonus is clamped to the ability's shipped `maximum_level`.
+    #[test]
+    fn a_gear_bonus_cannot_exceed_the_abilitys_maximum_level() {
+        let uuid = "4be1d681-c35d-4540-b255-c2910ac80664"; // Frostbite, maximum_level 16
+        let cap = gamedata::ability(uuid).unwrap().maximum_level;
+        let mut bonus = std::collections::HashMap::new();
+        bonus.insert(uuid.to_string(), 99u16);
+
+        let mut abilities = vec![EquippedAbility {
+            instance_uuid: uuid.into(),
+            level: 10,
+            tag: AbilityTag::Damage,
+        }];
+        super::apply_grade_bonuses(&mut abilities, &bonus);
+        assert_eq!(u16::from(abilities[0].level), cap, "must clamp at maximum_level");
+    }
+
+    /// An ability with no jewellery bonus is left exactly as it was.
+    #[test]
+    fn abilities_without_a_grade_bonus_are_untouched() {
+        let mut abilities = vec![EquippedAbility {
+            instance_uuid: "4be1d681-c35d-4540-b255-c2910ac80664".into(),
+            level: 4,
+            tag: AbilityTag::Damage,
+        }];
+        super::apply_grade_bonuses(&mut abilities, &std::collections::HashMap::new());
+        assert_eq!(abilities[0].level, 4);
+    }
+
+    /// The measured tier -> ranks rule, and its ceiling.
+    #[test]
+    fn grade_bonus_is_four_at_tier_one_and_five_above() {
+        assert_eq!(super::grade_bonus_ranks(0), 0);
+        assert_eq!(super::grade_bonus_ranks(1), 4, "observed in game");
+        assert_eq!(super::grade_bonus_ranks(2), 5, "observed in game");
+        // Only tiers 1 and 2 exist in the whole captured corpus. Anything higher is
+        // clamped to the measured ceiling rather than extrapolated — the shipped
+        // headroom is 5 per slot for 46 of 49 abilities, so 5 IS the ceiling.
+        assert_eq!(super::grade_bonus_ranks(9), 5, "clamped, not extrapolated");
+    }
+
+    /// The rule must NOT be the rank-count formula that was published and retracted.
+    ///
+    /// `floor(n_ranks / 3)` fits all three in-game observations exactly and is wrong:
+    /// it contradicts the shipped headroom on 36 of 49 abilities. Ice Spike has 14
+    /// ranks, so that formula caps gear at +4/slot and its ceiling at 12 — but the
+    /// game ships `maximum_level` 14. This pins the difference so it cannot come back.
+    #[test]
+    fn the_retracted_rank_count_formula_is_not_what_we_use() {
+        // Ice Spike: 14 ranks. floor(14/3) = 4, which would be tier-independent.
+        // The real rule gives 4 at tier 1 but 5 at tier 2.
+        assert_ne!(
+            super::grade_bonus_ranks(2),
+            14 / 3,
+            "tier 2 must grant 5, not the rank-count formula's 4",
+        );
+    }
+
+    /// Every shipped grade property resolves to a real ability.
+    ///
+    /// The table is generated, so the failure mode is a silent mismatch after a
+    /// regeneration — a property pointing at an ability uuid that no longer exists
+    /// would simply never grant its bonus, with nothing to notice.
+    #[test]
+    fn every_grade_property_points_at_a_known_ability() {
+        assert!(!gamedata::GRADE_PROPERTIES.is_empty(), "the table must not be empty");
+        for g in gamedata::GRADE_PROPERTIES.iter() {
+            assert!(
+                gamedata::ability(g.ability_uuid).is_some(),
+                "{} ({}) points at unknown ability {}",
+                g.editor_name,
+                g.uuid,
+                g.ability_uuid,
+            );
+        }
+    }
+
+    /// Frostbite's grade property, looked up the way the loadout does it.
+    #[test]
+    fn the_frostbite_grade_property_resolves() {
+        let g = gamedata::grade_property("d5676014-c4f7-4da6-a6e7-3a5e3d495da9")
+            .expect("FrostbiteBonusRanks must be in the generated table");
+        assert_eq!(g.editor_name, "FrostbiteBonusRanks");
+        assert_eq!(g.ability_uuid, "4be1d681-c35d-4540-b255-c2910ac80664");
+        assert_eq!(g.slot, "Ring");
+    }
 
     /// The shipped Frost Revenge enchantment must land as ~137.32, not 7591.
     ///

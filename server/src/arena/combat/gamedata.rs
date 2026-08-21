@@ -61,6 +61,8 @@ pub mod source_hashes {
     pub const ABILITIES_FULL: &str = "a2c287755ca303adf038c64755402580dff0170457e3add698e36f9308c53c5d";
     /// sha256 of `reference/game-defs/enchantments.json`.
     pub const ENCHANTMENTS: &str = "2ff3bb76d3b3776c84e02149b3cbf9f098d9e0fa710cb6438be0dab89b9573c1";
+    /// sha256 of `reference/game-defs/grade_properties.json`.
+    pub const GRADE_PROPERTIES: &str = "f969bfb9845a30d80e3bf602403724ace99dfe5a1673856c9e4986c7b4b8b3d3";
 
     /// `(filename, sha256)` for every source, in generation order.
     pub const ALL: &[(&str, &str)] = &[
@@ -68,6 +70,7 @@ pub mod source_hashes {
         ("items.json", ITEMS),
         ("abilities_full.json", ABILITIES_FULL),
         ("enchantments.json", ENCHANTMENTS),
+        ("grade_properties.json", GRADE_PROPERTIES),
     ];
 }
 
@@ -36539,6 +36542,323 @@ pub const ENCHANT_TIERS: [EnchantTier; 1094] = [
     },
 ];
 
+/// A jewellery GRADING affix: which ability it grants bonus ranks to.
+///
+/// The magnitude is deliberately absent, because the shipped data does not
+/// carry one — `AbilityBonusRanksStaticData` has a single field, `_abilityUid`.
+/// Observed in game: tier 1 grants +4 and tier 2 grants +5, and the ceiling is
+/// 5 per jewellery slot (`maximum_level - maximum_purchaseable_level` is
+/// `5 x slots` for 46 of the 49 abilities carrying one).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GradeProperty {
+    /// The affix UUID, as it appears in `item.properties.GRADING[].id`.
+    pub uuid: &'static str,
+    /// Editor name, e.g. `FrostbiteBonusRanks`.
+    pub editor_name: &'static str,
+    /// UUID of the ability whose rank this raises.
+    pub ability_uuid: &'static str,
+    /// Which jewellery list it came from — Ring (two slots) or Necklace (one).
+    pub slot: &'static str,
+}
+
+/// All 49 jewellery grade properties, **sorted by `uuid`**.
+pub const GRADE_PROPERTIES: [GradeProperty; 49] = [
+    GradeProperty {
+        uuid: "0e570b97-87ba-4967-a7fa-cf51f40065fb",
+        editor_name: "CombatFocusBonusRanks",
+        ability_uuid: "e0b549c8-a686-49d4-a800-4661fff73e1d",
+        slot: "Necklace",
+    },
+    GradeProperty {
+        uuid: "0eec2883-8bc1-4fdd-a939-8292b545e35d",
+        editor_name: "PiercingStrikesBonusRanks",
+        ability_uuid: "cdab44fb-6ff6-4701-a4ec-d19cce79e49f",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "0f7b4dcc-da92-4133-b716-b06a1afd6aaa",
+        editor_name: "MatchingSetBonusRanks",
+        ability_uuid: "3dcb91c5-2279-4003-b6a6-53eac6fb86c8",
+        slot: "Necklace",
+    },
+    GradeProperty {
+        uuid: "16436d01-d60e-4397-81ab-a3481020439a",
+        editor_name: "FocusingDodgeBonusRanks",
+        ability_uuid: "e685e88f-34e7-4fdc-bacd-618763078d65",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "1ee674e6-8440-401f-945e-9318e080a5e8",
+        editor_name: "RecklessFuryBonusRanks",
+        ability_uuid: "0cfe29cd-89d9-42ad-9227-8308e2f87c7f",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "2582bb2c-3165-4c1b-b91f-2491f88a0c9d",
+        editor_name: "PoisonCloudBonusRanks",
+        ability_uuid: "66bdc017-30c5-4b5e-9753-215c45056f6a",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "266ac7c0-b53f-4345-8646-8cc5939944f6",
+        editor_name: "AdrenalineDodgeBonusRanks",
+        ability_uuid: "be56c560-a4ba-47ad-8513-f24c342ca594",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "2af1fd3a-e7b4-488f-a15b-09243e1958e3",
+        editor_name: "ThunderstormBonusRanks",
+        ability_uuid: "2ab06506-2114-4738-bd87-f6f402d3ce2e",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "2dc15011-e900-43dc-ab15-74dcbb76c85e",
+        editor_name: "ResistElementsBonusRanks",
+        ability_uuid: "91078132-ef5c-492a-97f2-ac69be5140a8",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "2fc55741-1c89-46cd-85e2-a8a27f6cea38",
+        editor_name: "AugmentedFlamesBonusRanks",
+        ability_uuid: "ed235f8d-0648-4aee-b955-a951562f549d",
+        slot: "Necklace",
+    },
+    GradeProperty {
+        uuid: "328a6fe8-1826-48ed-90af-91af7bae821c",
+        editor_name: "BlindBonusRanks",
+        ability_uuid: "85596d85-5f2a-4f3a-9059-960eaff79a87",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "33f0477b-704c-48a3-a4f1-6ab1a9a1916b",
+        editor_name: "ScoutBonusRanks",
+        ability_uuid: "11ebd583-fc0c-44f0-8dbf-5c7207526064",
+        slot: "Necklace",
+    },
+    GradeProperty {
+        uuid: "360e3a3b-307f-401a-b357-e674d01dc834",
+        editor_name: "HealingSurgeBonusRanks",
+        ability_uuid: "09aa3390-8f42-4cd5-a88c-5c94d5e1dd29",
+        slot: "Necklace",
+    },
+    GradeProperty {
+        uuid: "370d00b8-af67-4cfa-a327-ccc8585e1bb5",
+        editor_name: "RenewingDodgeBonusRanks",
+        ability_uuid: "7f78d342-f346-4210-9f62-01a540687bb3",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "40215e5f-767a-45b8-bf92-9012f66217bb",
+        editor_name: "AbsorbBonusRanks",
+        ability_uuid: "4e760726-b012-4b25-bc92-0cd6312d6601",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "41e72fea-cc55-41c6-b89c-e9ccc88a17f3",
+        editor_name: "SkullcrusherBonusRanks",
+        ability_uuid: "c112c956-eaac-4d7d-878e-32cd7d1e5209",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "4683da1e-5fc4-42a2-b2c4-fba6de1ca72a",
+        editor_name: "IndomitableSmashBonusRanks",
+        ability_uuid: "66610227-07bf-4e3b-a75b-c591271f0817",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "4773dffb-5b15-48cd-b99b-47214f0af7ef",
+        editor_name: "ShieldBashBonusRanks",
+        ability_uuid: "f9a2373b-a84f-4716-90ce-165baa2dd6ed",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "4792e8b7-4adb-4ee0-9f74-11d4246eb6b0",
+        editor_name: "MaximumPowerBonusRanks",
+        ability_uuid: "83784ade-533e-4965-a540-05bfd4f056d8",
+        slot: "Necklace",
+    },
+    GradeProperty {
+        uuid: "53671f03-59b2-49ed-acb1-f2dcc10ab0e4",
+        editor_name: "GuardbreakerBonusRanks",
+        ability_uuid: "cc768bae-a063-4885-8207-f39c6542fb36",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "5af1b056-7d44-4e02-a653-bc538569b4e6",
+        editor_name: "AugmentedFrostBonusRanks",
+        ability_uuid: "270ae0e8-3758-4840-bdc2-e882008f0f0a",
+        slot: "Necklace",
+    },
+    GradeProperty {
+        uuid: "5b7960d3-f100-4b7b-956d-903fe09598e0",
+        editor_name: "ReflectingBashBonusRanks",
+        ability_uuid: "ba61ce46-163f-4a61-8ede-f5b7ae365e40",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "611e1d55-8b23-4b4c-9db1-27532e83cbd0",
+        editor_name: "WardBonusRanks",
+        ability_uuid: "65ede044-d68a-4b2b-8f0c-02075ad133cc",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "6bc19568-2f76-4c0e-8482-dee16629dc5b",
+        editor_name: "ConsumingInfernoBonusRanks",
+        ability_uuid: "e07f9b1a-64db-44ef-ba25-0e4378789ddc",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "6c6d9c5d-814a-42aa-948b-c6210311c3da",
+        editor_name: "ConservationistBonusRanks",
+        ability_uuid: "2eff05aa-a6a8-4060-9bac-8be1bb60c040",
+        slot: "Necklace",
+    },
+    GradeProperty {
+        uuid: "6d4e4437-3448-4a61-98e8-12a7e6850c8c",
+        editor_name: "DelayedLightningBoltBonusRanks",
+        ability_uuid: "dfb8d247-1333-42eb-9730-a1c16d10584f",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "71a55022-713d-450d-aa54-551cea5a1d02",
+        editor_name: "MettleBonusRanks",
+        ability_uuid: "d6d7ad89-0c41-410f-8a19-c4850ab9fe4f",
+        slot: "Necklace",
+    },
+    GradeProperty {
+        uuid: "72f4c7da-b097-40f1-b940-e5781751f356",
+        editor_name: "MagickaSurgeBonusRanks",
+        ability_uuid: "1c836287-44d8-40a6-bf02-d457f57d171d",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "7ed4d49b-5053-4a5d-bbac-b32a96871a85",
+        editor_name: "EnchantmentSynergyBonusRanks",
+        ability_uuid: "780b82d1-a371-4454-baea-e18389f315e5",
+        slot: "Necklace",
+    },
+    GradeProperty {
+        uuid: "7f66e203-4e89-47fc-8287-7e27590ad673",
+        editor_name: "FireballBonusRanks",
+        ability_uuid: "d07a8d30-9a1c-49b0-866d-97a8aa1534cf",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "823073fa-9501-49d4-9f95-ffc4740c8e74",
+        editor_name: "VenomStrikesBonusRanks",
+        ability_uuid: "e14eedd5-cd50-404e-9697-a37fd1d2ce02",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "8687fa52-155a-4777-8e94-e3a4332ec093",
+        editor_name: "ArmsmanBonusRanks",
+        ability_uuid: "3f575c09-ca6d-40a8-977b-b2c5d44d1b5c",
+        slot: "Necklace",
+    },
+    GradeProperty {
+        uuid: "8e9928a8-4793-4e15-ae24-91c41aebad9c",
+        editor_name: "BlizzardArmorBonusRanks",
+        ability_uuid: "c4b48518-e847-4f3d-81a2-2856bdb4ed98",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "9a96b343-af96-4852-825b-06a0fe2d07b4",
+        editor_name: "BarbarianBonusRanks",
+        ability_uuid: "64a6a981-0dc8-4fc1-b043-a75d052b00f5",
+        slot: "Necklace",
+    },
+    GradeProperty {
+        uuid: "9ec3bb8a-050a-4b4e-ae82-c1b570b49278",
+        editor_name: "QuickStrikesBonusRanks",
+        ability_uuid: "eb0cb7e6-47cf-48e7-8cc9-dbf80fc77f13",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "9f68a947-4b4c-434f-95ee-9aad4990e813",
+        editor_name: "AugmentedShockBonusRanks",
+        ability_uuid: "3c0510d4-84ef-40b6-b0f4-2b096ae89860",
+        slot: "Necklace",
+    },
+    GradeProperty {
+        uuid: "b442ea19-02cb-4825-aa13-2f2f14ccd338",
+        editor_name: "DodgingStrikeBonusRanks",
+        ability_uuid: "1e7f0dd6-6015-4f65-b811-3246e407e330",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "c68b9c82-9f6f-4b10-9fce-c64dd3020084",
+        editor_name: "StaggeringBashBonusRanks",
+        ability_uuid: "9b915ec3-c63b-4b62-b417-4c5436d45fc1",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "ceeed207-4d8c-493d-b506-c6ca65116d6b",
+        editor_name: "RecoveryStrikesBonusRanks",
+        ability_uuid: "e08f95de-85bb-4829-ba7e-cf45bc6fb422",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "d1749122-5ada-4017-918d-990fc7717481",
+        editor_name: "ParalyzeBonusRanks",
+        ability_uuid: "9fdc4d52-ce90-44f8-9b5d-21f31e27dbda",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "d5676014-c4f7-4da6-a6e7-3a5e3d495da9",
+        editor_name: "FrostbiteBonusRanks",
+        ability_uuid: "4be1d681-c35d-4540-b255-c2910ac80664",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "ede8bce4-de2c-4ca5-bc44-c214f15189ba",
+        editor_name: "PowerAttackBonusRanks",
+        ability_uuid: "ce6b63e9-9f18-49c4-aee0-51f7985f9892",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "ef58796e-980c-41d5-83ca-321cfa3c8667",
+        editor_name: "AugmentedPoisonBonusRanks",
+        ability_uuid: "66faf7c6-426c-4689-99e6-ccdd25b9bc11",
+        slot: "Necklace",
+    },
+    GradeProperty {
+        uuid: "f17be1d9-1c1e-4510-8514-3d108b92220f",
+        editor_name: "FirewallBonusRanks",
+        ability_uuid: "256b722a-c4bd-45ad-ae25-15ee805fbc70",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "f17eb3cb-a4c9-44a8-9aa5-d3ccb0932e30",
+        editor_name: "EchoWeaponBonusRanks",
+        ability_uuid: "f60f69d4-24bc-46fb-a4fa-d4abdac0f06f",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "f3adab07-7e2c-43a9-855e-66c1f4511a4c",
+        editor_name: "IceSpikeBonusRanks",
+        ability_uuid: "cfee0b02-6d91-4d34-869c-a7e54329060d",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "f5e3adb5-8e75-4716-b430-71654b5ce96d",
+        editor_name: "HarryingBashBonusRanks",
+        ability_uuid: "69ffa3fd-deb7-4824-bab6-ac6450f19676",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "fe2923dc-1869-40bf-800b-203a456d0f44",
+        editor_name: "LightningBoltBonusRanks",
+        ability_uuid: "7fc15804-1637-40a9-8dcc-3ea1eb0f778d",
+        slot: "Ring",
+    },
+    GradeProperty {
+        uuid: "ff35b37f-7bc3-455f-81d7-3a2b60417ab5",
+        editor_name: "ElementalProtectionBonusRanks",
+        ability_uuid: "788aa75e-4796-4d57-bbab-b1b901623f16",
+        slot: "Necklace",
+    },
+];
+
 // ------------------------------------------------------------------ lookups
 
 /// Weapon stats for an item template UUID.
@@ -36620,6 +36940,14 @@ pub fn enchant_family(family_uuid: &str) -> Option<&'static EnchantFamily> {
 /// Magnitude of an `item.properties.ENCHANTING[{id, tier}]` entry.
 pub fn enchant_value(family_uuid: &str, tier: u8) -> Option<f32> {
     enchant_family(family_uuid)?.value(tier)
+}
+
+/// Grade property for a GRADING affix UUID.
+pub fn grade_property(uuid: &str) -> Option<&'static GradeProperty> {
+    GRADE_PROPERTIES
+        .binary_search_by(|g| g.uuid.cmp(uuid))
+        .ok()
+        .map(|i| &GRADE_PROPERTIES[i])
 }
 
 /// Stable UUIDs the tests (and, later, the model) refer to by name.
