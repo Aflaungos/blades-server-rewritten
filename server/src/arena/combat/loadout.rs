@@ -397,7 +397,12 @@ fn apply_grade_bonuses(
             .unwrap_or_else(|| u16::from(a.level));
         let raised = (u16::from(a.level) + *extra).min(cap);
         if raised != u16::from(a.level) {
-            log::debug!(
+            // info!, not debug!: production runs RUST_LOG=info, and at debug this —
+            // the only evidence that gear ranks were applied at all — is invisible.
+            // Volume is trivial: at most one line per equipped ability per match, and
+            // every sibling combat diagnostic (STUNNED / FROZEN / REVENGE / damage)
+            // is already info!.
+            log::info!(
                 "loadout: ability {} rank {} -> {raised} (+{extra} from jewellery, cap {cap})",
                 a.instance_uuid,
                 a.level,
