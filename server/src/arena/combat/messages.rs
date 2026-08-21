@@ -833,6 +833,34 @@ pub fn damage_negated(defender_net_object_id: i32) -> Vec<u8> {
     frame(MSGTYPE_USERMESSAGE, w.finish())
 }
 
+/// Build a `RequestExecuteAbility` (gmid 37) c2s frame for `ability_uuid`.
+///
+/// Bots have no ENet peer and therefore no client to send this, but the cast path
+/// (`resolve_ability_cast`) echoes the request bytes back as the op38 authoritative
+/// perform. Rather than give bots a second, parallel cast implementation that could
+/// drift from the human one, they synthesise the frame a client would have sent and
+/// go through the identical path.
+///
+/// Layout is exactly what `input::parse_execute_ability` scans for:
+/// `marker(0x84) ‖ carrier(0x36) ‖ NetObjectInfo prefix ‖ 02 00 00 ‖ [type] ‖
+/// [role=3] ‖ [gmid=37] ‖ [u16-LE len=36] ‖ [36-byte ASCII UUID]`.
+pub fn request_execute_ability(ability_uuid: &str) -> Vec<u8> {
+    debug_assert_eq!(ability_uuid.len(), 36, "ability UUID must be 36 chars");
+    let mut frame = Vec::with_capacity(2 + 6 + 8 + 36);
+    frame.push(0x84); // c2s marker
+    frame.push(0x36); // UserMessage carrier
+    frame.extend_from_slice(&[0x04, 0x1F, 0x70, 0x77, 0x0A, 0x35]); // NetObjectInfo prefix
+    frame.extend_from_slice(&[
+        0x02, 0x00, 0x00, // separator
+        0x38, // type nibble
+        0x03, // role = Autonomous
+        0x25, // gmid = 37
+        0x24, 0x00, // u16-LE length = 36
+    ]);
+    frame.extend_from_slice(ability_uuid.as_bytes());
+    frame
+}
+
 /// `PlayerDeadStateChange` (29) — the addressed avatar died (the killing blow).
 ///
 /// **Capture-proven layout (s506 #3523661, the final-round death):** op29 rides the
