@@ -1019,6 +1019,13 @@ fn stun_the_blocked_attacker(
         "combat: slot {attacker_slot} STUNNED {secs:.2}s — its weapon attack was \
          blocked HIGH by slot {blocker_slot} (tracker #31)"
     );
+    // Retail sends the actor-state frame BEFORE the status frame: 90 of 90 staggering
+    // high blocks in s615/s616, no exceptions. `apply_stagger_for` above queued the
+    // Staggered transition, so drain THIS actor now and the op39 goes out ahead of the
+    // op51. Without this the end-of-tick drain appends it afterwards and every stun we
+    // send is in the opposite order to every one retail sent.
+    out.extend(drain_state_changes_for(combat, now, Some(attacker_slot)));
+
     let frame =
         messages::change_combat_status_effect(obj, true, StatusEffectType::Staggered, secs, 0);
     for v in 0..viewers {
@@ -2606,9 +2613,29 @@ const RECOVERY_DELAY: Duration = Duration::from_millis(17);
 /// case: every one of the 593 decoded retail swings begins with a 45 for the same
 /// avatar 300-400 ms before its 52.
 pub fn drain_state_changes(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8>)> {
+    drain_state_changes_for(combat, now, None)
+}
+
+/// As [`drain_state_changes`], but optionally for ONE slot.
+///
+/// Exists for ordering. Retail sends the actor-state frame BEFORE the status frame
+/// that accompanies it — measured at 90/90 on high-block stuns in s615/s616, with no
+/// exceptions. Our status frames are emitted inline where the effect is applied, while
+/// state frames come from the end-of-tick drain, which put us in the opposite order on
+/// every single one. A caller that emits a status can drain its own actor's state first
+/// and restore retail's order without giving up the single-seam drain for everything
+/// else: the end-of-tick call then finds nothing left for that slot.
+pub fn drain_state_changes_for(
+    combat: &mut MatchCombat,
+    now: Instant,
+    only: Option<usize>,
+) -> Vec<(usize, Vec<u8>)> {
     let viewers = combat.fighters.len();
     let mut out = Vec::new();
     for slot in 0..viewers {
+        if matches!(only, Some(s) if s != slot) {
+            continue;
+        }
         let changes = combat.fighters[slot].take_state_changes();
         if changes.is_empty() {
             continue;
@@ -5444,6 +5471,40 @@ mod report_31_high_block_stun {
             "a bot mid-wind-up must not still be blocking",
         );
         assert!(c.fighters[1].bot_swing_at.is_some(), "and the wind-up must start");
+    }
+
+    /// The high-block stun must put the ACTOR-STATE frame before the STATUS frame.
+    ///
+    /// Measured in retail: across every staggering high block in s615/s616 the order is
+    /// op39 `Staggered` then op51 `Staggered` — **90 of 90, no exceptions**. Our status
+    /// frames are emitted inline while state frames came from the end-of-tick drain,
+    /// which put us in the opposite order on every stun we have ever sent.
+    #[test]
+    fn the_high_block_stun_sends_actor_state_before_status() {
+        let now = Instant::now();
+        let mut c = combat(now, 2);
+        let out = super::stun_the_blocked_attacker(&mut c, 0, 1, now);
+
+        let mut i39 = None;
+        let mut i51 = None;
+        for (n, (_slot, bytes)) in out.iter().enumerate() {
+            if bytes.len() < 3 || bytes[1] != 0x36 {
+                continue;
+            }
+            let p = arena_proto::parse_netdata(&bytes[2..]);
+            match p.int(3) {
+                Some(39) if i39.is_none() => i39 = Some(n),
+                Some(51) if i51.is_none() => i51 = Some(n),
+                _ => {}
+            }
+        }
+
+        let a = i39.expect("the stun must emit an op39 actor-state frame");
+        let b = i51.expect("the stun must emit an op51 status frame");
+        assert!(
+            a < b,
+            "retail sends op39 before op51 (90/90); got op39 at {a} and op51 at {b}",
+        );
     }
 
     /// The death frame's state ring must END in `Dead`, which means the loser has to
