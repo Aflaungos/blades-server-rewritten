@@ -570,6 +570,15 @@ pub struct Loadout {
     /// Attacker-side `Fortify <Element> Damage` — a 0..1 fraction per element that
     /// raises that element track's amplification ceiling. [Phase 3.6]
     pub element_fortify: Vec<(DamageType, f32)>,
+    /// Elemental RETALIATION from gear: when this fighter is hit, each entry deals
+    /// that much of that damage type back at the attacker (`DamageSource::Revenge`).
+    ///
+    /// Capture-measured, not inferred: across 203 Revenge frames in s615/s616 the
+    /// damage type varies per wearer (Frost / Fire / Poison), the magnitudes repeat
+    /// from a small fixed set, and they do NOT scale with the incoming hit — 105.0
+    /// followed a blocked 54.3 and again a blocked 23.8. It is the wearer's gear
+    /// hitting back, not a block-punish.
+    pub revenge: Vec<(DamageType, f32)>,
     /// Display name + character UUID for the round-start op50 spawn. Empty for the
     /// starter loadout (no character row); set by `loadout::from_character` + the
     /// matchmaker's character load.

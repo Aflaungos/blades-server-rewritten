@@ -207,6 +207,20 @@ fn apply_enchant(lo: &mut Loadout, id: &Uuid, tier: u8) {
         "WeaponDamageStaminaPropertyLogic" => push_enchant(lo, DamageType::Stamina, tier),
         "WeaponDamageMagickaPropertyLogic" => push_enchant(lo, DamageType::Magicka, tier),
 
+        // ---- elemental retaliation (Revenge) -------------------------------
+        // Only these FOUR ship values. All nine `SpellRevenge*` /
+        // `BlockSpellRevenge*` / Templar variants are zero at every tier in the
+        // shipped data, so they are deliberately not wired: they would add
+        // dispatch for a mechanic that does nothing.
+        //
+        // `magnitude` is validated against the wire: Frost Revenge t10 is
+        // 7591 * ENCHANT_DAMAGE_PER_VALUE = 137.32, and 137.21 is an observed
+        // value in s615 — the remainder being the target's resistance.
+        "RevengeFirePropertyLogic" => lo.revenge.push((DamageType::Fire, magnitude)),
+        "RevengeFrostPropertyLogic" => lo.revenge.push((DamageType::Frost, magnitude)),
+        "RevengeShockPropertyLogic" => lo.revenge.push((DamageType::Shock, magnitude)),
+        "RevengePoisonPropertyLogic" => lo.revenge.push((DamageType::Poison, magnitude)),
+
         // ---- resistance ratings (Phase 3.4) --------------------------------
         "ResistFirePropertyLogic" | "ResistFireMaterialPropertyLogic" => {
             push_resist(lo, DamageType::Fire, magnitude)
@@ -380,6 +394,47 @@ fn parse_equipped_abilities(equipped: &Value, levels: &Value) -> Vec<EquippedAbi
 
 #[cfg(test)]
 mod tests {
+
+    /// The shipped Frost Revenge enchantment must land as ~137.32, not 7591.
+    ///
+    /// This goes through `apply_enchant` deliberately. A test that sets
+    /// `loadout.revenge` by hand cannot catch the scaling bug, and that bug has real
+    /// form in this file — the block-rating arm shipped unscaled once and put a single
+    /// tier-10 enchant 8x past its cap.
+    ///
+    /// 7591 * ENCHANT_DAMAGE_PER_VALUE = 137.32, and 137.21 is an observed value on
+    /// the wire in s615.
+    #[test]
+    fn frost_revenge_t10_is_scaled_to_the_captured_magnitude() {
+        use super::super::state::DamageType;
+        let mut lo = starter();
+        lo.revenge.clear();
+        let id = Uuid::parse_str("17718cb7-fb8a-4fbc-adeb-c4cdbc37faf4").unwrap();
+        super::apply_enchant(&mut lo, &id, 10);
+
+        assert_eq!(lo.revenge.len(), 1, "the enchantment must register exactly once");
+        let (ty, mag) = lo.revenge[0];
+        assert_eq!(ty, DamageType::Frost);
+        assert!(
+            (mag - 137.32).abs() < 0.05,
+            "expected the scaled 137.32 (matching the wire), got {mag} — \
+             an unscaled value would be 7591",
+        );
+    }
+
+    /// The nine zero-valued Revenge variants must not register a retaliation.
+    #[test]
+    fn the_vs_spell_revenge_variants_are_inert() {
+        let mut lo = starter();
+        lo.revenge.clear();
+        // "Frost Revenge Vs Spell" — 0.0 at every one of its ten tiers.
+        let id = Uuid::parse_str("18ef65f2-7585-401b-b7a4-3fe66a830721").unwrap();
+        super::apply_enchant(&mut lo, &id, 10);
+        assert!(
+            lo.revenge.iter().all(|(_t, m)| *m > 0.0),
+            "a zero-magnitude family must not add a retaliation entry",
+        );
+    }
     use super::*;
     use serde_json::json;
 

@@ -1726,8 +1726,87 @@ fn emit_damage(
     // Paralyze poison→paralyse layering. [status-resistance-spec §5]
     out.extend(apply_status_conditioning(combat, target_slot, &components, now));
 
+    // The DEFENDER's gear hits back. Emitted after the hit that provoked it and
+    // before any death check, so a Revenge proc can itself be the killing blow —
+    // which is how retail orders it (`op50 blocked` then `op50 src=Revenge`).
+    out.extend(apply_revenge(combat, target_slot, attacker_slot, now));
+
     if combat.fighters[target_slot].is_dead() {
         out.extend(on_round_ending_death(combat, attacker_slot, now));
+    }
+    if combat.fighters[attacker_slot].is_dead() {
+        out.extend(on_round_ending_death(combat, target_slot, now));
+    }
+    out
+}
+
+/// Elemental retaliation: the fighter who was just hit deals their gear's Revenge
+/// damage back at whoever hit them.
+///
+/// Capture-measured over 203 Revenge frames in s615/s616, which is also what proves
+/// this is GEAR and not a block-punish: the damage type varies per wearer (Frost,
+/// Fire, Poison), each wearer's magnitudes repeat from a tiny fixed set, and the
+/// value does not track the incoming hit — 105.0 followed a blocked 54.3 and again a
+/// blocked 23.8. Retail's frames carry `flags=3` (SHOW|ATTACKER) and never the
+/// OPTIMAL bit, so it fires on being hit, blocked or not.
+///
+/// NO RECURSION: this emits a damage frame directly rather than re-entering the hit
+/// pipeline, so an attacker's own Revenge cannot fire in response to being retaliated
+/// against. Two wearers would otherwise ping-pong until one died.
+fn apply_revenge(
+    combat: &mut MatchCombat,
+    defender_slot: usize,
+    attacker_slot: usize,
+    _now: Instant,
+) -> Vec<(usize, Vec<u8>)> {
+    let mut out = Vec::new();
+    if defender_slot == attacker_slot {
+        return out;
+    }
+    let entries = match combat.fighters.get(defender_slot) {
+        Some(f) if !f.loadout.revenge.is_empty() => f.loadout.revenge.clone(),
+        _ => return out,
+    };
+
+    for (ty, raw) in entries {
+        if raw <= 0.0 {
+            continue;
+        }
+        // Resistance is the attacker's, and it is what explains the gap between the
+        // shipped 137.32 and the 137.21 seen on the wire.
+        let resisted = {
+            let a = &combat.fighters[attacker_slot];
+            // No elemental piercing: that is a property of an ATTACK, and Revenge is
+            // gear firing on its own, not a swing the wearer aimed.
+            (raw - a.total_resistance_against(ty, 0.0, _now)).max(0.0)
+        };
+        if resisted <= 0.0 {
+            continue;
+        }
+        combat.fighters[attacker_slot].take_damage(resisted.round().max(0.0) as u32);
+        let msg = {
+            let hit = &combat.fighters[attacker_slot];
+            let other = &combat.fighters[defender_slot];
+            messages::receive_damage(
+                hit.net_object_id,
+                NetObjectType::Avatar as u8,
+                hit.packed_stats(),
+                other.packed_stats(),
+                super::state::DamageSource::Revenge,
+                super::damage::flags::SHOW_DAMAGE | super::damage::flags::HAS_ATTACKER,
+                resisted,
+                0,
+                ActiveSide::None,
+                super::state::DamageType::None,
+                &[(ty, resisted)],
+            )
+        };
+        info!(
+            "combat: slot {defender_slot} REVENGE {ty:?} {resisted:.2} back at slot {attacker_slot}"
+        );
+        for v in 0..combat.fighters.len() {
+            out.push((v, msg.clone()));
+        }
     }
     out
 }
@@ -5377,6 +5456,105 @@ mod report_31_high_block_stun {
         super::on_tick(&mut c, after, false);
         assert!(!c.fighters[1].is_staggered(after));
         assert!(c.fighters[1].bot_swing_at.is_some(), "the bot swings again after the stun");
+    }
+
+    // -----------------------------------------------------------------------
+    // Revenge — elemental retaliation from gear
+    // -----------------------------------------------------------------------
+
+    /// Being hit makes the DEFENDER's gear hit back, and the magnitude is the shipped
+    /// enchantment value — validated against the wire, not invented.
+    ///
+    /// Frost Revenge t10 is `7591 * ENCHANT_DAMAGE_PER_VALUE = 137.32`, and **137.21
+    /// is an observed value in s615**, the remainder being the target's resistance.
+    #[test]
+    fn being_hit_retaliates_with_the_gears_element() {
+        let now = Instant::now();
+        let mut c = combat(now, 2);
+        c.fighters[1].loadout.revenge = vec![(super::super::state::DamageType::Frost, 137.32)];
+        let hp_before = c.fighters[0].health;
+
+        let out = super::apply_revenge(&mut c, 1, 0, now);
+
+        assert!(c.fighters[0].health < hp_before, "the attacker must take the retaliation");
+        let rev = out
+            .iter()
+            .map(|(_s, b)| b)
+            .find(|b| b.len() > 2 && b[1] == 0x36
+                  && arena_proto::parse_netdata(&b[2..]).int(3) == Some(50))
+            .expect("a Revenge op50 must be emitted");
+        let p = arena_proto::parse_netdata(&rev[2..]);
+        assert_eq!(p.int(6), Some(6), "DamageSource must be Revenge(6)");
+        assert_eq!(p.int(7), Some(3), "flags must be SHOW|ATTACKER — retail never sets OPTIMAL here");
+        assert_eq!(p.int(0), Some(c.fighters[0].net_object_id as i64),
+                   "the frame must address the ATTACKER, who is the one taking it");
+    }
+
+    /// Two fighters both wearing Revenge must not ping-pong retaliation forever.
+    #[test]
+    fn revenge_does_not_retaliate_against_revenge() {
+        let now = Instant::now();
+        let mut c = combat(now, 2);
+        let frost = super::super::state::DamageType::Frost;
+        c.fighters[0].loadout.revenge = vec![(frost, 50.0)];
+        c.fighters[1].loadout.revenge = vec![(frost, 50.0)];
+
+        // One retaliation resolves and stops; it does not re-enter the hit pipeline.
+        let out = super::apply_revenge(&mut c, 1, 0, now);
+        let n = out
+            .iter()
+            .filter(|(_s, b)| b.len() > 2 && b[1] == 0x36
+                    && arena_proto::parse_netdata(&b[2..]).int(6) == Some(6))
+            .count();
+        assert_eq!(n, c.fighters.len(), "exactly one Revenge frame per viewer, no cascade");
+    }
+
+    /// Gear without a Revenge enchantment retaliates for nothing.
+    #[test]
+    fn no_revenge_gear_means_no_retaliation() {
+        let now = Instant::now();
+        let mut c = combat(now, 2);
+        let hp = c.fighters[0].health;
+        let out = super::apply_revenge(&mut c, 1, 0, now);
+        assert!(out.is_empty());
+        assert_eq!(c.fighters[0].health, hp);
+    }
+
+    /// Retaliation must fire from a REAL hit, not just when called directly.
+    ///
+    /// The direct-call tests above cannot catch the wiring being absent — removing the
+    /// `apply_revenge` call from `emit_damage` leaves them all green. This drives an
+    /// actual swing so the hit path itself is under test.
+    #[test]
+    fn a_real_swing_provokes_the_defenders_revenge() {
+        let now = Instant::now();
+        let mut c = combat(now, 2);
+        c.fighters[1].loadout.revenge =
+            vec![(super::super::state::DamageType::Frost, 137.32)];
+        let attacker_hp_before = c.fighters[0].health;
+
+        // Slot 0 swings at slot 1; the hit lands after the follow-through beat.
+        let _ = super::resolve_swing(&mut c, 0, 1, 1.0, now);
+        let out = super::land_due_hits(
+            &mut c,
+            now + super::FOLLOW_THROUGH_DELAY + Duration::from_millis(1),
+        );
+
+        let revenge_frames = out
+            .iter()
+            .filter(|(_s, b)| b.len() > 2 && b[1] == 0x36
+                    && arena_proto::parse_netdata(&b[2..]).int(3) == Some(50)
+                    && arena_proto::parse_netdata(&b[2..]).int(6) == Some(6))
+            .count();
+        assert!(
+            revenge_frames > 0,
+            "a landed hit must provoke the defender's Revenge — the wiring in \
+             emit_damage is what this asserts",
+        );
+        assert!(
+            c.fighters[0].health < attacker_hp_before,
+            "and the attacker must actually lose health to it",
+        );
     }
 
     // -----------------------------------------------------------------------
