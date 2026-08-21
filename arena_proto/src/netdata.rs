@@ -469,6 +469,12 @@ impl NetDataWriter {
         self.put(p, NetDataValue::String(v.into()))
     }
 
+    /// Write a `ByteArray` value. The wire length prefix is a **u8** for this type
+    /// (unlike `String`, which is u16-LE) — see the module header.
+    pub fn bytes(&mut self, p: u8, v: &[u8]) -> &mut Self {
+        self.put(p, NetDataValue::ByteArray(v.to_vec()))
+    }
+
     /// Helper: write the actor `NetObjectInfo` at the canonical propIds 0/1/2
     /// (`netObjectId` Int, `netObjectType` Byte, `netRole` Byte).
     pub fn net_object_info(&mut self, net_object_id: i32, net_object_type: u8, net_role: u8) -> &mut Self {

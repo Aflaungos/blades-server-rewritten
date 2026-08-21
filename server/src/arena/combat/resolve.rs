@@ -1720,7 +1720,7 @@ fn emit_damage(
     out.extend(apply_status_conditioning(combat, target_slot, &components, now));
 
     if combat.fighters[target_slot].is_dead() {
-        out.extend(on_round_ending_death(combat, attacker_slot));
+        out.extend(on_round_ending_death(combat, attacker_slot, now));
     }
     out
 }
@@ -2153,7 +2153,7 @@ fn apply_dot_ticks(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8
 
             if combat.fighters[slot].is_dead() {
                 // DoT killed the defender — score the round for the opponent.
-                out.extend(on_round_ending_death(combat, opp_slot));
+                out.extend(on_round_ending_death(combat, opp_slot, now));
                 break;
             }
         }
@@ -2315,7 +2315,7 @@ fn apply_resist_elements(
 ///   2. op79 flow `RoundEnd` on the Control net-object (the client echoes op80).
 ///   3. op48 `MatchPostRoundInfoMsg` — the round result.
 ///   4. Match net-object `MatchState` → `PostRound`(14).
-fn on_round_ending_death(combat: &mut MatchCombat, winner: usize) -> Vec<(usize, Vec<u8>)> {
+fn on_round_ending_death(combat: &mut MatchCombat, winner: usize, now: Instant) -> Vec<(usize, Vec<u8>)> {
     let mut out = Vec::new();
     let loser = combat.opponent_of(winner).unwrap_or(winner);
     // **Phase 3.14 — DOUBLE-KO.** Both fighters at 0 HP in the same resolution step:
@@ -2333,10 +2333,24 @@ fn on_round_ending_death(combat: &mut MatchCombat, winner: usize) -> Vec<(usize,
     let loser_stats = combat.fighters.get(loser).map(|f| f.packed_stats()).unwrap_or(0);
     let winner_stats = combat.fighters.get(winner).map(|f| f.packed_stats()).unwrap_or(0);
 
-    // 1) op29 PlayerDead for the loser. Carrier 0x36, props 0-6 (NetObjectInfo + the
-    //    two packed-stats ULongs + a cause byte). Cause = WeaponManeuver(3), the s506
-    //    final-blow value. [capture-proven layout — supersedes the old bare guess.]
-    let dead_frame = messages::player_dead(loser_obj, loser_stats, winner_stats, DamageSource::WeaponManeuver as u8);
+    // 1) op29 PlayerDead for the loser, props 0-10.
+    //
+    //    Transition the loser to `Dead` FIRST. The state ring at propId 7 is what the
+    //    client reads to pick a death animation, and its newest entry must equal the
+    //    frame's own propId 6 — an invariant that holds in every retail frame decoded.
+    //    Snapshotting before the transition would ship a ring whose tail is whatever
+    //    the fighter was doing a moment ago, and a death that animates out of the
+    //    wrong pose.
+    if let Some(f) = combat.fighters.get_mut(loser) {
+        f.set_actor_state(ActorStateType::Dead, now);
+    }
+    let (loser_history, loser_time_in_prev) = combat
+        .fighters
+        .get(loser)
+        .map(|f| (f.packed_state_history(), f.time_in_state(now)))
+        .unwrap_or_default();
+    let dead_frame =
+        messages::player_dead(loser_obj, loser_stats, winner_stats, &loser_history, loser_time_in_prev);
     // 3) op48 MatchPostRoundInfoMsg — the result (winner/loser char UUIDs + match id).
     //    matchId = the gameSessionId (the Match net-object's propId9). Carries the ACTUAL
     //    round number (so the client scores THIS round, not a fixed round-3 frame) and
@@ -4616,7 +4630,7 @@ mod phase4_tests {
 
         // Neither side scores on a double-KO.
         let before = combat.rounds_won;
-        let _ = on_round_ending_death(&mut combat, 0);
+        let _ = on_round_ending_death(&mut combat, 0, now);
         assert_eq!(combat.rounds_won, before, "a double-KO scores nothing");
 
         // Tiebreak: higher remaining HP fraction first.
@@ -5289,6 +5303,54 @@ mod report_31_high_block_stun {
         super::on_tick(&mut c, after, false);
         assert!(!c.fighters[1].is_staggered(after));
         assert!(c.fighters[1].bot_swing_at.is_some(), "the bot swings again after the stun");
+    }
+
+    /// The death frame's state ring must END in `Dead`, which means the loser has to
+    /// be transitioned BEFORE the ring is snapshotted.
+    ///
+    /// The client picks its death animation from the pose the fighter was in when it
+    /// died — the tail of this ring. Snapshotting first would ship a ring ending in
+    /// whatever they were doing a moment earlier, and the corpse would animate out of
+    /// the wrong pose. Every retail death frame decoded holds the invariant that the
+    /// newest ring entry equals the frame's own propId 6.
+    #[test]
+    fn a_death_frame_carries_a_state_history_ending_in_dead() {
+        let now = Instant::now();
+        let mut c = combat(now, 2);
+
+        // Give the loser some history to ring: a couple of real transitions first.
+        c.fighters[1].set_actor_state(ActorStateType::Charging, now);
+        c.fighters[1].set_actor_state(ActorStateType::Blocking, now + Duration::from_millis(200));
+
+        let out = super::on_round_ending_death(&mut c, 0, now + Duration::from_millis(400));
+
+        // Find the op29 among the emitted frames and decode it.
+        let death = out
+            .iter()
+            .map(|(_, bytes)| bytes)
+            .find(|b| {
+                b.len() > 2
+                    && b[1] == 0x36
+                    && arena_proto::parse_netdata(&b[2..]).int(3) == Some(29)
+            })
+            .expect("a round-ending death must emit an op29");
+
+        let p = arena_proto::parse_netdata(&death[2..]);
+        assert_eq!(p.int(6), Some(3), "propId 6 must be ActorStateType::Dead");
+
+        let ring = match p.get(7) {
+            Some(arena_proto::NetDataValue::ByteArray(b)) => b.clone(),
+            other => panic!("propId 7 must carry the state ring, got {other:?}"),
+        };
+        assert_eq!(ring.len(), ring[0] as usize + 3, "ring framing: len == count + 3");
+        assert_eq!(
+            *ring.last().unwrap(),
+            3,
+            "the ring must END in Dead — otherwise the client animates the wrong pose",
+        );
+        // And the two ActorDeadState bools retail always sends false.
+        assert_eq!(p.get(9), Some(&arena_proto::NetDataValue::Bool(false)));
+        assert_eq!(p.get(10), Some(&arena_proto::NetDataValue::Bool(false)));
     }
 
     // -----------------------------------------------------------------------
