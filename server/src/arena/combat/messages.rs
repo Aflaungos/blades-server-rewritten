@@ -15,7 +15,7 @@
 
 use arena_proto::{GameMessageId, NetDataWriter};
 
-use super::state::{ActiveSide, DamageSource, DamageType, FlowState, MatchState, NetObjectType, NetRole, StatusEffectType};
+use super::state::{ActiveSide, ActorStateType, DamageSource, DamageType, FlowState, MatchState, NetObjectType, NetRole, StatusEffectType};
 
 /// `NetTransportMessage.MAGIC_HEADER` — present on every message, both directions.
 pub const MARKER_S2C: u8 = 0xBE;
@@ -863,24 +863,45 @@ pub fn request_execute_ability(ability_uuid: &str) -> Vec<u8> {
 
 /// `PlayerDeadStateChange` (29) — the addressed avatar died (the killing blow).
 ///
-/// **Capture-proven layout (s506 #3523661, the final-round death):** op29 rides the
-/// UserMessage carrier `0x36` (NOT its own carrier as the old placeholder guessed) —
-/// it is one of the avatar-state-change family on the Avatar net-object, GMID at
-/// propId 3. NetData `{0:Int deadAvatarObj · 1:Byte 56 Avatar · 2:Byte 1 Authority ·
-/// 3:Byte 29 · 4:ULong deadActorPackedStats · 5:ULong otherActorPackedStats ·
-/// 6:Byte cause}` — the same NetObjectInfo + two packed-stats ULong shape as
-/// `ReceiveDamage`/the 41-45/52 state changes, minus the damage components.
+/// Carrier `0x36`, one of the avatar-state-change family on the Avatar net-object,
+/// GameMessageId at propId 3. Layout, pinned across **196 deaths in 8 prod sessions**
+/// (s615/s616 two-sided + 468/470/601/605/447/572):
 ///
-/// `dead_packed_stats`/`other_packed_stats` are the two actors' current packed pools
-/// (`Fighter::packed_stats`); `cause` is a small byte (s506 = 3, the killing blow's
-/// DamageSource — WeaponManeuver — observed; not the binding field). Byte-for-byte vs
-/// s506 #3523661 (obj 124, p6=3). [decoded from prod arena_udp_frames s506 2026-06-19;
-/// supersedes the prior UNVERIFIED bare-NetObjectInfo guess.]
+/// ```text
+/// 0:Int  deadAvatarObj        4:ULong PvpThisActorStats (dying: health ALWAYS 0)
+/// 1:Byte 56 Avatar            5:ULong PvpOtherActorStats (the killer)
+/// 2:Byte 1 Authority          6:Byte  ActorStateType = 3 Dead   (196/196)
+/// 3:Byte 29                   7:ByteArray PvpPlayerStateHistory
+///                             8:Float timeInPreviousState
+///                             9,10:Bool ActorDeadState.Parameters (false in 196/196)
+/// ```
+///
+/// **propId 6 is the ACTOR STATE, not the damage source.** The single s506 sample this
+/// was originally modelled from read `p6 = 3` and that was interpreted as
+/// `DamageSource::WeaponManeuver`, which is also 3 — an exact collision that made one
+/// sample ambiguous. Across 196 deaths p6 is 3 regardless of what killed the fighter
+/// (Attack 119, WeaponManeuver 52, StatusEffect 10, Revenge 9, Spell 3, …), so it is
+/// `ActorStateType::Dead`. Passing a real DamageSource here would send `Attack`(1) as
+/// state `Blocking`(1) on a sword kill.
+///
+/// **propIds 7-10 were missing entirely.** propId 7 matters beyond completeness: the
+/// client picks the death animation from the pose the fighter was in when it died, and
+/// that pose is the tail of this ring. Retail's spread over 196 deaths — Staggered 56,
+/// Idle 40, Blocking 24, Charging 23, Recovery 21, Paralyzed 15, … — is what makes each
+/// ragdoll look a little different. Sending no history leaves the client with nothing
+/// to vary on.
+///
+/// The ragdoll itself is client-side: `OpponentDeadState` picks a 4-6 s dwell and takes
+/// its force vectors from prefab constants, its direction from the killing blow's
+/// `ActiveSide`, and its variant from that blow's `DamageSource`. Nothing in the death
+/// window carries a seed — all 196 bodies parse with zero leftover bytes and every prop
+/// maps to a named il2cpp field, so there is nowhere for one to hide.
 pub fn player_dead(
     dead_avatar_net_object_id: i32,
     dead_packed_stats: u64,
     other_packed_stats: u64,
-    cause: u8,
+    state_history: &[u8],
+    time_in_previous: f32,
 ) -> Vec<u8> {
     let mut w = NetDataWriter::new();
     w.int(0, dead_avatar_net_object_id)
@@ -889,7 +910,15 @@ pub fn player_dead(
         .byte(3, GameMessageId::PlayerDeadStateChange as u8)
         .ulong(4, dead_packed_stats)
         .ulong(5, other_packed_stats)
-        .byte(6, cause);
+        .byte(6, ActorStateType::Dead as u8)
+        .bytes(7, state_history)
+        .float(8, time_in_previous)
+        // `ActorDeadState.Parameters` is `{ShouldKneel, HasConceded, SpawnedDead}` in
+        // il2cpp — three fields, two on the wire. The corpus holds zero ConcedeMatch
+        // messages, so which two serialise is unresolved; both are false in every
+        // observed death, which is what we send.
+        .bool(9, false)
+        .bool(10, false);
     frame(MSGTYPE_USERMESSAGE, w.finish())
 }
 
@@ -1981,29 +2010,42 @@ mod tests {
         assert_eq!(got, want);
     }
 
-    /// Byte-for-byte vs s506 #3523661 (the final-round death): op29
-    /// `PlayerDeadStateChange` rides carrier 0x36 on the dead Avatar (obj 124), with
-    /// the two packed-stats ULongs at p4/p5 and a cause byte at p6 (the props-0-6
-    /// avatar-state-change shape the family shares — proven against the captured
-    /// header `0a ff 07 70 77 22 d7`). Supersedes the old bare-NetObjectInfo guess.
+    /// Byte-for-byte vs a REAL captured death: prod s616 frame 4410663.
+    ///
+    /// **This test previously pinned props 0-6 and was wrong.** Its own comment cited
+    /// the captured header `0a ff 07 70 77 22 d7` while asserting `06 7f …` — and
+    /// `0a ff 07` is maxPropId=10 with an eleven-bit bitmap, i.e. props 0..10. The
+    /// expected bytes described our truncated builder, not the wire it named, so the
+    /// test stayed green while we shipped a death message four properties short.
+    ///
+    /// The frame below is the whole message, marker to end, taken verbatim from the
+    /// packet (`parse_netdata` consumes all 63 NetData bytes with nothing trailing).
     #[test]
-    fn player_dead_matches_s506() {
-        // s506 #3523661 values: dead obj 124, dead stats 0x000001ec000001ea, other
-        // 0x3b86f83000001ea, cause 3.
-        let got = player_dead(124, 2_113_123_910_122, 4_289_388_580_159_095_274, 3);
-        let want = [
-            0xBE, 0x36, // marker + UserMessage carrier
-            0x06, 0x7F, // maxPropId=6, bitmap {0,1,2,3,4,5,6}
-            0x70, 0x77, 0x22, 0x07, // type nibbles [Int,Byte,Byte,Byte,ULong,ULong,Byte]
-            0x7C, 0x00, 0x00, 0x00, // p0 Int = 124 (dead avatar obj)
-            0x38, // p1 Byte = 56 (Avatar)
-            0x01, // p2 Byte = 1 (Authority)
-            0x1D, // p3 Byte = 29 (PlayerDeadStateChange)
-            0xEA, 0x01, 0x00, 0x00, 0xEC, 0x01, 0x00, 0x00, // p4 ULong dead stats
-            0xEA, 0x01, 0x00, 0x00, 0x30, 0xF8, 0x86, 0x3B, // p5 ULong other stats
-            0x03, // p6 Byte = 3 (cause)
-        ];
-        assert_eq!(got, want, "op29 props 0-6 must byte-match s506 #3523661");
+    fn player_dead_matches_s616_frame_4410663() {
+        let captured: Vec<u8> = {
+            const HEX: &str = "be360aff07707722d765063202000038011dbd01000094210000bd010000ca01802203171445000001000213110500010500040001000213110503728a883c0000";
+            (0..HEX.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&HEX[i..i + 2], 16).unwrap())
+                .collect()
+        };
+
+        // The propId-7 ring and propId-8 float, read back out of that same capture so
+        // the inputs are not hand-transcribed.
+        let parsed = arena_proto::parse_netdata(&captured[2..]);
+        let ring = match parsed.get(7) {
+            Some(arena_proto::NetDataValue::ByteArray(b)) => b.clone(),
+            other => panic!("propId 7 must be a ByteArray, got {other:?}"),
+        };
+        let time_in_prev = match parsed.get(8) {
+            Some(arena_proto::NetDataValue::Float(f)) => *f,
+            other => panic!("propId 8 must be a Float, got {other:?}"),
+        };
+        assert_eq!(ring.len(), ring[0] as usize + 3, "ring framing: len == count + 3");
+        assert_eq!(*ring.last().unwrap(), 3, "the ring must end in the state the frame reports");
+
+        let got = player_dead(562, 36_919_538_876_861, 2_485_988_961_403_535_805, &ring, time_in_prev);
+        assert_eq!(got, captured, "op29 must byte-match s616 frame 4410663");
     }
 
     /// op48 `MatchPostRoundInfoMsg` — pinned against ALL 375 captured s2c frames.
