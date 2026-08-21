@@ -3086,7 +3086,10 @@ pub fn on_tick(combat: &mut MatchCombat, now: Instant, debug_hold: bool) -> Vec<
                 f.blocking_side = ActiveSide::Middle; // retail: propId 9 == 1 in 578/578
                 f.blocking_until = Some(now + BLOCK_LEAK_GUARD);
                 f.block_raised_at = Some(now);
-                debug!("combat: slot {bot} bot guard UP");
+                // info!, not debug!: prod runs RUST_LOG=info. A played match showed
+                // 17 stuns, all one-directional, and this line — the only evidence of
+                // whether the bot ever guarded — produced nothing either way.
+                info!("combat: slot {bot} bot guard UP");
             }
             continue;
         }
