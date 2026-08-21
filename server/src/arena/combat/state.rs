@@ -799,6 +799,13 @@ pub struct Fighter {
     /// the swing `CHARGE_WINDUP` later — otherwise the charge and the swing would be
     /// drained in the same tick and the client would flash through the animation.
     pub bot_swing_at: Option<Instant>,
+    /// For a BOT: how many times it has cast each ability this match, keyed by
+    /// instance UUID. Drives least-cast-first selection so a bot match exercises the
+    /// whole loadout instead of hammering whichever ability happens to sort first.
+    pub bot_cast_counts: std::collections::HashMap<String, u32>,
+    /// For a BOT: when it last cast an ability, throttling casts independently of the
+    /// swing cadence so it does both rather than one or the other.
+    pub bot_last_cast: Option<Instant>,
     /// Server-side timestamp when this fighter last pressed the attack button (op46
     /// `_held=1`). Used with the release timestamp (op46 `_held=0`) to compute the
     /// server-measured hold duration for the held-charge crit gate (bug 4).
@@ -997,6 +1004,8 @@ impl Fighter {
             charge_press_at: None,
             charge_side: None,
             bot_swing_at: None,
+            bot_cast_counts: std::collections::HashMap::new(),
+            bot_last_cast: None,
             combo_count: 0,
             last_combo_side: ActiveSide::None,
             last_input_x: None,

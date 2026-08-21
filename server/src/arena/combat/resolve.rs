@@ -2743,6 +2743,35 @@ pub(super) const ROUND_START_ENGAGE_DELAY: Duration = Duration::from_millis(1000
 /// player wins comfortably but sees real incoming damage — a fight, not a static dummy.
 const BOT_SWING_COOLDOWN: Duration = Duration::from_millis(1800);
 
+/// How often a bot may cast an ability. AUTHORED, like `BOT_SWING_COOLDOWN` —
+/// retail arena is human-vs-human, so there is no shipped bot cadence to copy.
+///
+/// Slower than the swing cadence on purpose: the bot should still read as a
+/// melee opponent that occasionally casts, not a spell turret. Ability cooldowns
+/// gate individual abilities on top of this.
+const BOT_CAST_COOLDOWN: Duration = Duration::from_millis(4500);
+
+/// Choose the bot's next ability: the one it has cast FEWEST times this match,
+/// ties broken by loadout order.
+///
+/// Least-cast-first rather than random, for two reasons. It maximises coverage —
+/// the point of a bot match is to exercise mechanics, and a uniform random pick
+/// leaves the long tail of a loadout untouched for a long time. And it keeps the
+/// engine deterministic: there is no RNG anywhere in combat resolution, which is
+/// what lets the scenario tests assert exact sequences. Adding one here would cost
+/// that for no gain.
+///
+/// `Perk` is skipped because a perk is passive and never activates.
+fn bot_next_ability(f: &super::state::Fighter) -> Option<String> {
+    f.loadout
+        .abilities
+        .iter()
+        .filter(|a| a.tag != super::state::AbilityTag::Perk)
+        .enumerate()
+        .min_by_key(|(i, a)| (*f.bot_cast_counts.get(&a.instance_uuid).unwrap_or(&0), *i))
+        .map(|(_, a)| a.instance_uuid.clone())
+}
+
 /// Tick-driven combat. Drives any BOT fighters (slots at/after `expected_peers`,
 /// which have no real ENet peer — a solo-vs-bot match's 2nd fighter) to auto-swing
 /// at their opponent on `BOT_SWING_COOLDOWN`. Real players are input-driven
@@ -2842,6 +2871,39 @@ pub fn on_tick(combat: &mut MatchCombat, now: Instant, debug_hold: bool) -> Vec<
         if now.duration_since(combat.phase_entered) < ROUND_START_ENGAGE_DELAY {
             continue;
         }
+        // Cast before swinging. A bot that only ever swung was why a human opponent
+        // never received a status effect: every stun/freeze/paralyse in a bot match
+        // flowed one way, because only the human side ever cast anything.
+        let cast_ready = combat.fighters[bot]
+            .bot_last_cast
+            .map(|t| now.duration_since(t) >= BOT_CAST_COOLDOWN)
+            .unwrap_or(true);
+        if cast_ready && combat.fighters[bot].bot_swing_at.is_none() {
+            if let Some(uuid) = bot_next_ability(&combat.fighters[bot]) {
+                // Go through the SAME path a human cast takes — synthesise the frame a
+                // client would have sent rather than maintain a second cast
+                // implementation that could drift. `resolve_ability_cast` still applies
+                // the per-ability cooldown and resource cost, so an unaffordable or
+                // still-cooling ability simply produces nothing here.
+                let frame = messages::request_execute_ability(&uuid);
+                if let Some(ea) = input::parse_execute_ability(&frame) {
+                    let before = out.len();
+                    out.extend(resolve_ability_cast(combat, bot, target, &frame, &ea, now));
+                    if out.len() > before {
+                        // Only count a cast that actually resolved, so an ability that
+                        // is on cooldown or unaffordable does not get "used up" and
+                        // starve the rest of the loadout.
+                        *combat.fighters[bot]
+                            .bot_cast_counts
+                            .entry(uuid)
+                            .or_insert(0) += 1;
+                        combat.fighters[bot].bot_last_cast = Some(now);
+                        continue;
+                    }
+                }
+            }
+        }
+
         // A bot swings in TWO steps, because retail's swing is two steps.
         //
         // Step 1, the wind-up: enter `Charging` and note when the swing should land.
@@ -5227,6 +5289,134 @@ mod report_31_high_block_stun {
         super::on_tick(&mut c, after, false);
         assert!(!c.fighters[1].is_staggered(after));
         assert!(c.fighters[1].bot_swing_at.is_some(), "the bot swings again after the stun");
+    }
+
+    // -----------------------------------------------------------------------
+    // Bot ability casting — coverage rig
+    // -----------------------------------------------------------------------
+
+    /// Give the bot a loadout of real abilities, ordered so that "first in the list"
+    /// and "least cast" are different answers once anything has been cast.
+    fn bot_with_abilities(c: &mut MatchCombat) {
+        use super::super::state::{AbilityTag, EquippedAbility};
+        c.fighters[1].loadout.abilities = vec![
+            EquippedAbility {
+                instance_uuid: "4be1d681-c35d-4540-b255-c2910ac80664".into(), // Frostbite
+                level: 4,
+                tag: AbilityTag::Damage,
+            },
+            EquippedAbility {
+                instance_uuid: "cfee0b02-6d91-4d34-869c-a7e54329060d".into(), // Ice Spike
+                level: 4,
+                tag: AbilityTag::Damage,
+            },
+            EquippedAbility {
+                instance_uuid: "9fdc4d52-ce90-44f8-9b5d-21f31e27dbda".into(), // Paralyze
+                level: 4,
+                tag: AbilityTag::Paralyze,
+            },
+        ];
+    }
+
+    /// A bot with abilities CASTS one. Before this, bots only ever swung, which is why
+    /// a human opponent never received a status effect: every stun/freeze/paralyse in a
+    /// bot match flowed one way, because only the human side ever cast anything.
+    #[test]
+    fn a_bot_casts_an_ability_and_does_not_only_swing() {
+        let now = Instant::now();
+        let mut c = combat(now, 1);
+        bot_with_abilities(&mut c);
+
+        let at = now + super::ROUND_START_ENGAGE_DELAY + Duration::from_millis(10);
+        let out = super::on_tick(&mut c, at, false);
+
+        assert!(!out.is_empty(), "the tick must produce frames");
+        assert!(
+            c.fighters[1].bot_last_cast.is_some(),
+            "the bot must have cast an ability, not just queued a swing",
+        );
+        assert_eq!(
+            c.fighters[1].bot_cast_counts.values().sum::<u32>(),
+            1,
+            "exactly one cast is counted for one cast",
+        );
+    }
+
+    /// Selection is least-cast-first, so a bot match exercises the WHOLE loadout
+    /// instead of hammering whichever ability sorts first. This is the coverage
+    /// property the rig exists for.
+    #[test]
+    fn the_bot_picks_the_least_cast_ability() {
+        let now = Instant::now();
+        let mut c = combat(now, 1);
+        bot_with_abilities(&mut c);
+
+        // Nothing cast yet → first in loadout order.
+        assert_eq!(
+            super::bot_next_ability(&c.fighters[1]).as_deref(),
+            Some("4be1d681-c35d-4540-b255-c2910ac80664"),
+        );
+
+        // Cast it twice and the SECOND ability becomes the least-cast one.
+        c.fighters[1]
+            .bot_cast_counts
+            .insert("4be1d681-c35d-4540-b255-c2910ac80664".into(), 2);
+        assert_eq!(
+            super::bot_next_ability(&c.fighters[1]).as_deref(),
+            Some("cfee0b02-6d91-4d34-869c-a7e54329060d"),
+        );
+
+        // Level the first two and the untouched third wins — the long tail of a
+        // loadout gets reached, which uniform random selection would not guarantee.
+        c.fighters[1]
+            .bot_cast_counts
+            .insert("cfee0b02-6d91-4d34-869c-a7e54329060d".into(), 2);
+        assert_eq!(
+            super::bot_next_ability(&c.fighters[1]).as_deref(),
+            Some("9fdc4d52-ce90-44f8-9b5d-21f31e27dbda"),
+        );
+    }
+
+    /// A perk is passive and never activates, so it must never be selected — otherwise
+    /// the bot would burn its cast slot on something that cannot fire.
+    #[test]
+    fn the_bot_never_selects_a_perk() {
+        use super::super::state::{AbilityTag, EquippedAbility};
+        let now = Instant::now();
+        let mut c = combat(now, 1);
+        c.fighters[1].loadout.abilities = vec![
+            EquippedAbility {
+                instance_uuid: "00000000-0000-0000-0000-0000000000aa".into(),
+                level: 1,
+                tag: AbilityTag::Perk,
+            },
+            EquippedAbility {
+                instance_uuid: "4be1d681-c35d-4540-b255-c2910ac80664".into(),
+                level: 4,
+                tag: AbilityTag::Damage,
+            },
+        ];
+        assert_eq!(
+            super::bot_next_ability(&c.fighters[1]).as_deref(),
+            Some("4be1d681-c35d-4540-b255-c2910ac80664"),
+            "the perk sorts first but must be skipped",
+        );
+    }
+
+    /// A bot with no abilities at all still swings — the cast path must not deadlock
+    /// the melee behaviour that already worked.
+    #[test]
+    fn a_bot_without_abilities_still_swings() {
+        let now = Instant::now();
+        let mut c = combat(now, 1);
+        assert!(super::bot_next_ability(&c.fighters[1]).is_none());
+
+        let at = now + super::ROUND_START_ENGAGE_DELAY + Duration::from_millis(10);
+        super::on_tick(&mut c, at, false);
+        assert!(
+            c.fighters[1].bot_swing_at.is_some(),
+            "with nothing to cast the bot must fall through to its swing",
+        );
     }
 
 
