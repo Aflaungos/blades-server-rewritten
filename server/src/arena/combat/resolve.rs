@@ -2765,6 +2765,32 @@ const BOT_SWING_COOLDOWN: Duration = Duration::from_millis(1800);
 /// gate individual abilities on top of this.
 const BOT_CAST_COOLDOWN: Duration = Duration::from_millis(4500);
 
+/// How long after its own swing a bot raises its guard.
+///
+/// AUTHORED, but the value is not arbitrary — it is pinned by two shipped constants.
+/// A re-raise within `OPTIMAL_BLOCK_RECOVERY_SECS` (0.8 s) of the last drop is
+/// downgraded to a LATE block, so raising sooner than that would guarantee the bot
+/// only ever blocks low. 900 ms clears it, which leaves the guard up for the ~900 ms
+/// remaining of `BOT_SWING_COOLDOWN` (1.8 s) — comfortably inside the 2 s
+/// `BLOCK_OPTIMAL_TIME_SECS` window, so the guard is a genuine HIGH block for its
+/// whole life.
+///
+/// That matters because the high-block stun fires on the ATTACKER. Until the bot
+/// blocked, a human could never be stunned by one: the stun needs the DEFENDER to
+/// block high, and bots never guarded.
+const BOT_GUARD_RAISE_DELAY: Duration = Duration::from_millis(900);
+
+/// Drop a bot's guard the way a human's release does, so the client sees the same
+/// exit: clear the window and let `reconcile_block` map Blocking → Idle, which the
+/// drain emits as a gmid 39 carrying stateId 0. (Retail ends 199 of 225 blocks this
+/// way rather than with a second gmid 41.)
+fn bot_lower_guard(f: &mut super::state::Fighter, now: Instant) {
+    if f.actor_state() == ActorStateType::Blocking {
+        f.blocking_until = None;
+        f.reconcile_block(now);
+    }
+}
+
 /// Choose the bot's next ability: the one it has cast FEWEST times this match,
 /// ties broken by loadout order.
 ///
@@ -2899,6 +2925,7 @@ pub fn on_tick(combat: &mut MatchCombat, now: Instant, debug_hold: bool) -> Vec<
                 // implementation that could drift. `resolve_ability_cast` still applies
                 // the per-ability cooldown and resource cost, so an unaffordable or
                 // still-cooling ability simply produces nothing here.
+                bot_lower_guard(&mut combat.fighters[bot], now);
                 let frame = messages::request_execute_ability(&uuid);
                 if let Some(ea) = input::parse_execute_ability(&frame) {
                     let before = out.len();
@@ -2939,7 +2966,27 @@ pub fn on_tick(combat: &mut MatchCombat, now: Instant, debug_hold: bool) -> Vec<
             .last_swing
             .map(|t| now.duration_since(t) >= BOT_SWING_COOLDOWN)
             .unwrap_or(true);
-        if ready {
+        if !ready {
+            // The gap between swings is when a real player guards, so the bot does
+            // too. Raising here (rather than on a timer of its own) is what keeps the
+            // block INSIDE the optimal window: see `BOT_GUARD_RAISE_DELAY`.
+            let since_swing = combat.fighters[bot].last_swing.map(|t| now.duration_since(t));
+            let due = since_swing.map(|d| d >= BOT_GUARD_RAISE_DELAY).unwrap_or(false);
+            let f = &mut combat.fighters[bot];
+            if due && f.actor_state() != ActorStateType::Blocking && f.block_phase(now).is_none() {
+                // Same fields the human block-zone press sets, so the drain emits the
+                // identical gmid 41 and the block resolves through the identical path.
+                f.set_actor_state(ActorStateType::Blocking, now);
+                f.blocking_side = ActiveSide::Middle; // retail: propId 9 == 1 in 578/578
+                f.blocking_until = Some(now + BLOCK_LEAK_GUARD);
+                f.block_raised_at = Some(now);
+                debug!("combat: slot {bot} bot guard UP");
+            }
+            continue;
+        }
+        {
+            // Swinging ends the guard, exactly as an attack press does for a human.
+            bot_lower_guard(&mut combat.fighters[bot], now);
             // The side is decided now, at the start of the wind-up, and
             // `resolve_swing`'s alternation fallback will produce the same one when the
             // swing lands — retail carries one side across all four beats (593/593).
@@ -5303,6 +5350,100 @@ mod report_31_high_block_stun {
         super::on_tick(&mut c, after, false);
         assert!(!c.fighters[1].is_staggered(after));
         assert!(c.fighters[1].bot_swing_at.is_some(), "the bot swings again after the stun");
+    }
+
+    // -----------------------------------------------------------------------
+    // Bot blocking — the other half of the high-block stun
+    // -----------------------------------------------------------------------
+
+    /// A bot raises its guard in the gap between swings, and the guard is a genuine
+    /// HIGH (optimal) block rather than a low one.
+    ///
+    /// This is what lets a human be stunned at all. The high-block stun fires on the
+    /// ATTACKER when the DEFENDER blocks high — so with bots that never guarded, a
+    /// player could inflict that stun but never receive it.
+    #[test]
+    fn a_bot_raises_a_high_guard_between_swings() {
+        let now = Instant::now();
+        let mut c = combat(now, 1);
+        let start = now + super::ROUND_START_ENGAGE_DELAY + Duration::from_millis(10);
+
+        // Land a swing so the cooldown (and therefore the gap) starts.
+        c.fighters[1].last_swing = Some(start);
+
+        // Too soon: inside OPTIMAL_BLOCK_RECOVERY_SECS, so no guard yet.
+        super::on_tick(&mut c, start + Duration::from_millis(300), false);
+        assert_ne!(
+            c.fighters[1].actor_state(),
+            ActorStateType::Blocking,
+            "raising inside the 0.8s recovery would only ever produce a LATE block",
+        );
+
+        // After the raise delay the guard goes up, and it is OPTIMAL.
+        let guarded = start + super::BOT_GUARD_RAISE_DELAY + Duration::from_millis(10);
+        super::on_tick(&mut c, guarded, false);
+        assert_eq!(c.fighters[1].actor_state(), ActorStateType::Blocking, "guard must be up");
+        assert_eq!(
+            c.fighters[1].block_phase(guarded),
+            Some(super::super::state::BlockPhase::Optimal),
+            "the bot's guard must be a HIGH block, or it cannot stun the attacker",
+        );
+    }
+
+    /// The payoff: a human swinging into that guard is STUNNED.
+    #[test]
+    fn a_human_who_swings_into_the_bot_guard_is_stunned() {
+        let now = Instant::now();
+        let mut c = combat(now, 1);
+        let start = now + super::ROUND_START_ENGAGE_DELAY + Duration::from_millis(10);
+        c.fighters[1].last_swing = Some(start);
+
+        let guarded = start + super::BOT_GUARD_RAISE_DELAY + Duration::from_millis(10);
+        super::on_tick(&mut c, guarded, false);
+        assert_eq!(c.fighters[1].block_phase(guarded), Some(super::super::state::BlockPhase::Optimal));
+
+        // Slot 0 (the human) swings into it and the hit lands.
+        let swing_at = guarded + Duration::from_millis(20);
+        let _ = super::resolve_swing(&mut c, 0, 1, 1.0, swing_at);
+        let land_at = swing_at + super::FOLLOW_THROUGH_DELAY + Duration::from_millis(1);
+        let _ = super::land_due_hits(&mut c, land_at);
+
+        assert!(
+            c.fighters[0].is_staggered(land_at),
+            "the ATTACKER must be stunned by the bot's high block — this is the thing \
+             a player could never experience before bots guarded",
+        );
+    }
+
+    /// The guard comes down to swing, so blocking cannot deadlock the attack cadence.
+    #[test]
+    fn the_bot_lowers_its_guard_to_swing() {
+        let now = Instant::now();
+        let mut c = combat(now, 1);
+        let start = now + super::ROUND_START_ENGAGE_DELAY + Duration::from_millis(10);
+        c.fighters[1].last_swing = Some(start);
+
+        super::on_tick(&mut c, start + super::BOT_GUARD_RAISE_DELAY + Duration::from_millis(10), false);
+        assert_eq!(c.fighters[1].actor_state(), ActorStateType::Blocking);
+
+        // Once the swing cooldown expires the bot drops the guard and winds up.
+        let swing_ready = start + super::BOT_SWING_COOLDOWN + Duration::from_millis(10);
+        super::on_tick(&mut c, swing_ready, false);
+
+        // Asserting on the actor state alone would be VACUOUS: the wind-up sets
+        // `Charging`, so the state moves off `Blocking` whether or not the guard was
+        // actually released. The real defect is a guard window left standing while the
+        // bot charges — it would keep resolving incoming hits as blocked, and keep
+        // stunning the attacker, from behind a shield that is visually down.
+        assert!(
+            c.fighters[1].blocking_until.is_none(),
+            "the guard WINDOW must be cleared, not just the actor state",
+        );
+        assert!(
+            c.fighters[1].block_phase(swing_ready).is_none(),
+            "a bot mid-wind-up must not still be blocking",
+        );
+        assert!(c.fighters[1].bot_swing_at.is_some(), "and the wind-up must start");
     }
 
     /// The death frame's state ring must END in `Dead`, which means the loser has to
