@@ -1472,6 +1472,68 @@ impl MatchInstance {
 
 #[cfg(test)]
 pub(in crate::arena::combat) mod tests {
+
+    /// The op51 REMOVE must reach the wire, not just the state layer.
+    ///
+    /// THE REPORTED BUG (2026-08-22). A player high-blocked a bot, saw it
+    /// stunned, and then watched it swing and land hits while still rendered
+    /// mid-stun. The actor state returned to Idle over op39; the status layer
+    /// was never told the stun ended, because the engine had never sent an op51
+    /// with `apply = false` — all 15 emission sites passed `true`.
+    ///
+    /// This drives a real tick, so it fails if `emit_status_removals` is
+    /// computed but not wired into it — which is a distinct bug from the state
+    /// diff being wrong, and the state-level tests cannot see it.
+    #[test]
+    fn a_lapsed_stagger_puts_an_op51_remove_on_the_wire() {
+        use crate::arena::combat::state::StatusEffectType;
+
+        let t0 = Instant::now();
+        let mut m = MatchInstance::new(2, 2, vec![], t0);
+        // `on_tick` is a no-op outside the in-round phase, which is where a
+        // stagger can actually happen.
+        m.combat.phase = crate::arena::combat::state::FlowState::StateTimeout;
+
+        m.combat.fighters[1].apply_stagger_for(t0, 1.0);
+
+        // Mid-stagger: nothing removed yet.
+        let mid = collect_op51(m.on_tick(2, t0 + Duration::from_millis(400)));
+        assert!(
+            !mid.iter().any(|(apply, eff)| !*apply && *eff == StatusEffectType::Staggered as u8),
+            "no remove while the stagger is still running",
+        );
+
+        // Past the duration: the remove goes out.
+        let after = collect_op51(m.on_tick(2, t0 + Duration::from_millis(1200)));
+        assert!(
+            after.iter().any(|(apply, eff)| !*apply && *eff == StatusEffectType::Staggered as u8),
+            "a lapsed stagger must emit op51 Staggered with apply=false; saw {after:?}",
+        );
+    }
+
+    /// `(apply, effectType)` for every op51 in a tick's output.
+    fn collect_op51(out: Vec<(usize, Vec<u8>)>) -> Vec<(bool, u8)> {
+        let mut v = Vec::new();
+        for (_viewer, frame) in out {
+            // marker 0xBE, carrier, then NetData
+            let Some(i) = frame.iter().position(|b| *b == 0xBE) else { continue };
+            if i + 2 >= frame.len() {
+                continue;
+            }
+            let nd = arena_proto::parse_netdata(&frame[i + 2..]);
+            if nd.int(3) != Some(51) {
+                continue;
+            }
+            let apply = matches!(
+                nd.props.get(&4),
+                Some(arena_proto::NetDataValue::Bool(true))
+            );
+            if let Some(eff) = nd.int(5) {
+                v.push((apply, eff as u8));
+            }
+        }
+        v
+    }
     use super::*;
 
     fn inst(capacity: usize) -> (MatchInstance, Instant) {

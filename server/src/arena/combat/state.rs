@@ -884,6 +884,30 @@ pub struct Fighter {
     /// (`CombatParameters.baseStaggerDuration` 1.5 s): inputs are dropped, exactly
     /// like `Paralyzed`, and the actor-state is `Staggered`. [Phase 3.13]
     pub staggered_until: Option<Instant>,
+
+    /// Statuses we have told the clients are ACTIVE on this fighter, as of the
+    /// last tick.
+    ///
+    /// The engine emitted op51 applies and never a single remove — 15 call
+    /// sites, all `apply = true`. Retail sends a remove for every status: across
+    /// 2,889 op51 messages in s615+s616 the apply/remove counts run ~1:1 for all
+    /// nineteen effect types (Staggered 132/140, Paralyzed 16/17, Blocking
+    /// 736/756). The client does NOT time an effect out from the duration it was
+    /// given, so without the remove the visual sticks forever — a player watched
+    /// a bot swing at him while still rendered mid-stun.
+    ///
+    /// Diffing this against the live state each tick is what generates the
+    /// removes, rather than emitting one at each expiry site: expiry happens in
+    /// three different places (`effects` pruning, `reconcile_stagger`,
+    /// `reconcile_paralysis`), two of which run from input handlers that cannot
+    /// reach the wire.
+    ///
+    /// Deliberately holds ONLY the statuses [`Self::tracked_statuses`] can see.
+    /// Ward, Absorb and ResistElements are announced from elsewhere and are not
+    /// represented in the state this scans, so including them would make the
+    /// very first diff emit a bogus remove for a status that had just been
+    /// applied.
+    announced_statuses: Vec<StatusEffectType>,
     /// Consumables used in the CURRENT round — gated by
     /// [`CONSUMABLES_PER_ROUND`] (1). Reset by `reset_fighters_for_next_round`.
     /// [Phase 4.3]
@@ -1027,6 +1051,7 @@ impl Fighter {
             negation_pools: Vec::new(),
             transient_resistances: Vec::new(),
             staggered_until: None,
+            announced_statuses: Vec::new(),
             consumables_used: 0,
             equipped_consumable: None,
             paralyze_secs: paralyze_duration_secs(1),
@@ -1201,6 +1226,39 @@ impl Fighter {
             }
         }
         false
+    }
+
+    /// The statuses this fighter is currently under, restricted to the ones whose
+    /// lifetime the engine actually models here.
+    ///
+    /// `effects` covers the elemental conditions; stagger and paralysis live in
+    /// their own fields. Ward / Absorb / ResistElements are excluded on purpose —
+    /// see [`Self::announced_statuses`].
+    pub fn tracked_statuses(&self, now: Instant) -> Vec<StatusEffectType> {
+        let mut v: Vec<StatusEffectType> =
+            self.effects.iter().filter(|e| now < e.expires_at).map(|e| e.effect).collect();
+        if self.is_staggered(now) {
+            v.push(StatusEffectType::Staggered);
+        }
+        if self.is_paralyzed() {
+            v.push(StatusEffectType::Paralyzed);
+        }
+        v.sort_by_key(|s| *s as u16);
+        v.dedup();
+        v
+    }
+
+    /// Statuses that have LAPSED since the last call — the ones the client still
+    /// believes are active and needs an op51 remove for.
+    ///
+    /// Also records what is active now, so the next call can diff against it.
+    /// Call once per tick, per fighter.
+    pub fn drain_lapsed_statuses(&mut self, now: Instant) -> Vec<StatusEffectType> {
+        let active = self.tracked_statuses(now);
+        let lapsed: Vec<StatusEffectType> =
+            self.announced_statuses.iter().copied().filter(|s| !active.contains(s)).collect();
+        self.announced_statuses = active;
+        lapsed
     }
 
     /// True when health is below `CombatParameters.criticalHealthThreshold` (35 %).
@@ -1796,6 +1854,10 @@ impl MatchCombat {
             f.negation_pools.clear();
             f.transient_resistances.clear();
             f.staggered_until = None;
+            // A new round starts with nothing announced: the client resets its own
+            // effect layer, so replaying removes for last round's statuses would be
+            // noise at best and could clear a fresh apply at worst.
+            f.announced_statuses.clear();
             f.consumables_used = 0; // consumablesPerRound is PER ROUND [Phase 4.3]
         }
         // Anchor the regen timer to now so the next round's first tick fires 1s in.
@@ -1855,6 +1917,77 @@ impl MatchCombat {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    // -----------------------------------------------------------------
+    // op51 removes: the client is not told an effect ENDED
+    // -----------------------------------------------------------------
+
+    /// A stagger that lapses must show up as lapsed exactly once.
+    ///
+    /// THE REPORTED BUG: a player high-blocked a bot, the bot was stunned, and
+    /// then swung at him and landed hits while still rendered mid-stun. The
+    /// actor state went back to Idle on the wire; the status layer never heard.
+    #[test]
+    fn a_lapsed_stagger_is_reported_once_and_only_once() {
+        let t0 = Instant::now();
+        let mut f = Fighter::new(0, 564, Loadout::default(), t0);
+
+        f.apply_stagger_for(t0, 1.0);
+        // While it is running there is nothing to remove, and the status is
+        // recorded as announced.
+        assert!(f.drain_lapsed_statuses(t0).is_empty());
+        assert!(f.drain_lapsed_statuses(t0 + Duration::from_millis(500)).is_empty());
+
+        let lapsed = f.drain_lapsed_statuses(t0 + Duration::from_millis(1100));
+        assert_eq!(lapsed, vec![StatusEffectType::Staggered], "the stagger must be reported");
+
+        // Not again — a repeated remove would clear a fresh stagger applied later.
+        assert!(
+            f.drain_lapsed_statuses(t0 + Duration::from_millis(1200)).is_empty(),
+            "a lapsed status must be reported once",
+        );
+    }
+
+    /// Re-staggering before the first one lapses must not report a removal — the
+    /// effect never stopped being active.
+    #[test]
+    fn a_refreshed_stagger_reports_nothing() {
+        let t0 = Instant::now();
+        let mut f = Fighter::new(0, 564, Loadout::default(), t0);
+        f.apply_stagger_for(t0, 1.0);
+        assert!(f.drain_lapsed_statuses(t0).is_empty());
+
+        f.apply_stagger_for(t0 + Duration::from_millis(800), 1.0);
+        assert!(
+            f.drain_lapsed_statuses(t0 + Duration::from_millis(1100)).is_empty(),
+            "the refresh extended it past 1.1s, so nothing lapsed",
+        );
+        assert_eq!(
+            f.drain_lapsed_statuses(t0 + Duration::from_millis(1900)),
+            vec![StatusEffectType::Staggered],
+        );
+    }
+
+    /// Statuses the engine does not model the lifetime of must never be reported
+    /// as lapsed — otherwise the first tick after a Ward would clear it.
+    ///
+    /// Ward / Absorb / ResistElements are announced from elsewhere and have no
+    /// representation in what `tracked_statuses` scans.
+    #[test]
+    fn untracked_statuses_are_never_reported_as_lapsed() {
+        let t0 = Instant::now();
+        let mut f = Fighter::new(0, 564, Loadout::default(), t0);
+        for _ in 0..3 {
+            assert!(
+                f.drain_lapsed_statuses(t0).is_empty(),
+                "a fighter under no tracked status has nothing to remove",
+            );
+        }
+        assert!(f.tracked_statuses(t0).is_empty());
+    }
+
     use super::*;
 
     /// **The layout is pinned to real captured words, because nothing else was.**
