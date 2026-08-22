@@ -1854,12 +1854,42 @@ const DOT_TICK_INTERVAL: Duration = Duration::from_secs(1);
 const REGEN_TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// In-combat stamina/magicka regen rate as a fraction of the pool per second.
+///
 /// **Video ground-truth (s293)**: stamina and magicka both recover at ~5 %/s during
-/// passive recovery phases (t=50..52 clean window: 5%→10%→15% over 2s).  The earlier
-/// UESP figure of 4 %/s was slightly low; 5 %/s matches the observed HUD data.
-/// Rates are CDN `[ExcelVariable]` (`PlayerStats._staminaRegenRate` / `_magickaRegenRate`);
-/// 5 %/s is the video-pinned value and supersedes the UESP 4 %/s estimate.
+/// passive recovery phases (t=50..52 clean window: 5%→10%→15% over 2s).
 /// [ground-truth: /tmp/arena-video-groundtruth.md §1; calibration flag]
+///
+/// PROVENANCE, CORRECTED (tracker #53, 2026-08-22). This comment used to say the
+/// rates "are CDN `[ExcelVariable]` (`PlayerStats._staminaRegenRate` /
+/// `_magickaRegenRate`)" and that 5 %/s "supersedes the UESP 4 %/s estimate" —
+/// i.e. that the shipped asset field was a slightly-low measurement of THIS
+/// number. It is not the same number at all.
+///
+/// A contributor decompiled the regeneration gate. `Actor` declares
+/// `ShouldApplyRegeneration()` virtual, and exactly three classes override it:
+/// `EnemyActor` (real logic — base conditions, non-lethal state, gameplay
+/// manager), and **`PvpPlayerActor` and `PvpOpponentActor`, which both return
+/// false unconditionally.** No conditions, no field reads. Confirmed against
+/// `reference/il2cpp/dump.cs` — those are the only three overrides that exist.
+///
+/// So the client's passive regeneration — the system driven by
+/// `ActorInnateStats._staminaRegenRate` / `_magickaRegenRate` / `_healthRegenRate`
+/// — is switched off for BOTH actors in arena PvP. Bethesda wrote a dedicated
+/// override for each to make sure of it. Whatever `PlayerStats` ships (4 %/s
+/// stamina, 4 %/s magicka, 0.5 %/s health) answers a PvE/open-world question and
+/// has no bearing here. Do not "reconcile" this constant with it.
+///
+/// It follows that every pool change a PvP client sees is server-authored, which
+/// is what this engine already does.
+///
+/// **What that leaves genuinely open.** Two measurements of retail remain, and
+/// they now provably measure the SAME server-driven signal:
+///   * video HUD (s293)           — 5 %/s stamina, 5 %/s magicka
+///   * captured `packedStats` wire — ~3.03 %/s stamina, ~2.93 %/s magicka
+/// They cannot both be right. The wire is the finer instrument (10-bit pool
+/// fractions, thousands of samples, versus reading a bar off video frames), but
+/// the 5 %/s figure was an explicit owner call from the video and is left in
+/// place here rather than changed on my own initiative. Raised with the owner.
 const STAMINA_REGEN_RATE_PER_S: f32 = 0.05;
 const MAGICKA_REGEN_RATE_PER_S: f32 = 0.05;
 
@@ -1869,6 +1899,11 @@ const MAGICKA_REGEN_RATE_PER_S: f32 = 0.05;
 /// shows health only changing on hits, and the old UESP-derived 0.5 %/s baseline was
 /// wrong for arena PvP. Between rounds `reset_fighters_for_next_round` restores full
 /// HP anyway.
+///
+/// Independently supported since (tracker #53): `PvpPlayerActor::
+/// ShouldApplyRegeneration()` returns false unconditionally, so the client never
+/// applies `ActorInnateStats._healthRegenRate` in PvP whatever it ships. The
+/// 0.5 %/s in the `PlayerStats` asset is an open-world figure, not a PvP one.
 ///
 /// **But health CAN rise mid-round.** A regen perk plus the right rings/armour gives
 /// real in-round health recovery. It is rare, and on most builds too slow to matter,
