@@ -34,7 +34,41 @@
     "_note": "count values GUESSED. dedupeAcrossDays=1 means avoid repeating yesterday's picks where the pool is large enough."
   },
   "levelScaling": {
-    "_meta": "generate_quest_data currently hardcodes difficulty_level=1, enemy_level=1, given_xp=1000 (see blades_lib/src/util/quest.rs) — every dungeon quest spawns level-1 enemies regardless of player level. This block is the SCALING TABLE a fixed generator should read. GUESSED, aligned to the job difficulty curve.",
+    "_meta": "MEASURED from 773 pre-shutdown /quests captures (66,994 player/enemy level pairs). Supersedes the earlier GUESSED note, which also said generate_quest_data hardcodes enemy_level=1 \u2014 it no longer does, it calls QuestLevelScaling::enemy_level, so this block is LIVE.",
+    "_measured": {
+     "model": "enemyLevel = min(playerLevel + perSpawnGroupOffset, perSpawnGroupCap). The cap is the part we do not implement, and it is the whole difference at high level.",
+     "evidence": "Same spawn group across players: cf030d94 p15->12 then p30/p37/p54->20; 258b80d4 p15->16 then 24; 6c5dcf7a p15->10 then 18. Each saturates exactly 8 above its level-15 value and stops tracking the player. r(playerLevel, enemyLevel) = 0.908 over 7,551 points; of 631 spawn groups seen at 3+ player levels, 239 never move at all.",
+     "whatWeDoNow": "offsetBySkull defaults to 0, so we serve enemyLevel = playerLevel with no cap. At player level 84 retail's observed median was ~15 BELOW the player; we give 84. Our quests are HARDER than retail at high level, not easier.",
+     "howToFinishIt": "Mine the per-spawn-group cap from the corpus: for a group observed at player levels well above its cap, the max enemyLevel seen IS the cap. generate_quest_data then needs a per-spawn-group cap rather than one global curve.",
+     "givenXpByEnemyLevel": {
+      "note": "Deterministic in the captures; the max at each enemy level is the canonical value (lower observations are partial/zero-XP cases). The engine used a flat 1000, ~90x the real level-1 value. NOT wired up: correcting XP while enemyLevel is also wrong would change quest XP for every player, which is a balance decision.",
+      "1": 11,
+      "2": 13,
+      "3": 15,
+      "4": 17,
+      "5": 19,
+      "6": 22,
+      "7": 25,
+      "8": 28,
+      "9": 31,
+      "10": 34,
+      "11": 37,
+      "12": 41,
+      "13": 44,
+      "14": 48,
+      "15": 51,
+      "16": 55,
+      "17": 59,
+      "18": 63,
+      "19": 67,
+      "20": 71,
+      "21": 75,
+      "22": 79,
+      "23": 84,
+      "24": 88,
+      "25": 92
+     }
+    },
     "enemyLevelFromPlayerLevel": {
       "formula": "enemyLevel = clamp(playerLevel + offset, 1, 100)",
       "offsetBySkull": {
