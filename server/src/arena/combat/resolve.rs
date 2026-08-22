@@ -2110,9 +2110,14 @@ fn apply_status_conditioning(
 
 /// Clear a lapsed `Paralyzed` actor-state back to Idle once the paralyse duration
 /// (`PARALYZE_DURATION_SECS`) has elapsed since it was applied (`state_entered`) — so a
-/// paralysed fighter regains its inputs. (The client also times the status out via the
-/// op51 duration; the un-paralyse op51 *remove* is a cosmetic nicety not emitted here —
-/// the apply carried the duration.) No-op for a non-paralysed fighter.
+/// paralysed fighter regains its inputs. No-op for a non-paralysed fighter.
+///
+/// This used to add: "the client also times the status out via the op51 duration;
+/// the un-paralyse op51 *remove* is a cosmetic nicety not emitted here — the apply
+/// carried the duration." Both halves were wrong. The client does not time it out,
+/// and the remove is not cosmetic: without it the effect renders forever. The
+/// remove is now emitted by `emit_status_removals`, which diffs the state this
+/// function mutates.
 fn reconcile_paralysis(f: &mut super::state::Fighter, now: Instant) {
     use super::state::ActorStateType;
     if f.actor_state() == ActorStateType::Paralyzed
@@ -2196,6 +2201,45 @@ fn apply_channel_ticks(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Ve
     }
 
     combat.channels.retain(|c| c.remaining_ticks > 0);
+    out
+}
+
+/// op51 `ChangeCombatStatusEffect` with `apply = false` for every status that has
+/// just lapsed, to both viewers.
+///
+/// THE BUG THIS FIXES. The engine emitted applies and never a remove — all 15
+/// op51 call sites passed `apply = true`. The assumption, written down at
+/// `reconcile_paralysis`, was that "the apply carried the duration" so the client
+/// would time the effect out itself. It does not. A player high-blocked a bot,
+/// saw it stunned, and then watched it swing at him and land hits while still
+/// rendered mid-stun: the actor state had returned to Idle on the wire (op39),
+/// but the status layer never heard the stun ended.
+///
+/// Retail sends the remove. Across 2,889 op51 messages in captures s615+s616 the
+/// apply/remove counts are ~1:1 for every one of the nineteen effect types seen —
+/// Staggered 132/140, Paralyzed 16/17, Frozen 80/83, Blocking 736/756. (Removes
+/// slightly lead because the window catches some whose apply preceded it.)
+///
+/// Driven by diffing [`Fighter::drain_lapsed_statuses`] rather than emitting at
+/// each expiry site, because expiry happens in three places and two of them are
+/// input handlers with no route to the wire.
+fn emit_status_removals(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8>)> {
+    let mut out = Vec::new();
+    for slot in 0..combat.fighters.len() {
+        let lapsed = combat.fighters[slot].drain_lapsed_statuses(now);
+        if lapsed.is_empty() {
+            continue;
+        }
+        let obj = combat.fighters[slot].net_object_id;
+        for status in lapsed {
+            debug!("combat: slot {slot} status {status:?} lapsed → op51 remove");
+            // Duration on a remove is meaningless; retail carries 0.
+            let frame = messages::change_combat_status_effect(obj, false, status, 0.0);
+            for dest in 0..combat.fighters.len() {
+                out.push((dest, frame.clone()));
+            }
+        }
+    }
     out
 }
 
@@ -2997,6 +3041,9 @@ pub fn on_tick(combat: &mut MatchCombat, now: Instant, debug_hold: bool) -> Vec<
     // DoT ticks — one tick per second per active condition instance, independent of
     // whether a bot or player is the source. Runs BEFORE bot swings so a DoT killing
     // blow is processed before the bot's turn. [§Mechanic-2]
+    // Tell the clients about anything that just LAPSED, before `apply_dot_ticks`
+    // prunes the expired effects out of existence.
+    out.extend(emit_status_removals(combat, now));
     out.extend(apply_dot_ticks(combat, now));
     out.extend(apply_channel_ticks(combat, now));
     if matches!(combat.phase, FlowState::RoundEnd | FlowState::NextState) {
