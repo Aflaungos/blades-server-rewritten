@@ -659,6 +659,91 @@ mod tests {
         }
     }
 
+    /// `perk_bonus` is a BINARY SEARCH over `(perk, rank)`, so the generated
+    /// table has to be sorted that way. Nothing in the generator enforces it —
+    /// a future change to the emit order would leave the lookup silently
+    /// returning `None`, or worse, another perk's number.
+    #[test]
+    fn perk_ranks_are_sorted_the_way_perk_bonus_searches() {
+        let t = &gamedata::PERK_RANKS;
+        assert!(!t.is_empty(), "the table must not be empty");
+        for w in t.windows(2) {
+            let (a, b) = (&w[0], &w[1]);
+            assert!(
+                (a.perk, a.rank) < (b.perk, b.rank),
+                "PERK_RANKS out of order: {} rank {} before {} rank {}",
+                a.perk,
+                a.rank,
+                b.perk,
+                b.rank,
+            );
+        }
+    }
+
+    /// The three weapon perks, and the ordering that says the table is aligned.
+    ///
+    /// Light below versatile below heavy at every rank. A table with perks
+    /// mis-assigned to weapon classes would break this — it is how a tester's
+    /// correction (tracker #49, Scout is light, not Armsman) was confirmed.
+    #[test]
+    fn the_weapon_perks_order_light_versatile_heavy() {
+        for rank in 1..=11u8 {
+            let light = gamedata::perk_bonus("Scout", rank).expect("Scout rank");
+            let versatile = gamedata::perk_bonus("Armsman", rank).expect("Armsman rank");
+            let heavy = gamedata::perk_bonus("Barbarian", rank).expect("Barbarian rank");
+            assert!(
+                light < versatile && versatile < heavy,
+                "rank {rank}: expected light < versatile < heavy, got {light} / {versatile} / {heavy}",
+            );
+        }
+    }
+
+    /// Spot values straight off the shipped assets, so a regeneration that
+    /// silently changes the numbers is caught rather than absorbed.
+    #[test]
+    fn perk_bonus_returns_the_shipped_values() {
+        assert_eq!(gamedata::perk_bonus("Armsman", 1), Some(4.22));
+        assert_eq!(gamedata::perk_bonus("Scout", 1), Some(3.43));
+        assert_eq!(gamedata::perk_bonus("Barbarian", 11), Some(28.34));
+
+        // Unknown perk and out-of-range rank are None, never a silent 0.0 — a
+        // zero is indistinguishable from a perk that does nothing, which is the
+        // bug this table exists to fix.
+        assert_eq!(gamedata::perk_bonus("NoSuchPerk", 1), None);
+        assert_eq!(gamedata::perk_bonus("Armsman", 99), None);
+        assert_eq!(gamedata::perk_bonus("Armsman", 0), None);
+    }
+
+    /// Skill points stop at level 50 — reported by a player (tracker #49) and
+    /// true of the shipped data, which is why a level 100 has no skill edge over
+    /// a level 50 and the advantage above 50 is gear.
+    #[test]
+    fn no_perk_rank_is_purchasable_above_level_fifty() {
+        let buyable: Vec<_> = gamedata::PERK_RANKS
+            .iter()
+            .filter(|p| p.required_hero_level > 0)
+            .collect();
+        assert!(!buyable.is_empty());
+        for p in &buyable {
+            assert!(
+                p.required_hero_level <= 50,
+                "{} rank {} requires level {}",
+                p.perk,
+                p.rank,
+                p.required_hero_level,
+            );
+        }
+        // And the rest are gear-only: -1 for both level and cost, never one of
+        // the two, which would mean the sentinel had drifted.
+        for p in gamedata::PERK_RANKS.iter().filter(|p| p.required_hero_level < 0) {
+            assert_eq!(
+                p.ability_point_cost, -1,
+                "{} rank {} is unbuyable but still has a point cost",
+                p.perk, p.rank,
+            );
+        }
+    }
+
     /// Frostbite's grade property, looked up the way the loadout does it.
     #[test]
     fn the_frostbite_grade_property_resolves() {
