@@ -654,6 +654,25 @@ impl QuestsDailyData {
     }
 }
 
+/// `global_shop_free.json` — the offers retail gave away for nothing.
+///
+/// A wrapper struct rather than a bare `Vec`, so the file keeps a named key and
+/// can grow fields (a per-offer daily cap, say) without changing its shape.
+/// `Default` is an empty list, which is the safe direction: a missing file
+/// means nothing is free, not everything.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreeProductIds {
+    #[serde(default)]
+    pub free_product_ids: Vec<Uuid>,
+}
+
+impl FreeProductIds {
+    pub fn contains(&self, id: &Uuid) -> bool {
+        self.free_product_ids.contains(id)
+    }
+}
+
 /// All capture-derived static definitions, loaded once at startup. Fields are added
 /// per feature; each is independently optional (a missing/!invalid data file leaves
 /// its field empty rather than failing startup).
@@ -686,6 +705,14 @@ pub struct StaticData {
     /// `expectedPrices` (the base price list lives in the client bundles), so an
     /// unknown product can be priced but not fulfilled.
     pub global_shop_grants: HashMap<Uuid, RewardGrant>,
+    /// The global-shop offers retail gave away for nothing — the store's free
+    /// daily item. Mined from captured purchases retail answered 200 to with an
+    /// all-zero `expectedPrices` (`scripts/build-shop-static.py`).
+    ///
+    /// This has to be an allowlist rather than "permit a zero price", because
+    /// the price is client-supplied: accepting any zero would hand out every
+    /// paid offer for free.
+    pub global_shop_free: FreeProductIds,
     /// Challenge templates (objective + reward) the active set is generated from.
     pub challenge_templates: Vec<ChallengeTemplate>,
     /// Daily login reward rotation pool.

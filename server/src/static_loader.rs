@@ -14,7 +14,7 @@ use blades_lib::features::challenges::ChallengeTemplate;
 use blades_lib::features::daily_reward::DailyRewardDef;
 use blades_lib::features::game_events::EventDef;
 use blades_lib::static_data::{
-    Announcement, AbyssStaticData, GiftDef, ItemModRecipe, QuestsDailyData, Recipe,
+    Announcement, AbyssStaticData, FreeProductIds, GiftDef, ItemModRecipe, QuestsDailyData, Recipe,
     RecipeCraftingTypes, ShopBundle, ShopData, SmithCraftables, SmithCraftablesFile, StaticData,
 };
 use log::warn;
@@ -87,6 +87,9 @@ pub fn load(dir: &Path) -> StaticData {
     }
     let global_shop_grants: HashMap<Uuid, RewardGrant> =
         read_json(&dir.join("global_shop_grants.json"));
+    // A missing file leaves the list empty, i.e. nothing is free — the safe
+    // direction. Only offers retail itself gave away belong here.
+    let global_shop_free: FreeProductIds = read_json(&dir.join("global_shop_free.json"));
     let challenge_templates: Vec<ChallengeTemplate> = read_json(&dir.join("challenges.json"));
     let daily_rewards: Vec<DailyRewardDef> = read_json(&dir.join("daily_rewards.json"));
     let chest_loots: Vec<RewardGrant> = read_json(&dir.join("chest_loots.json"));
@@ -121,6 +124,7 @@ pub fn load(dir: &Path) -> StaticData {
         global_shop_authored,
         iap,
         global_shop_grants,
+        global_shop_free,
         challenge_templates,
         daily_rewards,
         chest_loots,

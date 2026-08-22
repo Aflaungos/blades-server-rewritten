@@ -278,7 +278,21 @@ pub async fn purchase_global_shop(
         .get(&body.global_shop_product_id)
         .cloned()
         .ok_or_else(|| map_purchase_err(PurchaseError::NoSuchProduct))?;
-    global_shop::sanitize_prices(&body.expected_prices).map_err(map_purchase_err)?;
+    // The store has free offers — retail's daily giveaway — and the client sends
+    // `quantity: 0` for them. `sanitize_prices` rejects a zero quantity, so every
+    // attempt to claim one 400'd (report #58's reporter hit it; the corpus shows
+    // retail answering 200 to exactly this request five times before shutdown,
+    // and us answering 400 fifteen times after).
+    //
+    // Zero is allowed ONLY for an offer on the capture-derived free list. The
+    // price is client-supplied, so a blanket "allow zero" would give away every
+    // paid offer.
+    if app_state.static_data.global_shop_free.contains(&body.global_shop_product_id) {
+        global_shop::sanitize_free_prices(&body.expected_prices)
+    } else {
+        global_shop::sanitize_prices(&body.expected_prices)
+    }
+    .map_err(map_purchase_err)?;
 
     let product_id = body.global_shop_product_id;
     let prices = body.expected_prices;

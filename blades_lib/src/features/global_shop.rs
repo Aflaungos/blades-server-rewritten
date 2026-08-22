@@ -59,6 +59,26 @@ pub fn sanitize_prices(prices: &[Price]) -> Result<(), PurchaseError> {
     Ok(())
 }
 
+/// Validate the `expectedPrices` of a **free** offer — one on the capture-derived
+/// free list, where retail itself charged nothing.
+///
+/// Same checks as [`sanitize_prices`] except that every line must be exactly
+/// zero. Deliberately not "zero is ALSO allowed": if a caller reaches here for
+/// an offer the client priced at 49 Gems, that is a mismatch worth rejecting,
+/// not a discount worth granting. The currency must still be a real one, so a
+/// free claim cannot smuggle in an unknown currency id.
+pub fn sanitize_free_prices(prices: &[Price]) -> Result<(), PurchaseError> {
+    if prices.is_empty() {
+        return Err(PurchaseError::InvalidPrice);
+    }
+    for p in prices {
+        if !economy::is_currency(p.currency_id) || p.quantity != 0 {
+            return Err(PurchaseError::InvalidPrice);
+        }
+    }
+    Ok(())
+}
+
 /// One entry of the `globalShopPurchases` list.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -111,6 +131,47 @@ mod tests {
             sanitize_prices(&[Price::new(GEMS, MAX_PRICE_QUANTITY + 1)]),
             Err(PurchaseError::InvalidPrice)
         );
+    }
+
+    /// The store's free daily offer. Retail answered 200 to an all-zero price for
+    /// it five times before shutdown; we answered 400 fifteen times after,
+    /// because the general validator treats zero as malformed.
+    #[test]
+    fn free_offers_may_be_claimed_for_nothing() {
+        assert_eq!(sanitize_free_prices(&[Price::new(SIGIL, 0)]), Ok(()));
+        assert_eq!(sanitize_free_prices(&[Price::new(GEMS, 0)]), Ok(()));
+        // ...and the general validator still refuses it, so the allowlist in the
+        // handler is what makes the difference, not a weakened global rule.
+        assert_eq!(
+            sanitize_prices(&[Price::new(SIGIL, 0)]),
+            Err(PurchaseError::InvalidPrice)
+        );
+    }
+
+    /// Reaching the free path does not make a priced request free: that is a
+    /// mismatch between client and catalogue, not a discount.
+    #[test]
+    fn a_priced_request_is_not_free_even_on_the_free_path() {
+        assert_eq!(
+            sanitize_free_prices(&[Price::new(SIGIL, 1)]),
+            Err(PurchaseError::InvalidPrice)
+        );
+        // Every line must be zero — a part-paid claim is still paid.
+        assert_eq!(
+            sanitize_free_prices(&[Price::new(SIGIL, 0), Price::new(GEMS, 49)]),
+            Err(PurchaseError::InvalidPrice)
+        );
+    }
+
+    /// A free claim must not be able to smuggle in an unknown currency.
+    #[test]
+    fn free_offers_still_require_a_real_currency() {
+        let not_a_currency = Uuid::from_u128(0xdead);
+        assert_eq!(
+            sanitize_free_prices(&[Price::new(not_a_currency, 0)]),
+            Err(PurchaseError::InvalidPrice)
+        );
+        assert_eq!(sanitize_free_prices(&[]), Err(PurchaseError::InvalidPrice));
     }
 
     #[test]
