@@ -483,6 +483,7 @@ async fn main() -> Result<()> {
                     .service(guild::get_guild)
                     .service(announcements::get_announcements)
                     .service(arena::leaderboards::get_leaderboard)
+                    .service(arena::presence::arena_presence)
                     .service(arena::avatar::set_avatar)
                     .service(arena::matchmaking::matchmaking_ws)
                     .service(arena::matchmaker::create_match)

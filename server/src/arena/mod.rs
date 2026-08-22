@@ -12,6 +12,7 @@ pub mod leaderboards;
 pub mod match_registry;
 pub mod matchmaker;
 pub mod matchmaking;
+pub mod presence;
 pub mod udp;
 
 use serde::Serialize;
