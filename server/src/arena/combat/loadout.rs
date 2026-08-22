@@ -336,24 +336,68 @@ fn push_enchant(lo: &mut Loadout, ty: DamageType, tier: u8) {
 
 /// Bonus ranks a jewellery GRADING affix grants at `tier`.
 ///
-/// The shipped data carries NO magnitude for these —
+/// CONTESTED. The values below are measured, and the shipped data disagrees with
+/// them by a factor of 2.5. Read this before touching either.
+///
+/// ## The premise this comment used to rest on was false
+///
+/// It said: "the shipped data carries NO magnitude for these —
 /// `AbilityBonusRanksStaticData` has exactly one field, `_abilityUid` — so the
-/// number is not extractable and had to be measured.
+/// number is not extractable". The first half is true and the conclusion does not
+/// follow. `AbilityBonusRanksStaticData` extends **`StandardItemPropertyStaticData`**,
+/// which declares
 ///
-/// Two independent sources agree on the ceiling of 5 per slot:
-///   * observed in game on a mixed-tier ring — tier 2 grants +5, tier 1 grants +4;
-///   * the shipped headroom `maximum_level - maximum_purchaseable_level` equals
-///     `5 x slots` for 46 of the 49 abilities that carry a grade property (two
-///     ring slots, one necklace slot).
+/// ```text
+/// [SerializeField] [ExcelVariable] private float[] _xValueByTier;  // 0x30
+/// ```
 ///
-/// Only tiers 1 and 2 occur in the whole captured corpus (365 and 239 entries),
-/// so the curve beyond them is unobserved; anything higher is clamped to the
-/// measured ceiling rather than extrapolated.
+/// I read the subclass, saw one field, and concluded no magnitude existed. It is
+/// on the base class, and `reference/game-defs/extract/x_grade_properties.py` has
+/// been extracting it into `grade_properties.json` the whole time.
 ///
-/// A previous attempt derived this from the ability's rank COUNT
-/// (`floor(n_ranks / 3)`). It fits all three observations exactly and is WRONG:
-/// it contradicts the shipped headroom on 36 of 49 abilities — under it Ice
-/// Spike's ceiling would be 12, but the game ships 14. Do not reintroduce it.
+/// ## What the data says
+///
+/// All **49** grade properties ship the identical array `[0.0, 1.0, 2.0]`, indexed
+/// by tier, and all 49 have `PropertyType == 3`. Tracker #54 traced `GetRawXValue`:
+/// it returns the raw per-tier value unless `PropertyType == 2`, which is the
+/// gear-tempering-multiplied branch these do not take. So the shipped grant is
+///
+/// ```text
+/// tier 1 -> +1 rank      tier 2 -> +2 ranks
+/// ```
+///
+/// against the `+4 / +5` below. Grade tiers only ever occur as 1 or 2, which
+/// matches the array having exactly three entries.
+///
+/// ## One measurement disagrees, and it is not dismissable
+///
+/// The owner's skills menu reads "Frostbite 4+10". His equipped gear carries
+/// `FrostbiteBonusRanks` (d5676014) at tier 2 on **two** items — prod, verified.
+/// The shipped array gives +2 each, so +4, and a rank of 8. The client's own menu
+/// says 14. The client computes that display from the same shipped data we are
+/// reading, so one of the two readings of `_xValueByTier` is wrong.
+///
+/// ## What was genuinely wrong in the old reasoning
+///
+/// The headroom argument — `maximum_level - maximum_purchaseable_level == 5 x
+/// slots` — bounds the CEILING, not the per-item grant. A cap of 5 is perfectly
+/// consistent with +2 per tier-2 item; it says what you may reach, not what one
+/// ring gives. Treating a cap as a grant is how `+5` got here, and that step was
+/// unsound regardless of which number turns out to be right.
+///
+/// ## Left alone deliberately
+///
+/// Changing this to `1 / 2` would be a 2.5x nerf to every graded ability on every
+/// character, shipped on the strength of a field I misread once already in this
+/// same function. It needs one decisive observation, named in the PR: equip a
+/// SINGLE tier-1 grade item for an ability with no other bonus and read the skills
+/// menu. `+1` settles it for the data; `+4` means `_xValueByTier` is not the rank
+/// count and something else supplies it.
+///
+/// A still earlier attempt derived this from the ability's rank COUNT
+/// (`floor(n_ranks / 3)`). It fits the observations and is WRONG: it contradicts
+/// the shipped headroom on 36 of 49 abilities — under it Ice Spike's ceiling would
+/// be 12, but the game ships 14. Do not reintroduce it.
 fn grade_bonus_ranks(tier: u8) -> u8 {
     match tier {
         0 => 0,
