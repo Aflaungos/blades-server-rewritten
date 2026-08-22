@@ -15,12 +15,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use actix_web::{
-    HttpResponse, post,
+    HttpResponse,
     http::StatusCode,
+    post,
     web::{self, Json},
 };
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
-use diesel_async::RunQueryDsl;
+use diesel_async::pooled_connection::bb8::PooledConnection;
+use diesel_async::{AsyncPgConnection, RunQueryDsl};
 use log::{info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
@@ -311,9 +313,7 @@ async fn load_loadout(db: &Option<DbPool>, user_id: Uuid) -> crate::arena::comba
 /// client's deserializer would reject). `equippedItems` now carries retail's per-item
 /// `grade` and `arcaneTier` (`Item`), both omitted when absent so an item that has
 /// neither serializes byte-identically to before they were modelled.
-fn loadout_from_row(
-    r: &CharacterDbEntryCharacterWalletInventory,
-) -> crate::arena::combat::Loadout {
+fn loadout_from_row(r: &CharacterDbEntryCharacterWalletInventory) -> crate::arena::combat::Loadout {
     use crate::arena::combat::loadout;
     let mut lo = loadout::from_character(&r.character.0, &r.inventory.0);
     lo.character_uuid = r.id.to_string();
@@ -373,16 +373,15 @@ fn build_profile_character_json(
     id: Uuid,
     character: &blades_lib::user_data::CompleteCharacter,
 ) -> String {
-    let serialized = match serde_json::to_string(
-        &blades_lib::user_data::CompleteCharacterWithIdAndData {
+    let serialized =
+        match serde_json::to_string(&blades_lib::user_data::CompleteCharacterWithIdAndData {
             data: data.clone(),
             id,
             character: character.clone(),
-        },
-    ) {
-        Ok(s) => s,
-        Err(_) => return String::new(),
-    };
+        }) {
+            Ok(s) => s,
+            Err(_) => return String::new(),
+        };
     let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&serialized) else {
         return serialized;
     };
@@ -457,6 +456,18 @@ fn skill_of_row(r: &CharacterDbEntryCharacterWalletInventory) -> Option<Skill> {
 /// strength (`None` when the row's level/trophies could not be read).
 pub type BotCandidate = (String, bool, Option<Skill>);
 
+/// The outcome of a bot draw.
+///
+/// `step` is the bracket the chosen candidate satisfied, or `None` when no tier
+/// had anybody and the draw fell back to "any eligible opponent". Callers need
+/// that distinction: a fallback draw is a mismatch we tolerate to start a match
+/// at all, and tracker #49 showed it happening silently for months.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BotDraw {
+    pub index: usize,
+    pub step: Option<(i32, i64)>,
+}
+
 /// Pure selection: from the candidate pool, choose a bot that is COMPLETE (renders),
 /// distinct from the human (not a self-match), and AS CLOSE TO THE HUMAN'S STRENGTH
 /// as the pool allows. Returns the chosen index, or `None` if none qualifies.
@@ -492,7 +503,7 @@ fn pick_bot_index(
     human_char_uuid: &str,
     human: Option<Skill>,
     gsid: Uuid,
-) -> Option<usize> {
+) -> Option<BotDraw> {
     let eligible: Vec<usize> = candidates
         .iter()
         .enumerate()
@@ -508,7 +519,10 @@ fn pick_bot_index(
     let rotate = |pool: &[usize]| pool[seed % pool.len()];
 
     let Some(h) = human else {
-        return Some(rotate(&eligible));
+        return Some(BotDraw {
+            index: rotate(&eligible),
+            step: None,
+        });
     };
     for step in BRACKET_STEPS {
         let tier: Vec<usize> = eligible
@@ -517,10 +531,16 @@ fn pick_bot_index(
             .filter(|&i| candidates[i].2.is_some_and(|c| within_step(h, c, step)))
             .collect();
         if !tier.is_empty() {
-            return Some(rotate(&tier));
+            return Some(BotDraw {
+                index: rotate(&tier),
+                step: Some(step),
+            });
         }
     }
-    Some(rotate(&eligible))
+    Some(BotDraw {
+        index: rotate(&eligible),
+        step: None,
+    })
 }
 
 /// Load a SOLO-match bot opponent: a real, COMPLETE, distinct character so the bot has a
@@ -610,7 +630,8 @@ async fn pick_bot_loadout(
         return loadout::starter();
     };
 
-    let rows: Vec<CharacterDbEntryCharacterWalletInventory> = if !config.bot_user_ids.is_empty() {
+    let use_roster = !config.bot_user_ids.is_empty();
+    let mut rows: Vec<CharacterDbEntryCharacterWalletInventory> = if use_roster {
         characters::table
             .filter(characters::user_id.eq_any(config.bot_user_ids.clone()))
             .select(CharacterDbEntryCharacterWalletInventory::as_select())
@@ -618,38 +639,84 @@ async fn pick_bot_loadout(
             .await
             .unwrap_or_default()
     } else {
-        // No roster → any OTHER character (cap the scan; the pool is small today — this
-        // self-heals as more players transfer characters with appearance).
-        let mut q = characters::table
-            .select(CharacterDbEntryCharacterWalletInventory::as_select())
-            .limit(200)
-            .into_boxed();
-        if let Ok(h) = Uuid::parse_str(human_char_uuid) {
-            q = q.filter(characters::id.ne(h));
-        }
-        q.load(&mut conn).await.unwrap_or_default()
+        load_wide_pool(&mut conn, human_char_uuid).await
     };
 
-    let candidates: Vec<BotCandidate> = rows
-        .iter()
-        .map(|r| (r.id.to_string(), row_has_customization(r), skill_of_row(r)))
-        .collect();
-    match pick_bot_index(&candidates, human_char_uuid, human, gsid) {
-        Some(i) => {
-            if let (Some(h), Some(b)) = (human, candidates[i].2) {
-                info!(
-                    "matchmaker: bot drawn at level {} / {} trophies vs the player's {} / {} \
-                     (level gap {}, trophy gap {}) from a pool of {}",
-                    b.level,
-                    b.trophies,
-                    h.level,
-                    h.trophies,
-                    (b.level - h.level).abs(),
-                    (b.trophies - h.trophies).abs(),
-                    candidates.len(),
-                );
+    let mut candidates: Vec<BotCandidate> = rows.iter().map(candidate_of_row).collect();
+    let mut draw = pick_bot_index(&candidates, human_char_uuid, human, gsid);
+
+    // THE ROSTER IS A PREFERENCE, NOT A CAGE (tracker #49).
+    //
+    // A curated `ARENA_BOT_USER_IDS` roster keeps opponents complete and
+    // presentable, but it is small. When nobody in it is inside even the widest
+    // bracket step, honouring the roster means handing the player a wildly
+    // mismatched fight — the reported case was a level 43 / 49-trophy player drawn
+    // against a level 68 / 790-trophy bot, 25 levels and 741 trophies above him,
+    // while three characters within the TIGHTEST step existed outside the roster.
+    //
+    // Two preferences collided and the roster silently won. The bracket is the one
+    // the player feels, so when the roster cannot satisfy it, widen to the whole
+    // character pool and take a bracketed opponent from there. Completeness is not
+    // sacrificed: the wider pool goes through the same `row_has_customization`
+    // filter, so an unrenderable character still cannot be drawn.
+    //
+    // Only ever a widening — if the wider pool has nobody bracketed either, the
+    // roster draw stands.
+    if should_widen(use_roster, human, draw) {
+        let wide_rows = load_wide_pool(&mut conn, human_char_uuid).await;
+        let wide_candidates: Vec<BotCandidate> = wide_rows.iter().map(candidate_of_row).collect();
+        if let Some(d) = pick_bot_index(&wide_candidates, human_char_uuid, human, gsid)
+            && d.step.is_some()
+        {
+            info!(
+                "matchmaker: the {}-character bot roster had nobody inside the bracket for \
+                     this player — widened to the full character pool ({} candidates) and drew a \
+                     bracketed opponent instead",
+                candidates.len(),
+                wide_candidates.len(),
+            );
+            rows = wide_rows;
+            candidates = wide_candidates;
+            draw = Some(d);
+        }
+    }
+
+    match draw {
+        Some(d) => {
+            if let (Some(h), Some(b)) = (human, candidates[d.index].2) {
+                let (dl, dt) = ((b.level - h.level).abs(), (b.trophies - h.trophies).abs());
+                if d.step.is_some() {
+                    info!(
+                        "matchmaker: bot drawn at level {} / {} trophies vs the player's {} / {} \
+                         (level gap {}, trophy gap {}) from a pool of {}",
+                        b.level,
+                        b.trophies,
+                        h.level,
+                        h.trophies,
+                        dl,
+                        dt,
+                        candidates.len(),
+                    );
+                } else {
+                    // Previously silent. This is the line that would have explained
+                    // tracker #49 the first time it happened instead of months later.
+                    warn!(
+                        "matchmaker: NO bracketed opponent anywhere for a player at level {} / {} \
+                         trophies — drew level {} / {} (level gap {}, trophy gap {}) from a pool \
+                         of {}. The widest step is {:?}; this match is a known mismatch. Transfer \
+                         a character near this player's strength to fix it.",
+                        h.level,
+                        h.trophies,
+                        b.level,
+                        b.trophies,
+                        dl,
+                        dt,
+                        candidates.len(),
+                        BRACKET_STEPS[BRACKET_STEPS.len() - 1],
+                    );
+                }
             }
-            loadout_from_row(&rows[i])
+            loadout_from_row(&rows[d.index])
         }
         None => {
             warn!(
@@ -661,6 +728,48 @@ async fn pick_bot_loadout(
             loadout::starter()
         }
     }
+}
+
+/// Should a roster draw be widened to the whole character pool?
+///
+/// Split out from [`pick_bot_loadout`] so the decision is testable without a
+/// database — the bug in tracker #49 was entirely in this condition being absent,
+/// and a condition only reachable through a live Postgres is a condition nobody
+/// tests.
+///
+/// True only when all three hold: a roster is actually configured (otherwise we
+/// are already looking at the whole pool), the player's strength is known
+/// (otherwise there is no bracket to satisfy), and the draw did not satisfy any
+/// bracket step (including "no draw at all").
+fn should_widen(use_roster: bool, human: Option<Skill>, draw: Option<BotDraw>) -> bool {
+    if !use_roster || human.is_none() {
+        return false;
+    }
+    match draw {
+        None => true,
+        Some(d) => d.step.is_none(),
+    }
+}
+
+/// One bot-pool row as [`pick_bot_index`] sees it.
+fn candidate_of_row(r: &CharacterDbEntryCharacterWalletInventory) -> BotCandidate {
+    (r.id.to_string(), row_has_customization(r), skill_of_row(r))
+}
+
+/// Every OTHER character, capped. The pool used when no roster is configured, and
+/// the widening the roster path falls back to when the bracket cannot be met.
+async fn load_wide_pool(
+    conn: &mut PooledConnection<'_, AsyncPgConnection>,
+    human_char_uuid: &str,
+) -> Vec<CharacterDbEntryCharacterWalletInventory> {
+    let mut q = characters::table
+        .select(CharacterDbEntryCharacterWalletInventory::as_select())
+        .limit(200)
+        .into_boxed();
+    if let Ok(h) = Uuid::parse_str(human_char_uuid) {
+        q = q.filter(characters::id.ne(h));
+    }
+    q.load(conn).await.unwrap_or_default()
 }
 
 #[cfg(test)]
@@ -795,15 +904,17 @@ mod bot_pick_tests {
     fn bot_loadout_is_marked_ai_in_both_name_fields() {
         let mut lo = crate::arena::combat::loadout::starter();
         lo.display_name = "Blank".into();
-        lo.profile_character_json =
-            r#"{"id":"abc","name":"Blank","tagId":7}"#.to_string();
+        lo.profile_character_json = r#"{"id":"abc","name":"Blank","tagId":7}"#.to_string();
 
         mark_loadout_as_bot(&mut lo);
 
         assert_eq!(lo.display_name, "Blank (AI)", "the op50 Player spawn name");
         let v: serde_json::Value =
             serde_json::from_str(&lo.profile_character_json).expect("profile stays valid JSON");
-        assert_eq!(v["name"], "Blank (AI)", "the op54 PROFILE name the HUD renders");
+        assert_eq!(
+            v["name"], "Blank (AI)",
+            "the op54 PROFILE name the HUD renders"
+        );
         // Everything else in the profile survives untouched — this is a rename,
         // not a rebuild.
         assert_eq!(v["id"], "abc");
@@ -905,16 +1016,180 @@ mod bot_pick_tests {
         (uuid.to_string(), true, Some(Skill { level, trophies }))
     }
 
+    /// These tests assert WHICH candidate is drawn. The bracket step that justified
+    /// the draw is asserted separately, by the tests below that care about it, so
+    /// the index-only assertions stay readable.
+    fn pick_bot_index(
+        candidates: &[BotCandidate],
+        human_char_uuid: &str,
+        human: Option<Skill>,
+        gsid: Uuid,
+    ) -> Option<usize> {
+        super::pick_bot_index(candidates, human_char_uuid, human, gsid).map(|d| d.index)
+    }
+
+    /// The bracket step a draw satisfied, or `None` for a fallback draw.
+    fn drawn_step(
+        candidates: &[BotCandidate],
+        human: Option<Skill>,
+        seed: u8,
+    ) -> Option<(i32, i64)> {
+        super::pick_bot_index(candidates, NOBODY, human, gsid_with_first_byte(seed))
+            .expect("a candidate was available")
+            .step
+    }
+
+    // -------------------------------------------------------------------
+    // tracker #49: the roster is a preference, not a cage
+    // -------------------------------------------------------------------
+
+    /// The bot roster exactly as production had it on 2026-08-21, minus the
+    /// reporter's own character (self-matches are filtered before the bracket).
+    fn production_roster() -> Vec<BotCandidate> {
+        vec![
+            cand_at("11111111-0000-0000-0000-000000000001", 16, 145), // Prki
+            cand_at("22222222-0000-0000-0000-000000000002", 68, 790), // Meryl Andra
+            cand_at("33333333-0000-0000-0000-000000000003", 89, 776), // WolfWalker
+            cand_at("44444444-0000-0000-0000-000000000004", 91, 1568), // Ivan
+            cand_at("55555555-0000-0000-0000-000000000005", 93, 777), // Shoyr
+        ]
+    }
+
+    /// N'wah, the reporting player: level 43, 49 trophies.
+    fn nwah() -> Option<Skill> {
+        Some(Skill {
+            level: 43,
+            trophies: 49,
+        })
+    }
+
+    /// THE reported match. Against the real roster nobody is inside even the widest
+    /// step — Prki is 27 levels away, everyone else is 25+ levels AND 700+ trophies
+    /// away — so the draw is a fallback and must SAY so. Before this it was silent,
+    /// which is why the mismatch went unexplained.
+    #[test]
+    fn the_production_roster_cannot_bracket_a_level_43_player() {
+        for seed in [0u8, 1, 2, 3, 4, 200] {
+            assert_eq!(
+                drawn_step(&production_roster(), nwah(), seed),
+                None,
+                "seed {seed}: no roster member is within {:?}",
+                BRACKET_STEPS[BRACKET_STEPS.len() - 1],
+            );
+        }
+    }
+
+    /// …and the fix: three characters OUTSIDE the roster (also production, same
+    /// day) sit inside the TIGHTEST step. Widening finds them, so the mismatch was
+    /// never necessary.
+    #[test]
+    fn the_full_pool_brackets_the_same_player_at_the_tightest_step() {
+        let mut wide = production_roster();
+        wide.extend([
+            cand_at("66666666-0000-0000-0000-000000000006", 38, 56), // Ruukoto
+            cand_at("77777777-0000-0000-0000-000000000007", 40, 157), // Ma'dami
+            cand_at("88888888-0000-0000-0000-000000000008", 47, 70), // Ulvoch
+        ]);
+        for seed in [0u8, 1, 2, 3, 4, 200] {
+            assert_eq!(
+                drawn_step(&wide, nwah(), seed),
+                Some(BRACKET_STEPS[0]),
+                "seed {seed}: the near-level characters must win over the roster",
+            );
+            let i = super::pick_bot_index(&wide, NOBODY, nwah(), gsid_with_first_byte(seed))
+                .unwrap()
+                .index;
+            assert!(
+                i >= 5,
+                "seed {seed}: drew index {i}, expected one of the three near ones"
+            );
+        }
+    }
+
+    /// A draw that DID satisfy a bracket reports which one — otherwise the caller
+    /// cannot tell a good draw from a tolerated mismatch, and would widen (or warn)
+    /// on every match.
+    #[test]
+    fn a_bracketed_draw_reports_its_step() {
+        let near = vec![cand_at("99999999-0000-0000-0000-000000000009", 45, 100)];
+        assert_eq!(drawn_step(&near, nwah(), 0), Some(BRACKET_STEPS[0]));
+
+        // 20 levels / 500 trophies apart: too far for steps 0 and 1, inside step 2.
+        let middling = vec![cand_at("99999999-0000-0000-0000-00000000000a", 63, 549)];
+        assert_eq!(drawn_step(&middling, nwah(), 0), Some(BRACKET_STEPS[2]));
+    }
+
+    /// Widening must never smuggle in an opponent that cannot render — that is the
+    /// invisible-bot bug the roster was introduced to prevent. A perfectly
+    /// bracketed but INCOMPLETE candidate stays excluded, and the draw stays a
+    /// fallback rather than silently becoming "bracketed".
+    #[test]
+    fn widening_does_not_relax_the_completeness_filter() {
+        let mut wide = production_roster();
+        wide.push((
+            "aaaaaaaa-0000-0000-0000-00000000000b".to_string(),
+            false, // incomplete: an invisible opponent
+            Some(Skill {
+                level: 43,
+                trophies: 49,
+            }), // a perfect bracket match
+        ));
+        assert_eq!(
+            drawn_step(&wide, nwah(), 0),
+            None,
+            "an unrenderable character must not be drawn, however well it brackets",
+        );
+    }
+
+    #[test]
+    fn widen_only_when_the_roster_failed_the_bracket() {
+        let bracketed = Some(BotDraw {
+            index: 0,
+            step: Some(BRACKET_STEPS[0]),
+        });
+        let fallback = Some(BotDraw {
+            index: 0,
+            step: None,
+        });
+
+        assert!(
+            should_widen(true, nwah(), fallback),
+            "roster missed the bracket, so widen"
+        );
+        assert!(
+            should_widen(true, nwah(), None),
+            "roster had nobody at all, so widen"
+        );
+        assert!(
+            !should_widen(true, nwah(), bracketed),
+            "a bracketed roster draw is what we wanted, so no second query"
+        );
+        assert!(
+            !should_widen(false, nwah(), fallback),
+            "no roster configured, so the draw already came from the whole pool"
+        );
+        assert!(
+            !should_widen(true, None, fallback),
+            "unknown player strength, so there is no bracket to satisfy"
+        );
+    }
+
     #[test]
     fn pick_bot_index_prefers_complete_and_distinct() {
         let human = "aaaaaaaa-0000-0000-0000-000000000001";
         let cands = vec![
-            cand(human, true),                                            // self-match → excluded
-            cand("bbbbbbbb-0000-0000-0000-000000000002", false),          // incomplete → excluded
-            cand("cccccccc-0000-0000-0000-000000000003", true),           // the only eligible
+            cand(human, true),                                   // self-match → excluded
+            cand("bbbbbbbb-0000-0000-0000-000000000002", false), // incomplete → excluded
+            cand("cccccccc-0000-0000-0000-000000000003", true),  // the only eligible
         ];
-        assert_eq!(pick_bot_index(&cands, human, None, gsid_with_first_byte(0)), Some(2));
-        assert_eq!(pick_bot_index(&cands, human, None, gsid_with_first_byte(123)), Some(2));
+        assert_eq!(
+            pick_bot_index(&cands, human, None, gsid_with_first_byte(0)),
+            Some(2)
+        );
+        assert_eq!(
+            pick_bot_index(&cands, human, None, gsid_with_first_byte(123)),
+            Some(2)
+        );
     }
 
     #[test]
@@ -924,7 +1199,10 @@ mod bot_pick_tests {
             cand(human, true),                                   // self
             cand("dddddddd-0000-0000-0000-000000000004", false), // incomplete
         ];
-        assert_eq!(pick_bot_index(&cands, human, None, gsid_with_first_byte(0)), None);
+        assert_eq!(
+            pick_bot_index(&cands, human, None, gsid_with_first_byte(0)),
+            None
+        );
     }
 
     // -------------------------------------------------------------------
@@ -939,7 +1217,10 @@ mod bot_pick_tests {
     /// to hand him the level 93.
     #[test]
     fn a_level_43_player_draws_the_bot_near_his_level() {
-        let taheen = Some(Skill { level: 43, trophies: 240 });
+        let taheen = Some(Skill {
+            level: 43,
+            trophies: 240,
+        });
         let cands = vec![
             cand_at("11111111-0000-0000-0000-000000000001", 89, 700),
             cand_at("22222222-0000-0000-0000-000000000002", 93, 810),
@@ -966,13 +1247,16 @@ mod bot_pick_tests {
     /// A bot inside step 0 beats a bot that only makes step 1, which beats step 2.
     #[test]
     fn the_bot_ladder_takes_the_tightest_step_that_has_anyone() {
-        let me = Some(Skill { level: 50, trophies: 400 });
+        let me = Some(Skill {
+            level: 50,
+            trophies: 400,
+        });
         // One candidate per step, plus one outside every step.
         let cands = vec![
             cand_at("00000000-0000-0000-0000-00000000000f", 90, 2000), // outside all
-            cand_at("00000000-0000-0000-0000-000000000003", 68, 970),  // outside all (level 18 ok, trophies 570 → step 2)
-            cand_at("00000000-0000-0000-0000-000000000002", 59, 690),  // step 1 (9 / 290)
-            cand_at("00000000-0000-0000-0000-000000000001", 53, 500),  // step 0 (3 / 100)
+            cand_at("00000000-0000-0000-0000-000000000003", 68, 970), // outside all (level 18 ok, trophies 570 → step 2)
+            cand_at("00000000-0000-0000-0000-000000000002", 59, 690), // step 1 (9 / 290)
+            cand_at("00000000-0000-0000-0000-000000000001", 53, 500), // step 0 (3 / 100)
         ];
         for seed in [0u8, 1, 7, 128, 255] {
             assert_eq!(
@@ -984,19 +1268,31 @@ mod bot_pick_tests {
         // Drop it → the step-1 candidate. Then the step-2 one. Then anyone.
         let mut pool = cands.clone();
         pool.remove(3);
-        assert_eq!(pick_bot_index(&pool, NOBODY, me, gsid_with_first_byte(0)), Some(2));
+        assert_eq!(
+            pick_bot_index(&pool, NOBODY, me, gsid_with_first_byte(0)),
+            Some(2)
+        );
         pool.remove(2);
-        assert_eq!(pick_bot_index(&pool, NOBODY, me, gsid_with_first_byte(0)), Some(1));
+        assert_eq!(
+            pick_bot_index(&pool, NOBODY, me, gsid_with_first_byte(0)),
+            Some(1)
+        );
         pool.remove(1);
         // Only the far one is left: a bad match beats no match.
-        assert_eq!(pick_bot_index(&pool, NOBODY, me, gsid_with_first_byte(0)), Some(0));
+        assert_eq!(
+            pick_bot_index(&pool, NOBODY, me, gsid_with_first_byte(0)),
+            Some(0)
+        );
     }
 
     /// The bracket is a PREFERENCE, never a gate. An unusable pool must still yield
     /// an opponent rather than strand the player at "determining server".
     #[test]
     fn the_bot_bracket_never_refuses_to_start_a_match() {
-        let me = Some(Skill { level: 5, trophies: 10 });
+        let me = Some(Skill {
+            level: 5,
+            trophies: 10,
+        });
         let far = vec![cand_at("00000000-0000-0000-0000-000000000001", 100, 5000)];
         assert_eq!(
             pick_bot_index(&far, NOBODY, me, gsid_with_first_byte(0)),
@@ -1004,28 +1300,53 @@ mod bot_pick_tests {
             "nobody in any step → still pick the far bot",
         );
         // Unknown human skill (a failed `load_skill`) → the pre-#24 rotation.
-        assert_eq!(pick_bot_index(&far, NOBODY, None, gsid_with_first_byte(0)), Some(0));
+        assert_eq!(
+            pick_bot_index(&far, NOBODY, None, gsid_with_first_byte(0)),
+            Some(0)
+        );
         // Unknown CANDIDATE skill → it cannot satisfy a step, but it can still be drawn.
         let unknown = vec![cand("00000000-0000-0000-0000-000000000002", true)];
-        assert_eq!(pick_bot_index(&unknown, NOBODY, me, gsid_with_first_byte(0)), Some(0));
+        assert_eq!(
+            pick_bot_index(&unknown, NOBODY, me, gsid_with_first_byte(0)),
+            Some(0)
+        );
         // And an INCOMPLETE candidate is still excluded — the render guard outranks
         // the bracket, because an invisible opponent hangs the client at "Connecting".
-        let incomplete = vec![("00000000-0000-0000-0000-000000000003".to_string(), false, Some(Skill { level: 5, trophies: 10 }))];
-        assert_eq!(pick_bot_index(&incomplete, NOBODY, me, gsid_with_first_byte(0)), None);
+        let incomplete = vec![(
+            "00000000-0000-0000-0000-000000000003".to_string(),
+            false,
+            Some(Skill {
+                level: 5,
+                trophies: 10,
+            }),
+        )];
+        assert_eq!(
+            pick_bot_index(&incomplete, NOBODY, me, gsid_with_first_byte(0)),
+            None
+        );
     }
 
     /// Variety across matches must survive inside a tier: two bots equally close to
     /// the player still rotate by gsid, as they did before the bracket existed.
     #[test]
     fn the_gsid_rotation_still_varies_within_a_tier() {
-        let me = Some(Skill { level: 50, trophies: 400 });
+        let me = Some(Skill {
+            level: 50,
+            trophies: 400,
+        });
         let cands = vec![
             cand_at("00000000-0000-0000-0000-000000000001", 48, 350),
             cand_at("00000000-0000-0000-0000-000000000002", 52, 450),
             cand_at("00000000-0000-0000-0000-000000000003", 95, 3000), // outside every step
         ];
-        assert_eq!(pick_bot_index(&cands, NOBODY, me, gsid_with_first_byte(0)), Some(0));
-        assert_eq!(pick_bot_index(&cands, NOBODY, me, gsid_with_first_byte(1)), Some(1));
+        assert_eq!(
+            pick_bot_index(&cands, NOBODY, me, gsid_with_first_byte(0)),
+            Some(0)
+        );
+        assert_eq!(
+            pick_bot_index(&cands, NOBODY, me, gsid_with_first_byte(1)),
+            Some(1)
+        );
         assert_eq!(
             pick_bot_index(&cands, NOBODY, me, gsid_with_first_byte(2)),
             Some(0),
@@ -1038,9 +1359,19 @@ mod bot_pick_tests {
     #[test]
     fn a_perfectly_matched_self_is_still_refused() {
         let human = "aaaaaaaa-0000-0000-0000-000000000001";
-        let me = Some(Skill { level: 50, trophies: 400 });
+        let me = Some(Skill {
+            level: 50,
+            trophies: 400,
+        });
         let cands = vec![
-            (human.to_string(), true, Some(Skill { level: 50, trophies: 400 })),
+            (
+                human.to_string(),
+                true,
+                Some(Skill {
+                    level: 50,
+                    trophies: 400,
+                }),
+            ),
             cand_at("00000000-0000-0000-0000-000000000002", 95, 3000),
         ];
         assert_eq!(
@@ -1064,7 +1395,10 @@ mod bot_pick_tests {
         }
         // Tightest first, and monotonically widening.
         for w in BRACKET_STEPS.windows(2) {
-            assert!(w[1].0 >= w[0].0 && w[1].1 >= w[0].1, "the ladder must not narrow");
+            assert!(
+                w[1].0 >= w[0].0 && w[1].1 >= w[0].1,
+                "the ladder must not narrow"
+            );
         }
     }
 
@@ -1073,8 +1407,14 @@ mod bot_pick_tests {
     /// widened — a server with a handful of players cannot hold out forever.
     #[test]
     fn the_reported_mismatch_is_refused_at_first_and_allowed_later() {
-        let taheen = Some(Skill { level: 43, trophies: 240 });
-        let trickster = Some(Skill { level: 66, trophies: 720 });
+        let taheen = Some(Skill {
+            level: 43,
+            trophies: 240,
+        });
+        let trickster = Some(Skill {
+            level: 66,
+            trophies: 720,
+        });
 
         assert!(
             !compatible(taheen, trickster, Duration::from_secs(0)),
@@ -1090,8 +1430,14 @@ mod bot_pick_tests {
 
     #[test]
     fn a_close_pairing_goes_through_at_once() {
-        let a = Some(Skill { level: 45, trophies: 300 });
-        let b = Some(Skill { level: 47, trophies: 380 });
+        let a = Some(Skill {
+            level: 45,
+            trophies: 300,
+        });
+        let b = Some(Skill {
+            level: 47,
+            trophies: 380,
+        });
         assert!(compatible(a, b, Duration::from_secs(0)));
     }
 
@@ -1099,19 +1445,42 @@ mod bot_pick_tests {
     /// one and far on the other is not a fair match.
     #[test]
     fn both_dimensions_are_enforced() {
-        let base = Some(Skill { level: 50, trophies: 400 });
-        let same_level_far_trophies = Some(Skill { level: 51, trophies: 900 });
-        let same_trophies_far_level = Some(Skill { level: 80, trophies: 410 });
-        assert!(!compatible(base, same_level_far_trophies, Duration::from_secs(0)));
-        assert!(!compatible(base, same_trophies_far_level, Duration::from_secs(0)));
+        let base = Some(Skill {
+            level: 50,
+            trophies: 400,
+        });
+        let same_level_far_trophies = Some(Skill {
+            level: 51,
+            trophies: 900,
+        });
+        let same_trophies_far_level = Some(Skill {
+            level: 80,
+            trophies: 410,
+        });
+        assert!(!compatible(
+            base,
+            same_level_far_trophies,
+            Duration::from_secs(0)
+        ));
+        assert!(!compatible(
+            base,
+            same_trophies_far_level,
+            Duration::from_secs(0)
+        ));
     }
 
     /// A failed skill lookup must never strand someone in the queue. The bracket is
     /// a preference, not a gate that can deadlock the arena.
     #[test]
     fn unknown_skill_never_blocks_a_match() {
-        let known = Some(Skill { level: 1, trophies: 0 });
-        let wildly_different = Some(Skill { level: 100, trophies: 5000 });
+        let known = Some(Skill {
+            level: 1,
+            trophies: 0,
+        });
+        let wildly_different = Some(Skill {
+            level: 100,
+            trophies: 5000,
+        });
         assert!(compatible(None, wildly_different, Duration::from_secs(0)));
         assert!(compatible(known, None, Duration::from_secs(0)));
         assert!(compatible(None, None, Duration::from_secs(0)));
@@ -1134,7 +1503,10 @@ mod bot_pick_tests {
                 bracket_for(Duration::from_secs(w.0)).unwrap(),
                 bracket_for(Duration::from_secs(w.1)).unwrap(),
             );
-            assert!(b.0 >= a.0 && b.1 >= a.1, "bracket must not narrow with time");
+            assert!(
+                b.0 >= a.0 && b.1 >= a.1,
+                "bracket must not narrow with time"
+            );
         }
     }
 
@@ -1147,9 +1519,18 @@ mod bot_pick_tests {
             cand("33333333-0000-0000-0000-000000000003", true),
         ];
         // Three eligible → gsid first-byte selects eligible[b % 3]; distinct seeds differ.
-        assert_eq!(pick_bot_index(&cands, human, None, gsid_with_first_byte(0)), Some(0));
-        assert_eq!(pick_bot_index(&cands, human, None, gsid_with_first_byte(1)), Some(1));
-        assert_eq!(pick_bot_index(&cands, human, None, gsid_with_first_byte(2)), Some(2));
+        assert_eq!(
+            pick_bot_index(&cands, human, None, gsid_with_first_byte(0)),
+            Some(0)
+        );
+        assert_eq!(
+            pick_bot_index(&cands, human, None, gsid_with_first_byte(1)),
+            Some(1)
+        );
+        assert_eq!(
+            pick_bot_index(&cands, human, None, gsid_with_first_byte(2)),
+            Some(2)
+        );
     }
 }
 
@@ -1277,7 +1658,9 @@ pub async fn query_recent_matches(
     limit: i64,
     filter: Option<Uuid>,
 ) -> Vec<RecentTicketView> {
-    let Ok(mut conn) = db.get().await else { return Vec::new() };
+    let Ok(mut conn) = db.get().await else {
+        return Vec::new();
+    };
     let rows: Vec<ArenaMatchRow> = diesel::sql_query(
         "SELECT ticket_id, user_id, status, paired, game_session_id, \
          CAST(EXTRACT(epoch FROM (now() - recorded_at)) AS BIGINT) AS age_seconds \
@@ -1324,7 +1707,8 @@ impl ArenaGlobal {
         // handle — `start` runs under the actix/tokio runtime). `None` when
         // submission is disabled / unconfigured, in which case admit is a no-op.
         let key_submitter = KeySubmitter::from_config(KeySubmitConfig::from_env()).map(Arc::new);
-        let registry = MatchRegistry::new_with_submitter(config.max_concurrent_matches, key_submitter);
+        let registry =
+            MatchRegistry::new_with_submitter(config.max_concurrent_matches, key_submitter);
 
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         let mm_cfg = config.clone();
@@ -1440,7 +1824,10 @@ async fn matchmaker_loop(
                 let waited = since.elapsed();
                 // Don't spin up a bot match for a client that's already gone.
                 if lone.rms.is_gone().await {
-                    info!("matchmaker: waiting ticket {} abandoned (RMS gone) — dropped, no fallback", lone.ticket_id);
+                    info!(
+                        "matchmaker: waiting ticket {} abandoned (RMS gone) — dropped, no fallback",
+                        lone.ticket_id
+                    );
                     continue;
                 }
                 info!(
@@ -1479,26 +1866,37 @@ async fn matchmaker_loop(
                 let before = waiting.len();
                 waiting.retain(|(t, _)| !(t.ticket_id == ticket_id && t.user_id == user_id));
                 if waiting.len() < before {
-                    info!("matchmaker: cancelled waiting ticket {ticket_id} (user {user_id}) — dequeued");
+                    info!(
+                        "matchmaker: cancelled waiting ticket {ticket_id} (user {user_id}) — dequeued"
+                    );
                 } else {
-                    info!("matchmaker: cancel for ticket {ticket_id} — not in the queue (already resolved/gone)");
+                    info!(
+                        "matchmaker: cancel for ticket {ticket_id} — not in the queue (already resolved/gone)"
+                    );
                 }
                 continue;
             }
         };
 
-        info!("matchmaker: ticket {} (user {})", req.ticket_id, req.user_id);
+        info!(
+            "matchmaker: ticket {} (user {})",
+            req.ticket_id, req.user_id
+        );
         record_match_queued(&db, req.ticket_id, req.user_id).await;
         // Push the captured 3-frame progression's first two frames now; the
         // `Succeeded` frame follows once the match resolves (pair or fallback). Sent to
         // the client's CURRENT live rms sender (re-fetched by `RmsHandle::send`).
         let _ = req
             .rms
-            .send(MatchmakingMessage::Searching { ticket_id: req.ticket_id })
+            .send(MatchmakingMessage::Searching {
+                ticket_id: req.ticket_id,
+            })
             .await;
         let _ = req
             .rms
-            .send(MatchmakingMessage::PotentialMatch { ticket_id: req.ticket_id })
+            .send(MatchmakingMessage::PotentialMatch {
+                ticket_id: req.ticket_id,
+            })
             .await;
 
         // Drop any waiting ticket whose client has gone. Pairing against a stale
@@ -1507,7 +1905,10 @@ async fn matchmaker_loop(
         let mut live: Vec<(TicketRequest, Instant)> = Vec::with_capacity(waiting.len());
         for (t, since) in std::mem::take(&mut waiting) {
             if t.rms.is_gone().await {
-                info!("matchmaker: discarded stale waiting ticket {} (RMS gone)", t.ticket_id);
+                info!(
+                    "matchmaker: discarded stale waiting ticket {} (RMS gone)",
+                    t.ticket_id
+                );
             } else {
                 live.push((t, since));
             }
@@ -1605,7 +2006,10 @@ async fn resolve(
         {
             Ok(lo) => lo,
             Err(_) => {
-                warn!("matchmaker: loadout load timed out (user {}) — starter", t.user_id);
+                warn!(
+                    "matchmaker: loadout load timed out (user {}) — starter",
+                    t.user_id
+                );
                 crate::arena::combat::loadout::starter()
             }
         };
@@ -1647,8 +2051,7 @@ async fn resolve(
             // The lone human's character UUID (slot 0), to reject a self-match ghost.
             // (Index, not `.first()`: diesel's `QueryDsl` is in scope and shadows the
             // slice method on `Vec`.)
-            let human_char_uuid: Option<String> =
-                loadouts.get(0).map(|l| l.character_uuid.clone());
+            let human_char_uuid: Option<String> = loadouts.get(0).map(|l| l.character_uuid.clone());
             for i in 0..bots {
                 let lo = match tokio::time::timeout(
                     std::time::Duration::from_millis(1500),
@@ -1658,7 +2061,9 @@ async fn resolve(
                 {
                     Ok(lo) => lo,
                     Err(_) => {
-                        warn!("matchmaker: DEBUG ghost loadout load timed out (user {ghost_id}) — starter");
+                        warn!(
+                            "matchmaker: DEBUG ghost loadout load timed out (user {ghost_id}) — starter"
+                        );
                         crate::arena::combat::loadout::starter()
                     }
                 };
@@ -1797,7 +2202,9 @@ async fn resolve(
                 // Best-effort: if the client's RMS feed is already closed this is a no-op.
                 let _ = t
                     .rms
-                    .send(MatchmakingMessage::Failed { ticket_id: t.ticket_id })
+                    .send(MatchmakingMessage::Failed {
+                        ticket_id: t.ticket_id,
+                    })
                     .await;
             }
             return;
@@ -1976,10 +2383,13 @@ pub async fn cancel_match(
     // a `Succeeded`/"determining server" for a match it had abandoned). Scoped to this
     // user's id so a cancel can only drop that user's own waiting ticket. Best-effort:
     // if the actor's channel is gone the ticket can't be in-queue anyway.
-    let _ = app_state.arena.matchmaker_tx.send(MatchmakerCommand::Cancel {
-        ticket_id,
-        user_id: session.session.user_id,
-    });
+    let _ = app_state
+        .arena
+        .matchmaker_tx
+        .send(MatchmakerCommand::Cancel {
+            ticket_id,
+            user_id: session.session.user_id,
+        });
     // Captured behavior: 200 with a literal `null` body.
     Ok(HttpResponse::Ok()
         .content_type("application/json")
@@ -2004,11 +2414,16 @@ mod tests {
         let psids = derive_player_session_ids(gsid, 2);
         assert_eq!(psids.len(), 2);
         let (psid_a, psid_b) = (&psids[0], &psids[1]);
-        assert_ne!(psid_a, psid_b, "each player gets a distinct playerSessionId");
+        assert_ne!(
+            psid_a, psid_b,
+            "each player gets a distinct playerSessionId"
+        );
 
         let gsid_s = gsid.to_string();
-        let want_prefix =
-            format!("psess-{}", gsid_s.splitn(4, '-').take(3).collect::<Vec<_>>().join("-"));
+        let want_prefix = format!(
+            "psess-{}",
+            gsid_s.splitn(4, '-').take(3).collect::<Vec<_>>().join("-")
+        );
         assert!(
             psid_a.starts_with(&want_prefix) && psid_b.starts_with(&want_prefix),
             "both psess derive their first 3 groups from the gsid: prefix {want_prefix}, got {psid_a} / {psid_b}"
@@ -2022,7 +2437,11 @@ mod tests {
             );
         }
         let suffix = |p: &str| p.splitn(4, '-').skip(3).collect::<Vec<_>>().join("-");
-        assert_ne!(suffix(psid_a), suffix(psid_b), "per-player suffixes are distinct");
+        assert_ne!(
+            suffix(psid_a),
+            suffix(psid_b),
+            "per-player suffixes are distinct"
+        );
     }
 
     /// Two tickets enqueued back-to-back form ONE shared match — but a DB-less pair
@@ -2074,16 +2493,30 @@ mod tests {
         // confirm no Succeeded sneaks through.
         for _ in 0..3 {
             let got_a = tokio::time::timeout(Duration::from_millis(200), recv_a.recv()).await;
-            assert!(no_succeeded(&got_a), "no Succeeded for an empty-UUID paired match (appearance guard)");
-            if matches!(got_a, Err(_)) { break; } // timeout = no more messages
+            assert!(
+                no_succeeded(&got_a),
+                "no Succeeded for an empty-UUID paired match (appearance guard)"
+            );
+            if matches!(got_a, Err(_)) {
+                break;
+            } // timeout = no more messages
         }
         for _ in 0..3 {
             let got_b = tokio::time::timeout(Duration::from_millis(200), recv_b.recv()).await;
-            assert!(no_succeeded(&got_b), "no Succeeded for an empty-UUID paired match (appearance guard)");
-            if matches!(got_b, Err(_)) { break; }
+            assert!(
+                no_succeeded(&got_b),
+                "no Succeeded for an empty-UUID paired match (appearance guard)"
+            );
+            if matches!(got_b, Err(_)) {
+                break;
+            }
         }
         // The capacity permit was returned (no match allocated), so all 4 are free.
-        assert_eq!(registry.available_permits(), 4, "the refused pair holds no capacity permit");
+        assert_eq!(
+            registry.available_permits(),
+            4,
+            "the refused pair holds no capacity permit"
+        );
     }
 
     /// Fix 2 — un-stick on same-char rejection: when the appearance guard rejects
@@ -2165,7 +2598,11 @@ mod tests {
             "client B must receive Failed (appearance guard un-stick, Fix 2); got {failed_b:?}"
         );
         // No match was allocated.
-        assert_eq!(registry.available_permits(), 4, "same-char rejection must not consume a capacity permit");
+        assert_eq!(
+            registry.available_permits(),
+            4,
+            "same-char rejection must not consume a capacity permit"
+        );
     }
 
     /// A waiting ticket whose client has gone (its RMS feed closed — cancelled, timed
@@ -2245,7 +2682,11 @@ mod tests {
 
         // Let Searching/PotentialMatch enqueue, then cancel BEFORE the 1s fallback.
         tokio::time::sleep(Duration::from_millis(100)).await;
-        tx.send(MatchmakerCommand::Cancel { ticket_id: tid, user_id: uid }).unwrap();
+        tx.send(MatchmakerCommand::Cancel {
+            ticket_id: tid,
+            user_id: uid,
+        })
+        .unwrap();
 
         // Past the fallback timer: the cancelled ticket must NOT have bot-matched.
         tokio::time::sleep(Duration::from_millis(1200)).await;
@@ -2255,7 +2696,8 @@ mod tests {
             "a cancelled ticket must not consume a match permit (dequeued, not zombie-resolved)"
         );
         // Drain the channel: only Searching + PotentialMatch, never a Succeeded.
-        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(50), recv.recv()).await {
+        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_millis(50), recv.recv()).await
+        {
             assert!(
                 !matches!(msg, MatchmakingMessage::Succeeded { .. }),
                 "a cancelled ticket must never receive a Succeeded frame; got {msg:?}"
@@ -2296,8 +2738,11 @@ mod tests {
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         // A cancel for someone else's ticket must not touch A's waiting ticket.
-        tx.send(MatchmakerCommand::Cancel { ticket_id: Uuid::new_v4(), user_id: Uuid::new_v4() })
-            .unwrap();
+        tx.send(MatchmakerCommand::Cancel {
+            ticket_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+        })
+        .unwrap();
 
         // Past the fallback timer: A still bot-matched (a solo bot needs no DB — the
         // starter bot fill allocates a permit), so one permit is consumed.
@@ -2325,7 +2770,10 @@ mod tests {
         );
         // An empty ghost UUID (starter loadout / no character) is never a self-match,
         // even against an empty human UUID — don't reject the legitimate bot fallback.
-        assert!(!is_self_match(human, ""), "empty ghost UUID ⇒ not a self-match");
+        assert!(
+            !is_self_match(human, ""),
+            "empty ghost UUID ⇒ not a self-match"
+        );
         assert!(!is_self_match("", ""), "two empty UUIDs ⇒ not a self-match");
     }
 
@@ -2349,7 +2797,10 @@ mod tests {
             with_uuid("38c987fd-c42b-4ea6-b869-c8d4c03055f9", "Flappety"),
             with_uuid("1131a037-716c-49cc-b165-32d8ddc14f49", "Blank"),
         ];
-        assert!(check_paired_uuids_distinct(&ok).is_ok(), "distinct non-empty UUIDs must pass");
+        assert!(
+            check_paired_uuids_distinct(&ok).is_ok(),
+            "distinct non-empty UUIDs must pass"
+        );
 
         // Two equal non-empty UUIDs → rejected (both peers resolved to the same row →
         // appearance collapse). This is the WolfWalker-vs-Flappety reported symptom.
@@ -2358,7 +2809,10 @@ mod tests {
             with_uuid("38c987fd-c42b-4ea6-b869-c8d4c03055f9", "Flappety"),
         ];
         let err = check_paired_uuids_distinct(&same).expect_err("shared UUID must be rejected");
-        assert!(err.contains("share character_uuid"), "rejection names the shared-UUID collapse: {err}");
+        assert!(
+            err.contains("share character_uuid"),
+            "rejection names the shared-UUID collapse: {err}"
+        );
 
         // An empty UUID (a starter() fallback on a slow load_loadout) → rejected: its
         // avatar propId4 would be "" → can't bind a distinct opponent, drops the profile.
@@ -2367,7 +2821,10 @@ mod tests {
             with_uuid("", "DegradedToStarter"),
         ];
         let err = check_paired_uuids_distinct(&empty).expect_err("empty UUID must be rejected");
-        assert!(err.contains("EMPTY character_uuid"), "rejection names the empty-UUID collapse: {err}");
+        assert!(
+            err.contains("EMPTY character_uuid"),
+            "rejection names the empty-UUID collapse: {err}"
+        );
     }
 
     /// The symmetric half of the guard: distinct `character_uuid`s are necessary but
@@ -2446,7 +2903,8 @@ mod tests {
         let mut character = CompleteCharacter::default();
         character.name = "Opponent".into();
         character.level = 86;
-        character.completed_quests = json!({ "q1": { "completed": true }, "q2": { "completed": true } });
+        character.completed_quests =
+            json!({ "q1": { "completed": true }, "q2": { "completed": true } });
         character.global_shop_offers = json!([{ "offerId": "x", "price": 100 }]);
         character.challenge_season = CharacterChallengeSeason {
             current_session_id: Uuid::new_v4(),
@@ -2511,7 +2969,10 @@ mod tests {
         );
 
         // Sanity: the rest of the profile still serialized (id + a real field).
-        assert_eq!(obj.get("id").and_then(|i| i.as_str()), Some(id.to_string().as_str()));
+        assert_eq!(
+            obj.get("id").and_then(|i| i.as_str()),
+            Some(id.to_string().as_str())
+        );
         assert_eq!(obj.get("name").and_then(|n| n.as_str()), Some("Opponent"));
     }
 }
