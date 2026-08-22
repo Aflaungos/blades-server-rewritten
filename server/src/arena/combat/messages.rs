@@ -703,18 +703,49 @@ pub fn receive_damage(
     frame(MSGTYPE_USERMESSAGE, w.finish())
 }
 
+/// propId 7 of op51 — which KIND of thing applied the status.
+///
+/// `STATUS_SOURCE_ELEMENTAL` is sent for the four elemental conditions and
+/// `STATUS_SOURCE_NONE` for everything else. Retail also uses `1` for an
+/// alchemy effect, which additionally carries an `AlchemyInfo` block on propIds
+/// 8..12; we do not emit alchemy effects, so we never send `1`.
+///
+/// Measured over 2,889 retail op51 messages in captures s615 + s616: 329 zeros,
+/// and they are exactly Burning(4) 84 + Frozen(5) 163 + Enervated(6) 35 +
+/// Poisoned(7) 47. Every other status is 255.
+/// [`docs/arena-status-resistance-spec.md` §5.3a]
+const STATUS_SOURCE_ELEMENTAL: u8 = 0;
+const STATUS_SOURCE_NONE: u8 = 255;
+
+/// Is this one of the four elemental conditions retail marks with propId 7 == 0?
+///
+/// Derived from the status rather than passed in by the caller. It used to be a
+/// parameter, and every one of the ten call sites passed `0` — so we sent
+/// "elemental" for Staggered, Paralyzed, Blind, Dodging and ElementalStormArmor,
+/// where retail sends 255. The doc comment on this function stated the correct
+/// rule the whole time; only the call sites were wrong. A value that is a pure
+/// function of another argument should not be a parameter.
+fn status_source_kind(status: StatusEffectType) -> u8 {
+    match status {
+        StatusEffectType::Burning
+        | StatusEffectType::Frozen
+        | StatusEffectType::Enervated
+        | StatusEffectType::Poisoned => STATUS_SOURCE_ELEMENTAL,
+        _ => STATUS_SOURCE_NONE,
+    }
+}
+
 /// `ChangeCombatStatusEffect` (51) — a status effect (condition / buff) was applied or
 /// removed on an actor. Carrier `0x36`, GMID at propId 3. Capture-proven layout
-/// (`docs/arena-status-resistance-spec.md` §5.3, 2 337 frames): `{0:Int actorObj ·
+/// (`docs/arena-status-resistance-spec.md` §5.3/§5.3a, 2 889 messages): `{0:Int actorObj ·
 /// 1:Byte 56 Avatar · 2:Byte 1 Authority · 3:Byte 51 · 4:Bool apply/remove · 5:Byte
-/// StatusEffectType · 6:Float duration · 7:Byte sourceDamageType}`. propId7 = the source
-/// `DamageType` (0 for the four elemental conditions; 255/None otherwise).
+/// StatusEffectType · 6:Float duration · 7:Byte statusSourceKind}`, plus
+/// `8..12 AlchemyInfo` when propId 7 is 1 (not emitted here).
 pub fn change_combat_status_effect(
     actor_net_object_id: i32,
     apply: bool,
     status: StatusEffectType,
     duration: f32,
-    source_damage_type: u8,
 ) -> Vec<u8> {
     let mut w = NetDataWriter::new();
     w.int(0, actor_net_object_id)
@@ -724,7 +755,7 @@ pub fn change_combat_status_effect(
         .bool(4, apply)
         .byte(5, status as u16 as u8)
         .float(6, duration)
-        .byte(7, source_damage_type);
+        .byte(7, status_source_kind(status));
     frame(MSGTYPE_USERMESSAGE, w.finish())
 }
 
@@ -2476,10 +2507,10 @@ mod tests {
 
     /// op51 `ChangeCombatStatusEffect` byte shape (`docs/arena-status-resistance-spec.md`
     /// §5.3): carrier 0x36 on the Avatar, GMID 51, apply bool, status byte, duration,
-    /// source-damage byte. A Poisoned(4.89s) apply with source 0 (an elemental condition).
+    /// statusSourceKind byte. A Poisoned(4.89s) apply — an elemental condition, so 0.
     #[test]
     fn change_combat_status_effect_shape() {
-        let got = change_combat_status_effect(125, true, StatusEffectType::Poisoned, 4.89, 0);
+        let got = change_combat_status_effect(125, true, StatusEffectType::Poisoned, 4.89);
         assert_eq!(&got[0..2], &[0xBE, 0x36], "carrier 0x36");
         let nd = arena_proto::parse_netdata(&got[2..]);
         assert_eq!(nd.int(0), Some(125), "p0 actor obj");
@@ -2488,11 +2519,49 @@ mod tests {
         assert_eq!(nd.int(3), Some(51), "p3 ChangeCombatStatusEffect gmid");
         assert_eq!(nd.props.get(&4), Some(&arena_proto::NetDataValue::Bool(true)), "p4 apply=true");
         assert_eq!(nd.int(5), Some(7), "p5 StatusEffectType Poisoned(7)");
-        assert_eq!(nd.int(7), Some(0), "p7 sourceDamageType 0 (elemental condition)");
+        assert_eq!(nd.int(7), Some(0), "p7 statusSourceKind 0 (elemental condition)");
 
         // A Paralyzed(3.1s) apply rides the same shape (status byte 9).
-        let par = change_combat_status_effect(125, true, StatusEffectType::Paralyzed, 3.1, 0);
+        let par = change_combat_status_effect(125, true, StatusEffectType::Paralyzed, 3.1);
         assert_eq!(arena_proto::parse_netdata(&par[2..]).int(5), Some(9), "Paralyzed = StatusEffectType 9");
+    }
+
+    /// propId 7 is 0 for the four elemental conditions and 255 for everything
+    /// else — measured over 2,889 retail op51 messages in s615 + s616, where the
+    /// 329 zeros are exactly Burning 84 + Frozen 163 + Enervated 35 +
+    /// Poisoned 47. [`docs/arena-status-resistance-spec.md` §5.3a]
+    ///
+    /// THE BUG THIS PINS: propId 7 used to be a parameter, and all ten call
+    /// sites passed 0. So every Staggered, Paralyzed, Blind and Dodging we sent
+    /// claimed to be an elemental condition. Deriving it from the status makes
+    /// that unwriteable; this test makes sure it stays derived correctly.
+    #[test]
+    fn status_source_kind_is_elemental_only_for_the_four_conditions() {
+        let kind = |st| {
+            let f = change_combat_status_effect(1, true, st, 1.0);
+            arena_proto::parse_netdata(&f[2..]).int(7)
+        };
+
+        for st in [
+            StatusEffectType::Burning,
+            StatusEffectType::Frozen,
+            StatusEffectType::Enervated,
+            StatusEffectType::Poisoned,
+        ] {
+            assert_eq!(kind(st), Some(0), "{st:?} is an elemental condition");
+        }
+
+        // The five we were getting wrong, plus Blocking for good measure.
+        for st in [
+            StatusEffectType::Staggered,
+            StatusEffectType::Paralyzed,
+            StatusEffectType::Blind,
+            StatusEffectType::Dodging,
+            StatusEffectType::ElementalStormArmor,
+            StatusEffectType::Blocking,
+        ] {
+            assert_eq!(kind(st), Some(255), "{st:?} is not an elemental condition");
+        }
     }
 
     /// Three REAL prod `PlayerChannelingStateChange` (53) frames, stored as their exact

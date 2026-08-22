@@ -1027,7 +1027,7 @@ fn stun_the_blocked_attacker(
     out.extend(drain_state_changes_for(combat, now, Some(attacker_slot)));
 
     let frame =
-        messages::change_combat_status_effect(obj, true, StatusEffectType::Staggered, secs, 0);
+        messages::change_combat_status_effect(obj, true, StatusEffectType::Staggered, secs);
     for v in 0..viewers {
         out.push((v, frame.clone()));
     }
@@ -1359,7 +1359,7 @@ fn apply_shipped_effects(
             let obj = combat.fighters[caster].net_object_id;
             info!("combat: slot {caster} dodge pool +{cap:.1} ({ability_uuid})");
             let frame = messages::change_combat_status_effect(
-                obj, true, StatusEffectType::Dodging, 0.0, 0,
+                obj, true, StatusEffectType::Dodging, 0.0,
             );
             for v in 0..viewers {
                 out.push((v, frame.clone()));
@@ -1394,7 +1394,7 @@ fn apply_shipped_effects(
             // 2,965/2,965 across three sessions, so this is well-founded — but if the
             // shield visual does not show on device, this id is the first thing to check.
             let frame = messages::change_combat_status_effect(
-                obj, true, StatusEffectType::ElementalStormArmor, 0.0, 0,
+                obj, true, StatusEffectType::ElementalStormArmor, 0.0,
             );
             for v in 0..viewers {
                 out.push((v, frame.clone()));
@@ -1490,7 +1490,7 @@ fn apply_shipped_effects(
             let obj = combat.fighters[target_slot].net_object_id;
             info!("combat: slot {target_slot} BLINDED {secs:.2}s (hit {last_hit_total:.1} >= {threshold:.1})");
             let frame = messages::change_combat_status_effect(
-                obj, true, StatusEffectType::Blind, secs, 0,
+                obj, true, StatusEffectType::Blind, secs,
             );
             for v in 0..viewers {
                 out.push((v, frame.clone()));
@@ -1573,7 +1573,7 @@ fn apply_shipped_effects(
                  (hit {last_hit_total:.1} >= {threshold:.1}, {ability_uuid})"
             );
             let frame = messages::change_combat_status_effect(
-                obj, true, StatusEffectType::Staggered, secs, 0,
+                obj, true, StatusEffectType::Staggered, secs,
             );
             for v in 0..viewers {
                 out.push((v, frame.clone()));
@@ -1591,7 +1591,7 @@ fn apply_shipped_effects(
             let obj = f.net_object_id;
             info!("combat: slot {target_slot} FROZEN + PARALYZED {secs:.2}s ({ability_uuid})");
             for st in [StatusEffectType::Frozen, StatusEffectType::Paralyzed] {
-                let frame = messages::change_combat_status_effect(obj, true, st, secs, 0);
+                let frame = messages::change_combat_status_effect(obj, true, st, secs);
                 for v in 0..viewers {
                     out.push((v, frame.clone()));
                 }
@@ -1631,7 +1631,7 @@ fn try_paralyze(
     f.blocking_until = None;
     let obj = f.net_object_id;
     info!("combat: slot {target_slot} PARALYZED (poison {recent:.1} ≥ {threshold:.1}) for {secs}s");
-    let frame = messages::change_combat_status_effect(obj, true, StatusEffectType::Paralyzed, secs, 0);
+    let frame = messages::change_combat_status_effect(obj, true, StatusEffectType::Paralyzed, secs);
     for slot in 0..combat.fighters.len() {
         out.push((slot, frame.clone()));
     }
@@ -1993,7 +1993,7 @@ fn apply_status_conditioning(
                     is_transient_resist: false,
                 });
                 let frame = messages::change_combat_status_effect(
-                    target_obj, true, condition, CONDITION_DURATION_SECS, 0,
+                    target_obj, true, condition, CONDITION_DURATION_SECS,
                 );
                 debug!("combat: slot {target_slot} CONDITION {condition:?} landed ({recent:.0} ≥ {threshold:.0} window poison/elem)");
                 for slot in 0..combat.fighters.len() {
@@ -2060,7 +2060,7 @@ fn apply_status_conditioning(
                     f.blocking_until = None; // paralysed → guard drops
                     f.paralyze_secs = secs;
                     let frame = messages::change_combat_status_effect(
-                        target_obj, true, StatusEffectType::Paralyzed, secs, 0,
+                        target_obj, true, StatusEffectType::Paralyzed, secs,
                     );
                     info!("combat: slot {target_slot} PARALYZED (poison {recent:.1} ≥ {paralyze_threshold:.1}) for {secs}s");
                     for slot in 0..combat.fighters.len() {
@@ -2288,7 +2288,7 @@ fn apply_ward(
     );
     // op51 apply Ward=15 with the rank's real `_wardDuration` (was 0 = "pool-managed").
     let frame =
-        messages::change_combat_status_effect(target_obj, true, StatusEffectType::Ward, ward_duration, 0);
+        messages::change_combat_status_effect(target_obj, true, StatusEffectType::Ward, ward_duration);
     for slot in 0..combat.fighters.len() {
         out.push((slot, frame.clone()));
     }
@@ -2329,7 +2329,7 @@ fn apply_absorb(
     let obj = f.net_object_id;
     info!("combat: slot {caster_slot} ABSORB r{rank} applied (pool {amount:.2}, heal ×{restoration}, {duration}s)");
     let frame =
-        messages::change_combat_status_effect(obj, true, StatusEffectType::Absorb, duration, 0);
+        messages::change_combat_status_effect(obj, true, StatusEffectType::Absorb, duration);
     for slot in 0..combat.fighters.len() {
         out.push((slot, frame.clone()));
     }
@@ -2366,7 +2366,7 @@ fn apply_resist_elements(
             .transient_resistances
             .push((dmg_ty, resist_amount, expires));
         let frame =
-            messages::change_combat_status_effect(target_obj, true, effect_ty, resist_duration, 0);
+            messages::change_combat_status_effect(target_obj, true, effect_ty, resist_duration);
         for slot in 0..combat.fighters.len() {
             out.push((slot, frame.clone()));
         }
