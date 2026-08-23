@@ -33,6 +33,7 @@ use blades_lib::user_data::{
 };
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper, insert_into};
 use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt};
+use log::warn;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
@@ -49,6 +50,44 @@ use crate::{
 // real Blades service id (those are client-facing); picked to be obviously
 // out-of-band so import failures are easy to spot in logs.
 const IMPORT_SERVICE_ID: u64 = 9001;
+
+/// Deserialize `quests[]` entry by entry, DROPPING any the schema cannot read
+/// instead of failing the whole body.
+///
+/// WHY: report #59. One captured quest carried a negative `seed` where the
+/// struct wanted `u64`, and serde rejected the entire `import-character`
+/// request — so the player could not transfer his character at all, over one
+/// field of one quest in a list that is a nicety. A quest we cannot parse
+/// should cost that quest, never the character.
+///
+/// The strict behaviour is still right for the four `blades_lib` parts above:
+/// a character whose gear or wallet will not deserialize is not importable in
+/// any useful sense. It is wrong only for this list, which is additive.
+///
+/// Dropped entries are logged with the reason, so a schema drift shows up in
+/// the log rather than silently shrinking people's quest logs.
+fn quests_skipping_unparseable<'de, D>(de: D) -> Result<Vec<QuestWithId>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let raw = Vec::<Value>::deserialize(de)?;
+    let total = raw.len();
+    let mut out = Vec::with_capacity(total);
+    for v in raw {
+        match serde_json::from_value::<QuestWithId>(v) {
+            Ok(q) => out.push(q),
+            Err(e) => warn!("[import] skipping an unreadable quest: {e}"),
+        }
+    }
+    if out.len() != total {
+        warn!(
+            "[import] kept {}/{} quests; the rest could not be read",
+            out.len(),
+            total
+        );
+    }
+    Ok(out)
+}
 
 /// The four `blades_lib` parts of a character, as sent on the wire (camelCase).
 /// These mirror the JSONB columns of the `characters` table 1:1.
@@ -70,7 +109,7 @@ pub struct ImportCharacterRequest {
     /// empty quest table, so `get_quests` returns `quests: []` and the in-game
     /// quest map has nothing to draw (report #58). Job rows are not sent: those
     /// are rolled server-side per reset window.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "quests_skipping_unparseable")]
     pub quests: Vec<QuestWithId>,
     /// Dungeon bodies for the quests above, matched by `questId`. A quest whose
     /// dungeon was never generated in the capture simply has no entry here.
@@ -514,6 +553,62 @@ mod tests {
             1,
             "objective progress must not be dropped — it is what the map draws"
         );
+    }
+
+    /// Report #59: ONE quest with a value the schema could not read rejected the
+    /// entire `import-character` body, and the player could not transfer his
+    /// character at all. A quest we cannot parse must cost that quest only.
+    ///
+    /// The bad entry here is the real shape that caused it — a quest whose
+    /// `seed` is not representable — alongside two good ones.
+    #[test]
+    fn an_unreadable_quest_does_not_reject_the_character() {
+        let good = |id: &str| {
+            serde_json::json!({
+                "questId": id, "version": 2, "type": "NORMAL",
+                "objectiveStatuses": {}, "difficultyLevel": -1, "seed": 485975867,
+                "gldQuestId": id, "completed": false,
+            })
+        };
+        let mut body = body_without_quests();
+        body["quests"] = serde_json::json!([
+            good("159bc1e7-454c-4e2a-90cf-e200c74b961a"),
+            // unreadable: `seed` is a string, not a number
+            {
+                "questId": "334e582f-95ba-4263-b381-ac6d91eabe92",
+                "version": 2, "type": "NORMAL", "objectiveStatuses": {},
+                "difficultyLevel": -1, "seed": "not-a-number",
+                "gldQuestId": "334e582f-95ba-4263-b381-ac6d91eabe92",
+                "completed": false,
+            },
+            good("378307c6-0a23-41f8-b721-5282fa0a8a2b"),
+        ]);
+
+        let parsed: ImportCharacterRequest = serde_json::from_value(body)
+            .expect("one unreadable quest must not reject the whole character");
+        assert_eq!(parsed.quests.len(), 2, "the two readable quests survive");
+        // And the character itself is intact — the point of the whole change.
+        assert_eq!(parsed.user_id.to_string(), "11111111-2222-3333-4444-555555555555");
+    }
+
+    /// A quest missing a required field is dropped, not defaulted into
+    /// something wrong.
+    #[test]
+    fn a_quest_missing_a_required_field_is_dropped() {
+        let mut body = body_without_quests();
+        body["quests"] = serde_json::json!([{ "questId": "159bc1e7-454c-4e2a-90cf-e200c74b961a" }]);
+        let parsed: ImportCharacterRequest = serde_json::from_value(body).unwrap();
+        assert!(parsed.quests.is_empty());
+    }
+
+    /// Leniency applies ONLY to the quest list. A character whose own parts are
+    /// unreadable is not importable, and must still be refused.
+    #[test]
+    fn a_broken_character_part_is_still_refused() {
+        let mut body = body_without_quests();
+        body["wallet"] = serde_json::json!("not a wallet");
+        let r: Result<ImportCharacterRequest, _> = serde_json::from_value(body);
+        assert!(r.is_err(), "a malformed wallet must still fail the import");
     }
 
     /// Older capture-side callers send no `quests` key at all. They must keep
