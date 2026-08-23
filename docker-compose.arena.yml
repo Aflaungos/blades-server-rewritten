@@ -162,10 +162,14 @@ services:
       # Recreate the container to apply (no rebuild needed). See matchmaker.rs / config.rs.
       ARENA_DEBUG_GHOST: ${ARENA_DEBUG_GHOST:-}
       RUST_LOG: ${RUST_LOG:-info}
+      # The DB password reaches the server through the ENVIRONMENT, never as a
+      # command-line argument: argv lands in /proc/<pid>/cmdline, which any
+      # unprivileged local account can read via `ps aux`. This box also hosts
+      # other services, so that was a real exposure rather than a theoretical
+      # one.
+      ARENA_DATABASE_URL: postgres://blades:${ARENA_DB_PASSWORD:?set ARENA_DB_PASSWORD in arena.env}@arena-db:5432/blades
     command:
       - run
-      - --connection-string
-      - postgres://blades:${ARENA_DB_PASSWORD}@arena-db:5432/blades
       - --host
       - 0.0.0.0
       - --port

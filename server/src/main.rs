@@ -75,8 +75,14 @@ struct Cli {
 enum Commands {
     /// Run the server
     Run {
-        /// Database connection string
-        #[arg(short, long)]
+        /// Database connection string.
+        ///
+        /// Prefer the ENVIRONMENT. Passing it as an argument puts the database
+        /// password in `/proc/<pid>/cmdline`, which is world-readable: any
+        /// unprivileged local account can read it out of `ps aux`, and this box
+        /// hosts more than this service. `hide_env_values` keeps it out of
+        /// `--help` output too.
+        #[arg(short, long, env = "ARENA_DATABASE_URL", hide_env_values = true)]
         connection_string: String,
         #[arg(long)]
         host: String,
@@ -512,4 +518,63 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod cli_tests {
+    use super::*;
+    use clap::Parser;
+
+    /// ONE lock for the whole module. Rust runs tests in parallel threads that
+    /// share a single process environment, so a per-test lock would serialise
+    /// nothing — which is exactly the bug the first version of these tests had.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The database password must reach the server through the ENVIRONMENT.
+    ///
+    /// Passing it as an argument puts it in `/proc/<pid>/cmdline`, which any
+    /// unprivileged local account can read out of `ps aux` — and this box hosts
+    /// more than this service, so it was a real exposure. This test fails if
+    /// someone removes the `env` attribute and quietly sends us back to argv.
+    ///
+    /// Serialised and restored around the env mutation: Rust runs tests in
+    /// parallel threads sharing one environment.
+    #[test]
+    fn the_connection_string_can_come_from_the_environment() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("ARENA_DATABASE_URL").ok();
+
+        unsafe { std::env::set_var("ARENA_DATABASE_URL", "postgres://u:p@h:5432/db") };
+        let parsed = Cli::try_parse_from([
+            "server", "run", "--host", "0.0.0.0", "--port", "8080",
+            "--static-data", "/data/static",
+        ]);
+        match prev {
+            Some(v) => unsafe { std::env::set_var("ARENA_DATABASE_URL", v) },
+            None => unsafe { std::env::remove_var("ARENA_DATABASE_URL") },
+        }
+
+        let cli = parsed.expect("the env var must satisfy --connection-string");
+        let Commands::Run { connection_string, .. } = cli.command;
+        assert_eq!(connection_string, "postgres://u:p@h:5432/db");
+    }
+
+    /// With neither the flag nor the variable it must still refuse to start.
+    /// A fallback that quietly defaulted to something would be worse than the
+    /// exposure it replaced.
+    #[test]
+    fn it_still_refuses_to_start_with_no_connection_string_at_all() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("ARENA_DATABASE_URL").ok();
+        unsafe { std::env::remove_var("ARENA_DATABASE_URL") };
+
+        let parsed = Cli::try_parse_from([
+            "server", "run", "--host", "0.0.0.0", "--port", "8080",
+            "--static-data", "/data/static",
+        ]);
+        if let Some(v) = prev {
+            unsafe { std::env::set_var("ARENA_DATABASE_URL", v) };
+        }
+        assert!(parsed.is_err(), "must not start without a connection string");
+    }
 }
