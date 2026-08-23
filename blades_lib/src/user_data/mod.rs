@@ -37,7 +37,24 @@ impl Default for CompleteCharacterData {
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct CharacterChallengeSeason {
-    pub current_session_id: Uuid,
+    /// Retail leaves this out, or sends an explicit `null`, whenever the player has
+    /// no challenge session running — 773 of 1,032 captured `challengeSeason`
+    /// objects omit it.
+    ///
+    /// It was a bare `Uuid`, which can hold neither. The cost was not an import
+    /// failure but something quieter: `arena-transfer.ts` worked around the type by
+    /// substituting a hardcoded placeholder session id and default season state for
+    /// EVERY transferred character, with the reason written in its own comment —
+    /// *"challengeSeason is intentionally left at the default: its captured
+    /// currentSessionId is null, which the non-optional struct field can't hold"*.
+    /// So every transferred character silently lost its real challenge-season state
+    /// because of a type here.
+    ///
+    /// `Option` + `skip_serializing_if` is the faithful shape, matching `grade` and
+    /// `arcane_tier` in `backpack.rs`: retail omits the key rather than sending a
+    /// zero, so emitting one would be a shape retail never produced.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_session_id: Option<Uuid>,
     pub rank: i64,
     pub rank_rewarded: i64,
     pub points: i64,
@@ -131,7 +148,9 @@ impl Default for CompleteCharacter {
             stamina_attribute_points: 0,
             magicka_attribute_points: 0,
             challenge_season: CharacterChallengeSeason {
-                current_session_id: Uuid::from_str("3d336fe7-be60-46a1-b88b-540f3ad5efa2").unwrap(),
+                current_session_id: Some(
+                    Uuid::from_str("3d336fe7-be60-46a1-b88b-540f3ad5efa2").unwrap(),
+                ),
                 rank: 1,
                 rank_rewarded: 0,
                 points: 0,
@@ -193,4 +212,54 @@ impl UserAccount {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct B64EncodedData {
     pub b64: String,
+}
+
+#[cfg(test)]
+mod challenge_season_tests {
+    use super::*;
+
+    fn season(extra: &str) -> String {
+        format!(
+            r#"{{"rank":1,"rankRewarded":0,"points":0,"seasonYear":2026,"premium":false{extra}}}"#
+        )
+    }
+
+    /// Every assertion below goes through JSON rather than touching the field's
+    /// Rust type, so these tests COMPILE against the old bare `Uuid` too and fail
+    /// at runtime instead. `quest.rs` learned this the hard way: a compile error is
+    /// weaker evidence than watching the deserialize itself fail.
+    fn parse(extra: &str) -> Result<serde_json::Value, serde_json::Error> {
+        let c: CharacterChallengeSeason = serde_json::from_str(&season(extra))?;
+        Ok(serde_json::to_value(&c).unwrap())
+    }
+
+    /// Retail OMITS `currentSessionId` when no challenge session is running:
+    /// 773 of 1,032 captured `challengeSeason` objects have no such key.
+    #[test]
+    fn an_omitted_session_id_deserializes() {
+        let v = parse("").expect("retail omits currentSessionId with no session running");
+        assert!(
+            v.get("currentSessionId").is_none(),
+            "an absent session id must not be invented on serialize, got {v}",
+        );
+    }
+
+    /// And sends an explicit `null` in the case `arena-transfer.ts` documented.
+    /// A bare `Uuid` holds neither this nor the omission above, which is why the
+    /// transfer builder substituted a placeholder for every character it imported.
+    #[test]
+    fn an_explicit_null_session_id_deserializes() {
+        let v = parse(r#","currentSessionId":null"#)
+            .expect("retail sends an explicit null here");
+        assert!(v.get("currentSessionId").is_none());
+    }
+
+    /// A real session id must still survive — the control. A change that simply
+    /// dropped the field would pass both tests above and fail this one.
+    #[test]
+    fn a_real_session_id_round_trips() {
+        let id = "3d336fe7-be60-46a1-b88b-540f3ad5efa2";
+        let v = parse(&format!(r#","currentSessionId":"{id}""#)).unwrap();
+        assert_eq!(v["currentSessionId"], serde_json::json!(id));
+    }
 }

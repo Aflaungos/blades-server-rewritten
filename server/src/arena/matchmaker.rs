@@ -2907,7 +2907,7 @@ mod tests {
             json!({ "q1": { "completed": true }, "q2": { "completed": true } });
         character.global_shop_offers = json!([{ "offerId": "x", "price": 100 }]);
         character.challenge_season = CharacterChallengeSeason {
-            current_session_id: Uuid::new_v4(),
+            current_session_id: Some(Uuid::new_v4()),
             rank: 7,
             rank_rewarded: 3,
             points: 1234,
