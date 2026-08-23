@@ -702,6 +702,20 @@ pub struct ActiveChannel {
 // Per-fighter authoritative state
 // ---------------------------------------------------------------------------
 
+/// A potion that is still taking effect.
+///
+/// `remaining` is what is left to give, `per_tick` what each regen tick hands
+/// over. Both are floats because a 225-point restoration over 2.5 s does not
+/// divide evenly into whole points per second, and rounding each tick
+/// independently would quietly lose several points of the potion.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PendingRestore {
+    /// `ActorStats.CoreStats`: 0 Health, 1 Stamina, 2 Magicka.
+    pub affected_stat: u8,
+    pub remaining: f32,
+    pub per_tick: f32,
+}
+
 #[derive(Debug, Clone)]
 pub struct Fighter {
     pub slot: usize,
@@ -919,6 +933,13 @@ pub struct Fighter {
     /// request (63) itself carries no payload. `None` until the client uploads its
     /// loadout. [Phase 4.3 wire trigger]
     pub equipped_consumable: Option<String>,
+    /// An in-flight potion. Retail spreads a restoration over
+    /// `_restorationDuration` (2.5 s for every shipped tier) rather than
+    /// applying it in one lump, so this is drained by `apply_regen_tick`
+    /// instead of being added on the spot — the tick already owns pool
+    /// changes and already emits the stats update, so nothing new has to
+    /// learn how to talk to the client.
+    pub pending_restore: Option<PendingRestore>,
     /// How long the CURRENT paralysis lasts (the casting rank's shipped `_duration`);
     /// read by `resolve::reconcile_paralysis`. [Phase 3.9]
     pub paralyze_secs: f32,
@@ -1054,6 +1075,7 @@ impl Fighter {
             announced_statuses: Vec::new(),
             consumables_used: 0,
             equipped_consumable: None,
+            pending_restore: None,
             paralyze_secs: paralyze_duration_secs(1),
         }
     }

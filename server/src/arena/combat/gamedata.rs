@@ -65,6 +65,8 @@ pub mod source_hashes {
     pub const GRADE_PROPERTIES: &str = "f969bfb9845a30d80e3bf602403724ace99dfe5a1673856c9e4986c7b4b8b3d3";
     /// sha256 of `reference/game-defs/perks.json`.
     pub const PERKS: &str = "db00cb35d4a09b3c91d826164b73c38f3d509e257555a0a3716e5cf950080f07";
+    /// sha256 of `reference/game-defs/consumables.json`.
+    pub const CONSUMABLES: &str = "f6b698fde782e66614d8a1c01eadab00be019c048ae174eb113cfa167297d5f9";
 
     /// `(filename, sha256)` for every source, in generation order.
     pub const ALL: &[(&str, &str)] = &[
@@ -74,6 +76,7 @@ pub mod source_hashes {
         ("enchantments.json", ENCHANTMENTS),
         ("grade_properties.json", GRADE_PROPERTIES),
         ("perks.json", PERKS),
+        ("consumables.json", CONSUMABLES),
     ];
 }
 
@@ -38498,6 +38501,228 @@ pub fn ability_rank_clamped(ability_uuid: &str, rank: u16) -> Option<&'static Ab
         None if rank == 0 => ranks.first(),
         None => ranks.last(),
     }
+}
+
+/// What drinking one consumable restores — 30 items.
+///
+/// Source: `RestorationAbility` (`dump.cs:606658`), whose fields are all
+/// `[ExcelVariable]`, i.e. authored game data. Joined here from
+/// `items.json` (the item NAME carries the pool and tier) against
+/// `consumables.json` (the magnitudes, extracted from the APK's
+/// `ConsumableEffectList`).
+///
+/// Only the three RESTORATION families are here. The other eleven
+/// consumable families are alchemy effects (resists, weakness poisons)
+/// carrying an `AlchemyInfo` rather than a restoration, and are not
+/// modelled by this table.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Restoration {
+    pub uuid: &'static str,
+    /// `ActorStats.CoreStats`: 0 Health, 1 Stamina, 2 Magicka. Cross-checked
+    /// at generation time against the pool named in the item's own name —
+    /// a disagreement fails the build rather than shipping a potion that
+    /// refills the wrong bar.
+    pub affected_stat: u8,
+    /// Flat amount restored. Every shipped tier is flat (`_restorationMode`
+    /// 0); a percentage-mode tier is skipped at generation rather than
+    /// applied as if it were flat.
+    pub value: f32,
+    /// Seconds the restoration is spread over. Uniformly 2.5 in the shipped
+    /// data.
+    pub duration: f32,
+}
+
+/// All 30 restoration consumables, **sorted by `uuid`**.
+pub const RESTORATIONS: [Restoration; 30] = [
+    Restoration {
+        uuid: "08a2e790-c083-4157-906d-d6847fb9e584",
+        affected_stat: 2,
+        value: 675.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "0abd2631-f9f0-4db2-8f8a-e83bc15e8c1e",
+        affected_stat: 2,
+        value: 435.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "163d7b43-c246-4943-90b0-35410aee3d19",
+        affected_stat: 2,
+        value: 370.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "1c5c5ce3-178b-4938-89f3-faf3fa7f0664",
+        affected_stat: 0,
+        value: 170.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "1e12dc39-9029-4cfa-a7f1-9eebfbe240cf",
+        affected_stat: 1,
+        value: 370.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "21e6557f-17ca-4bd3-9379-00184efe0edc",
+        affected_stat: 0,
+        value: 145.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "2ce48871-b5c7-4deb-93b1-8e444098f753",
+        affected_stat: 2,
+        value: 210.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "3222bf47-86f6-4ca5-81b0-353cb38d5092",
+        affected_stat: 2,
+        value: 315.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "34988d74-de88-43af-adea-445def4949be",
+        affected_stat: 1,
+        value: 435.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "423fb9f0-a8fd-4b19-8701-b2bd92afdaaf",
+        affected_stat: 2,
+        value: 235.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "42a22694-40eb-4c34-a267-c9aef2d96f56",
+        affected_stat: 1,
+        value: 210.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "45fbef4d-9244-456e-8fc0-f23f0750b3fa",
+        affected_stat: 1,
+        value: 315.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "52e2f139-fd26-4707-8a96-8e823de59a66",
+        affected_stat: 1,
+        value: 675.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "5bcb4692-3c94-4732-9a27-63868a25ba5f",
+        affected_stat: 2,
+        value: 775.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "605786d6-1b00-48ec-b765-eb81c5e4a1df",
+        affected_stat: 0,
+        value: 195.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "61b31323-8ba2-49f2-befe-f43111c6e2c7",
+        affected_stat: 0,
+        value: 225.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "6c2e00e4-fbc8-4be8-8951-58e1aa33e930",
+        affected_stat: 2,
+        value: 505.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "819094ad-e749-4c02-9210-38c3bb1ec535",
+        affected_stat: 0,
+        value: 90.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "8da5101c-2e7c-446b-b3bd-d1b9aa5c44f6",
+        affected_stat: 1,
+        value: 775.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "979f5025-b9b8-4b1e-b312-f96f294f97ae",
+        affected_stat: 1,
+        value: 235.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "a578cb1a-c6d9-4cf7-be42-be56e403b937",
+        affected_stat: 1,
+        value: 585.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "a60bc580-cd03-46b0-b7b4-d479b52a3e0b",
+        affected_stat: 2,
+        value: 585.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "aa52a6a4-6500-44b5-ad74-9eb1d58e38c7",
+        affected_stat: 0,
+        value: 105.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "af316825-826d-4fba-8554-a99d2fe291e9",
+        affected_stat: 1,
+        value: 505.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "be886c9f-ed94-4610-b52b-3077152c3c01",
+        affected_stat: 2,
+        value: 270.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "c2139cd9-1d9d-4d4e-80b2-133e07440158",
+        affected_stat: 0,
+        value: 260.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "d5ccf370-0795-4554-9dab-68ccbb97473d",
+        affected_stat: 0,
+        value: 70.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "d826ea12-e583-47c1-a50f-4de608281735",
+        affected_stat: 0,
+        value: 80.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "f9d2869a-a517-4080-abac-be6af47e5556",
+        affected_stat: 0,
+        value: 125.0,
+        duration: 2.5,
+    },
+    Restoration {
+        uuid: "fc29f4b5-3764-4241-aa1c-c623c4fbeff4",
+        affected_stat: 1,
+        value: 270.0,
+        duration: 2.5,
+    },
+];
+
+/// What drinking `item_uuid` restores, or `None` if it restores nothing
+/// (every non-restoration consumable, and any item at all).
+pub fn restoration(item_uuid: &str) -> Option<&'static Restoration> {
+    RESTORATIONS
+        .binary_search_by(|r| r.uuid.cmp(item_uuid))
+        .ok()
+        .map(|i| &RESTORATIONS[i])
 }
 
 /// Enchantment family for a family UUID.

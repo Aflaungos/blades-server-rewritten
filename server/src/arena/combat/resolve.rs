@@ -2690,6 +2690,32 @@ fn apply_regen_tick(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u
 
         let before_s = f.stamina;
         let before_m = f.magicka;
+        let before_h = f.health;
+
+        // A potion in flight. Drained here so it shares the tick's existing
+        // stats-update emit, and so a restoration and a regen landing in the
+        // same second produce ONE frame rather than two.
+        //
+        // Health is restored even though passive health regen is zero: a potion
+        // is not regeneration, and `ShouldApplyRegeneration` returning false in
+        // PvP says nothing about drinking one.
+        if let Some(mut pr) = f.pending_restore.take() {
+            let give = pr.per_tick.min(pr.remaining);
+            let amount = give.round() as u32;
+            match pr.affected_stat {
+                0 => f.health = (f.health + amount).min(f.max_health),
+                1 => f.stamina = (f.stamina + amount).min(f.max_stamina),
+                2 => f.magicka = (f.magicka + amount).min(f.max_magicka),
+                _ => {}
+            }
+            pr.remaining -= give;
+            // Keep it only while there is something left to give; the rounding
+            // above can leave a sub-point remainder that would otherwise tick
+            // forever handing over zero.
+            if pr.remaining >= 1.0 {
+                f.pending_restore = Some(pr);
+            }
+        }
 
         // Health regen: NOT APPLIED HERE, and note that `HEALTH_REGEN_RATE_PER_S`
         // is referenced by no code at all — only by comments. Setting it does
@@ -2715,7 +2741,7 @@ fn apply_regen_tick(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u
             f.magicka = (f.magicka + regen).min(f.max_magicka);
         }
 
-        let changed = f.stamina != before_s || f.magicka != before_m;
+        let changed = f.stamina != before_s || f.magicka != before_m || f.health != before_h;
         if changed {
             f.stats_seq = f.stats_seq.wrapping_add(1);
             let packed = f.packed_stats();
@@ -4395,9 +4421,109 @@ fn on_consume_consumable(
         return Vec::new();
     }
     let obj = combat.fighters[sender].net_object_id;
-    info!("combat: slot {sender} consumed {uuid} (op63 → op64)");
+
+    // Apply what the potion actually restores (tracker #29). Until this, the
+    // charge was spent and the animation played and NOTHING happened, because
+    // the magnitude was not known to the engine. It is now a generated table
+    // joined from the shipped item data — see `gamedata::RESTORATIONS`.
+    //
+    // Spread over the tier's own duration rather than granted in one lump:
+    // every shipped tier is 2.5 s, and a 225-point heal arriving instantly is
+    // a different thing to fight against than one arriving over two and a half
+    // seconds. `apply_regen_tick` drains it.
+    match super::gamedata::restoration(&uuid) {
+        Some(r) => {
+            let ticks = (r.duration / REGEN_TICK_INTERVAL.as_secs_f32()).max(1.0);
+            combat.fighters[sender].pending_restore = Some(super::state::PendingRestore {
+                affected_stat: r.affected_stat,
+                remaining: r.value,
+                per_tick: r.value / ticks,
+            });
+            info!(
+                "combat: slot {sender} consumed {uuid} (op63 → op64) — \
+                 restoring {:.0} to stat {} over {:.1}s",
+                r.value, r.affected_stat, r.duration
+            );
+        }
+        None => {
+            // Every non-restoration consumable: resist potions and weakness
+            // poisons carry an AlchemyInfo instead, which is not modelled. The
+            // drink is still spent and still animates, as before.
+            info!("combat: slot {sender} consumed {uuid} (op63 → op64) — no restoration in data");
+        }
+    }
+
     let frame = messages::perform_consume_consumable(obj, &uuid);
     (0..combat.fighters.len()).map(|s| (s, frame.clone())).collect()
+}
+
+#[cfg(test)]
+mod potion_tests {
+    use super::super::gamedata;
+
+    /// Tracker #29: "potion had no effect". The engine spent the charge and
+    /// played the animation and applied nothing, because no magnitude was known
+    /// to it. These pin the table that fixed that.
+    ///
+    /// Values are the shipped ones, not chosen here: Health Potion tier 9 —
+    /// the tier the reporter was actually carrying — restores 225.
+    #[test]
+    fn the_reporters_potion_restores_its_shipped_amount() {
+        // Items.Name.Potion.Restoration.Health.Tier9
+        let r = gamedata::restoration("61b31323-8ba2-49f2-befe-f43111c6e2c7")
+            .expect("the health potion must be in the table");
+        assert_eq!(r.affected_stat, 0, "health");
+        assert_eq!(r.value, 225.0);
+        assert_eq!(r.duration, 2.5);
+    }
+
+    /// Every restoration consumable is present: three pools, ten tiers each.
+    #[test]
+    fn all_thirty_restorations_are_present() {
+        assert_eq!(gamedata::RESTORATIONS.len(), 30);
+        let mut per_stat = [0usize; 3];
+        for r in gamedata::RESTORATIONS.iter() {
+            per_stat[r.affected_stat as usize] += 1;
+        }
+        assert_eq!(per_stat, [10, 10, 10], "ten tiers of health, stamina, magicka");
+    }
+
+    /// The lookup is a binary search, so the table MUST stay uuid-sorted. A
+    /// generator change that reordered it would silently start returning None
+    /// for real potions.
+    #[test]
+    fn the_table_is_uuid_sorted() {
+        let mut prev = "";
+        for r in gamedata::RESTORATIONS.iter() {
+            assert!(r.uuid > prev, "out of order at {}", r.uuid);
+            prev = r.uuid;
+        }
+    }
+
+    /// Every value is positive and finite — a potion that restores nothing, or
+    /// NaN, would be worse than the old do-nothing behaviour.
+    #[test]
+    fn every_restoration_is_a_real_amount() {
+        for r in gamedata::RESTORATIONS.iter() {
+            assert!(r.value > 0.0 && r.value.is_finite(), "{} value {}", r.uuid, r.value);
+            assert!(r.duration > 0.0 && r.duration.is_finite(), "{} duration", r.uuid);
+            assert!(r.affected_stat <= 2, "{} stat {}", r.uuid, r.affected_stat);
+        }
+    }
+
+    /// A non-restoration consumable resolves to nothing rather than to a
+    /// default. Resist potions and weakness poisons carry an AlchemyInfo, which
+    /// this table deliberately does not model.
+    #[test]
+    fn a_resist_potion_has_no_restoration() {
+        // Prime Elixir of Resist Frost — a real consumable players drink.
+        assert!(gamedata::restoration("c4e0de4f-813c-45b9-9ed7-943b4ac2e729").is_none());
+    }
+
+    #[test]
+    fn an_unknown_item_has_no_restoration() {
+        assert!(gamedata::restoration("00000000-0000-0000-0000-000000000000").is_none());
+    }
 }
 
 #[cfg(test)]
