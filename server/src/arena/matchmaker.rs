@@ -185,6 +185,49 @@ pub fn compatible(a: Option<Skill>, b: Option<Skill>, waited: Duration) -> bool 
     }
 }
 
+/// At the fallback deadline, pick a human to pair with instead of a bot — **ignoring
+/// the bracket**.
+///
+/// The bracket ([`bracket_for`]) is a preference, not a gate, and it was silently
+/// outliving the thing it shares a queue with. `solo_fallback_secs` is 4 s; the first
+/// bracket step lasts 10 s. So two players outside [`BRACKET_STEPS`]`[0]` could sit in
+/// `waiting` *together* and both be handed a bot before the bracket ever widened once —
+/// the later steps were unreachable in a two-player arena. Observed with two testers
+/// pressing Fight seconds apart and never meeting.
+///
+/// The deadline is the moment the choice stops being "good match vs. better match" and
+/// becomes "this human vs. a bot". A lopsided human fight beats a bot, so at last call
+/// the bracket is dropped entirely.
+///
+/// Among those present it still takes the CLOSEST in trophies, tie-broken by longest
+/// waiting — the same ordering as the in-bracket path.
+///
+/// Returns the index into `candidates`, or `None` if nobody else is waiting.
+fn last_call_partner(
+    candidates: &[(Option<Skill>, Instant)],
+    lone: Option<Skill>,
+    now: Instant,
+) -> Option<usize> {
+    let mut best: Option<(usize, i64, Duration)> = None;
+    for (i, (skill, since)) in candidates.iter().enumerate() {
+        let waited = now.saturating_duration_since(*since);
+        let gap = match (skill, lone) {
+            (Some(a), Some(b)) => (a.trophies - b.trophies).abs(),
+            _ => i64::MAX,
+        };
+        let better = match best {
+            None => true,
+            Some((_, best_gap, best_waited)) => {
+                gap < best_gap || (gap == best_gap && waited > best_waited)
+            }
+        };
+        if better {
+            best = Some((i, gap, waited));
+        }
+    }
+    best.map(|(i, _, _)| i)
+}
+
 /// Status of a recorded matchmaking ticket, for the web /arena activity feed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -786,7 +829,343 @@ mod human_priority_tests {
             debug_ghost_user_id: None,
             bot_user_ids: Vec::new(),
             busy_fallback_secs: 230,
+            recent_fallback_secs: 30,
+            recent_window_secs: 300,
         }
+    }
+
+    /// Tier ordering. Someone standing in the queue beats everything: the deadline is
+    /// then just "stop honouring the bracket", not "wait for a maybe".
+    #[test]
+    fn the_tiers_are_ordered_waiting_then_live_then_recent_then_solo() {
+        let c = cfg();
+        let secs = |d: Duration| d.as_secs();
+        assert_eq!(
+            secs(fallback_delay(&c, 0, 0, 0)),
+            c.solo_fallback_secs,
+            "alone"
+        );
+        assert_eq!(
+            secs(fallback_delay(&c, 0, 1, 0)),
+            c.recent_fallback_secs,
+            "seen lately"
+        );
+        assert_eq!(
+            secs(fallback_delay(&c, 1, 1, 0)),
+            c.busy_fallback_secs,
+            "mid-match wins over recent"
+        );
+        assert_eq!(
+            secs(fallback_delay(&c, 1, 1, 1)),
+            c.solo_fallback_secs,
+            "somebody queued RIGHT NOW outranks both — pair them, do not hold the door"
+        );
+    }
+
+    /// The recent tier must clear a whole fight plus the results card, or two players
+    /// trading fights drop out of each other's window mid-cycle.
+    #[test]
+    fn the_recent_window_outlasts_a_human_ai_match() {
+        let c = cfg();
+        // The five measured human-vs-AI matches from the 2026-08-03 prod trace in
+        // `ArenaConfig::busy_fallback_secs`.
+        let longest = *[81u64, 110, 78, 110, 84].iter().max().expect("non-empty");
+        assert!(
+            c.recent_window_secs > longest * 2,
+            "recent window {}s must comfortably span a fight ({}s) plus a re-queue",
+            c.recent_window_secs,
+            longest
+        );
+        assert!(
+            c.recent_fallback_secs > c.solo_fallback_secs,
+            "the recent tier has to actually be longer than the solo one"
+        );
+    }
+
+    /// 30 s is not arbitrary: it is the first deadline at which the whole bracket
+    /// schedule is reachable. Below it the later widening steps are unreachable, which
+    /// is the defect this PR is about — pinned so a tuning change has to see it.
+    #[test]
+    fn the_recent_tier_lets_the_bracket_fully_widen() {
+        let c = cfg();
+        let unlimited_at = (0..600)
+            .find(|s| bracket_for(Duration::from_secs(*s)).is_none())
+            .expect("the bracket gives up eventually");
+        assert!(
+            c.recent_fallback_secs >= unlimited_at,
+            "recent tier {}s should reach the bracket's give-up point ({}s)",
+            c.recent_fallback_secs,
+            unlimited_at
+        );
+    }
+
+    /// A player's own arrivals must not put them in the recent tier — that would mean a
+    /// genuinely lone player waits 30 s for nobody.
+    #[test]
+    fn my_own_arrivals_do_not_count_as_company() {
+        let now = Instant::now();
+        let me = Uuid::new_v4();
+        let log = vec![
+            (me, now - Duration::from_secs(10)),
+            (me, now - Duration::from_secs(200)),
+        ];
+        assert_eq!(
+            others_recent(&log, me, Duration::from_secs(300), now),
+            0,
+            "queueing repeatedly alone must stay the solo tier"
+        );
+    }
+
+    /// Distinct others are counted once; anyone outside the window is forgotten.
+    #[test]
+    fn others_recent_dedupes_and_expires() {
+        let now = Instant::now();
+        let me = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let ancient = Uuid::new_v4();
+        let log = vec![
+            (other, now - Duration::from_secs(30)),
+            (other, now - Duration::from_secs(60)),
+            (ancient, now - Duration::from_secs(3600)),
+            (me, now),
+        ];
+        assert_eq!(
+            others_recent(&log, me, Duration::from_secs(300), now),
+            1,
+            "one distinct other inside the window; the hour-old one is gone"
+        );
+    }
+
+    /// THE CASE THE OWNER DESCRIBED: "if one is fighting an AI, let them finish before
+    /// matching the other human to an AI, so they _will_ always match."
+    ///
+    /// B has been holding the queue open through A's fight (busy tier, 230 s). A's match
+    /// ends, so `live_human_count()` drops and the tier falls to `recent`. Naively the
+    /// deadline recomputes to `B.since + 30 s` — which, 100 s in, is 70 s IN THE PAST, so
+    /// B is handed a bot at the exact moment A becomes free. B must instead get a fresh
+    /// 30 s in which A can re-queue.
+    #[test]
+    fn a_deadline_never_jumps_into_the_past_when_the_arena_empties() {
+        let now = Instant::now();
+        let since = now - Duration::from_secs(100);
+        let recent_delay = Duration::from_secs(30);
+
+        let naive = since + recent_delay;
+        assert!(
+            naive < now,
+            "precondition: the naive deadline is already behind us"
+        );
+
+        // Tier falls 2 (busy) -> 1 (recent).
+        let floor = next_floor(
+            since + Duration::from_secs(230),
+            2,
+            1,
+            since,
+            recent_delay,
+            now,
+        );
+        assert!(
+            floor > now,
+            "the ticket must get a fresh grace window, not be botted the instant the \
+             other player becomes available"
+        );
+        assert_eq!(
+            floor,
+            now + recent_delay,
+            "the grace is the new tier's full delay, from now"
+        );
+    }
+
+    /// A rising tier extends the deadline and never shortens it.
+    #[test]
+    fn a_rising_tier_only_ever_extends() {
+        let now = Instant::now();
+        let since = now - Duration::from_secs(3);
+        let short = since + Duration::from_secs(4);
+        let floor = next_floor(short, 0, 2, since, Duration::from_secs(230), now);
+        assert_eq!(
+            floor,
+            since + Duration::from_secs(230),
+            "solo -> busy extends"
+        );
+        assert!(floor > short);
+    }
+
+    /// A steady tier is stable — the floor must not creep forward every pass, or a
+    /// ticket in a quiet arena would never fall back at all.
+    #[test]
+    fn a_steady_tier_does_not_creep() {
+        let now = Instant::now();
+        let since = now - Duration::from_secs(2);
+        let delay = Duration::from_secs(4);
+        let first = next_floor(since + delay, 0, 0, since, delay, now);
+        let second = next_floor(first, 0, 0, since, delay, now + Duration::from_millis(500));
+        assert_eq!(first, second, "same tier, same floor — no creep");
+        assert_eq!(first, since + delay);
+    }
+
+    /// THE REPORTED BUG. Two testers press Fight seconds apart and never meet.
+    ///
+    /// The bracket and the solo fallback were designed independently and their
+    /// constants disagree: the opening bracket (5 levels / 150 trophies) lasts 10 s,
+    /// but a lone player falls back to a bot after 4 s. So a pair outside that opening
+    /// bracket sits in `waiting` together and BOTH are handed a bot six seconds before
+    /// the bracket would first have widened. The later bracket steps are unreachable in
+    /// a two-player arena.
+    ///
+    /// Fails on the pre-fix code: the deadline branch resolved to a bot without ever
+    /// looking at `waiting`.
+    #[test]
+    fn two_humans_outside_the_bracket_still_meet_at_last_call() {
+        let now = Instant::now();
+        // 18 levels and 400 trophies apart — refused by every bracket step until 20 s.
+        let me = Some(Skill {
+            level: 62,
+            trophies: 610,
+        });
+        let adventurer = Some(Skill {
+            level: 44,
+            trophies: 210,
+        });
+
+        // They ARE mutually refused for the whole window before the bot fires.
+        let solo = Duration::from_secs(cfg().solo_fallback_secs);
+        assert!(
+            !compatible(me, adventurer, solo),
+            "precondition: the bracket still refuses this pair when the bot deadline fires"
+        );
+
+        // At last call the bracket is dropped and the human is taken.
+        let waiting = [(adventurer, now - Duration::from_secs(2))];
+        assert_eq!(
+            last_call_partner(&waiting, me, now),
+            Some(0),
+            "a human out of bracket must beat a bot at the deadline"
+        );
+    }
+
+    /// The constant relationship that caused the bug, pinned so a future edit to either
+    /// side has to look at the other. If the solo fallback ever outlives the opening
+    /// bracket step this assertion stops being interesting — and the last-call path
+    /// stops being load-bearing.
+    #[test]
+    fn the_opening_bracket_outlives_the_solo_fallback() {
+        let solo = cfg().solo_fallback_secs;
+        let opening_step_ends = (0..)
+            .find(|s| bracket_for(Duration::from_secs(*s)) != bracket_for(Duration::ZERO))
+            .expect("the bracket widens at some point");
+        assert!(
+            solo < opening_step_ends,
+            "solo fallback {solo}s vs first widening at {opening_step_ends}s — if the \
+             fallback no longer fires inside the opening bracket, revisit last_call_partner"
+        );
+    }
+
+    /// Last call still prefers the closest opponent — it drops the bracket, not the
+    /// ordering. Otherwise a third player joining would make pairings arbitrary.
+    #[test]
+    fn last_call_takes_the_closest_human() {
+        let now = Instant::now();
+        let me = Some(Skill {
+            level: 50,
+            trophies: 400,
+        });
+        let far = Some(Skill {
+            level: 90,
+            trophies: 900,
+        });
+        let near = Some(Skill {
+            level: 58,
+            trophies: 480,
+        });
+        let waiting = [
+            (far, now - Duration::from_secs(9)),
+            (near, now - Duration::from_secs(1)),
+        ];
+        assert_eq!(
+            last_call_partner(&waiting, me, now),
+            Some(1),
+            "closest in trophies wins even though the other waited longer"
+        );
+    }
+
+    /// Equal gaps fall back to whoever has waited longest, so nobody is starved.
+    #[test]
+    fn last_call_breaks_ties_by_waiting_longest() {
+        let now = Instant::now();
+        let me = Some(Skill {
+            level: 50,
+            trophies: 400,
+        });
+        let a = Some(Skill {
+            level: 55,
+            trophies: 500,
+        });
+        let b = Some(Skill {
+            level: 45,
+            trophies: 300,
+        });
+        let waiting = [
+            (a, now - Duration::from_secs(1)),
+            (b, now - Duration::from_secs(8)),
+        ];
+        assert_eq!(
+            last_call_partner(&waiting, me, now),
+            Some(1),
+            "same 100-trophy gap either way — the longer wait breaks it"
+        );
+    }
+
+    /// An empty queue must still yield a bot. The whole point of the fallback is that a
+    /// lone tester gets a fight; last call must not strand them.
+    #[test]
+    fn last_call_with_nobody_waiting_still_falls_back_to_a_bot() {
+        let me = Some(Skill {
+            level: 50,
+            trophies: 400,
+        });
+        assert_eq!(
+            last_call_partner(&[], me, Instant::now()),
+            None,
+            "nobody waiting -> no partner -> the bot path stays reachable"
+        );
+    }
+
+    /// An unknown skill on either side must not exclude someone from last call — the
+    /// same rule `compatible` follows. A failed lookup should cost pairing quality, not
+    /// the match.
+    #[test]
+    fn last_call_accepts_an_unknown_skill() {
+        let now = Instant::now();
+        let waiting = [(None, now - Duration::from_secs(3))];
+        assert_eq!(
+            last_call_partner(
+                &waiting,
+                Some(Skill {
+                    level: 50,
+                    trophies: 400
+                }),
+                now
+            ),
+            Some(0),
+            "unknown skill still beats a bot"
+        );
+        assert_eq!(
+            last_call_partner(
+                &[(
+                    Some(Skill {
+                        level: 1,
+                        trophies: 0
+                    }),
+                    now
+                )],
+                None,
+                now
+            ),
+            Some(0),
+            "and the lone player's own unknown skill must not strand them either"
+        );
     }
 
     /// Alone in the arena → a bot straight away. This is the case the 4 s fallback
@@ -794,14 +1173,14 @@ mod human_priority_tests {
     /// "Searching".
     #[test]
     fn a_lone_player_still_gets_a_bot_fast() {
-        assert_eq!(fallback_delay(&cfg(), 0), Duration::from_secs(4));
+        assert_eq!(fallback_delay(&cfg(), 0, 0, 0), Duration::from_secs(4));
     }
 
     /// Somebody else is mid-match → hold the queue open for them.
     #[test]
     fn a_busy_arena_makes_the_bot_wait() {
-        assert_eq!(fallback_delay(&cfg(), 1), Duration::from_secs(230));
-        assert_eq!(fallback_delay(&cfg(), 7), Duration::from_secs(230));
+        assert_eq!(fallback_delay(&cfg(), 1, 0, 0), Duration::from_secs(230));
+        assert_eq!(fallback_delay(&cfg(), 7, 0, 0), Duration::from_secs(230));
     }
 
     /// **The reason for the number.** Prod 2026-08-03: two players shared the arena
@@ -849,7 +1228,7 @@ mod human_priority_tests {
 
         // Empty arena → the fast deadline.
         assert_eq!(
-            fallback_deadline(&config, &reg, since),
+            fallback_deadline(&config, &reg, since, 0, 0, None, Instant::now()).0,
             since + Duration::from_secs(4),
             "nobody else is playing, so a lone player must not be made to wait"
         );
@@ -865,7 +1244,7 @@ mod human_priority_tests {
         let peer: std::net::SocketAddr = "10.0.0.1:5000".parse().unwrap();
         assert!(reg.admit(peer, psid, &[7u8; 32]).is_some());
         assert_eq!(
-            fallback_deadline(&config, &reg, since),
+            fallback_deadline(&config, &reg, since, 0, 0, None, Instant::now()).0,
             since + Duration::from_secs(230),
             "somebody is mid-match — hold the queue open for them"
         );
@@ -874,7 +1253,7 @@ mod human_priority_tests {
         // whoever is waiting.
         reg.remove(&peer);
         assert_eq!(
-            fallback_deadline(&config, &reg, since),
+            fallback_deadline(&config, &reg, since, 0, 0, None, Instant::now()).0,
             since + Duration::from_secs(4),
             "the delay must collapse when the arena empties"
         );
@@ -939,6 +1318,8 @@ mod bot_pick_tests {
             debug_ghost_user_id: None,
             bot_user_ids: Vec::new(),
             busy_fallback_secs: 230,
+            recent_fallback_secs: 30,
+            recent_window_secs: 300,
         };
         // No DB pool → the function's first early return. `block_on` because the
         // path never awaits anything real once `db` is None.
@@ -1738,11 +2119,99 @@ const FALLBACK_REEVALUATE: Duration = Duration::from_secs(2);
 ///
 /// Pulled out of the loop so the rule is testable without spinning a matchmaker, a
 /// registry and a clock — the loop then has no decision left to get wrong.
-fn fallback_delay(config: &ArenaConfig, others_live: usize) -> Duration {
-    if others_live > 0 {
-        Duration::from_secs(config.busy_fallback_secs)
-    } else {
+fn fallback_delay(
+    config: &ArenaConfig,
+    others_live: usize,
+    others_recent: usize,
+    others_waiting: usize,
+) -> Duration {
+    if others_waiting > 0 {
+        // Somebody else is standing in the queue RIGHT NOW. Nothing is gained by
+        // holding longer — the only thing keeping these two apart is the bracket, and
+        // the deadline is precisely where `last_call_partner` stops honouring it.
+        // Waiting the `recent` tier here would make two coordinated players stare at
+        // "determining server" for 30 s to reach a pairing available at 4.
         Duration::from_secs(config.solo_fallback_secs)
+    } else if others_live > 0 {
+        // Somebody is mid-match and about to be free.
+        Duration::from_secs(config.busy_fallback_secs)
+    } else if others_recent > 0 {
+        // Nobody is playing right now, but somebody else queued inside the recent
+        // window — they are between fights, not gone. Hold the queue open long enough
+        // that a Discord-coordinated pair cannot miss each other.
+        Duration::from_secs(config.recent_fallback_secs)
+    } else {
+        // Genuinely alone. Never make this player wait.
+        Duration::from_secs(config.solo_fallback_secs)
+    }
+}
+
+/// Distinct OTHER humans seen queuing inside `recent_window_secs`.
+///
+/// "Other" is load-bearing: the caller's own arrivals are in the log too, and counting
+/// them would put a lone player permanently in the recent tier — a 30 s stare at
+/// "determining server" for someone with nobody to match against.
+fn others_recent(log: &[(Uuid, Instant)], me: Uuid, window: Duration, now: Instant) -> usize {
+    let mut seen: Vec<Uuid> = Vec::new();
+    for (user, at) in log {
+        if *user != me && now.saturating_duration_since(*at) <= window && !seen.contains(user) {
+            seen.push(*user);
+        }
+    }
+    seen.len()
+}
+
+fn tier_rank(others_live: usize, others_recent: usize, others_waiting: usize) -> u8 {
+    if others_waiting > 0 {
+        3
+    } else if others_live > 0 {
+        2
+    } else if others_recent > 0 {
+        1
+    } else {
+        0
+    }
+}
+
+/// The earliest a ticket may fall back, given what just changed.
+///
+/// **A deadline must never jump into the past.** Without this, the moment the player we
+/// were holding the queue open for finishes their match, `live_human_count()` drops and
+/// the deadline recomputes to `since + <shorter delay>` — which, for anyone who has
+/// already waited longer than that, is a time that has passed. They are handed a bot in
+/// the same instant the human became available. That is the reverse of the intent: the
+/// point of waiting through someone else's fight is to be there when it ends.
+///
+/// So when the tier FALLS, the shorter delay is granted **from now** — a fresh grace
+/// window in which the other player can re-queue. When it rises we extend. The grace is
+/// self-limiting: once the other player drops out of `recent_window_secs` the tier falls
+/// to solo and the next grace is only `solo_fallback_secs`.
+fn next_floor(
+    current: Instant,
+    previous_tier: u8,
+    tier: u8,
+    since: Instant,
+    delay: Duration,
+    now: Instant,
+) -> Instant {
+    if tier < previous_tier {
+        now + delay
+    } else {
+        current.max(since + delay)
+    }
+}
+
+/// Tier name for the log line that explains a deadline. The difference between "why did
+/// I get a bot" being one grep or an afternoon.
+fn fallback_tier(others_live: usize, others_recent: usize, others_waiting: usize) -> &'static str {
+    if others_waiting > 0 {
+        "paired-at-deadline (another human is queued)"
+    } else if others_live > 0 {
+        "busy (someone is mid-match)"
+    } else if others_recent > 0 {
+        "recent (someone queued lately)"
+    } else {
+        "solo (nobody else around)"
     }
 }
 
@@ -1752,8 +2221,23 @@ fn fallback_delay(config: &ArenaConfig, others_live: usize) -> Duration {
 /// pin the wiring — a test of `fallback_delay` alone passes even if the loop never
 /// asks the registry anything, which is how this feature would ship green and do
 /// nothing at all.
-fn fallback_deadline(config: &ArenaConfig, registry: &MatchRegistry, since: Instant) -> Instant {
-    since + fallback_delay(config, registry.live_human_count())
+fn fallback_deadline(
+    config: &ArenaConfig,
+    registry: &MatchRegistry,
+    since: Instant,
+    recent: usize,
+    waiting_others: usize,
+    prev: Option<(Instant, u8)>,
+    now: Instant,
+) -> (Instant, u8) {
+    let live = registry.live_human_count();
+    let delay = fallback_delay(config, live, recent, waiting_others);
+    let tier = tier_rank(live, recent, waiting_others);
+    let floor = match prev {
+        None => since + delay,
+        Some((current, previous_tier)) => next_floor(current, previous_tier, tier, since, delay, now),
+    };
+    (floor, tier)
 }
 
 /// The matchmaker actor. Single owner of the ticket queue — no locks.
@@ -1794,12 +2278,30 @@ async fn matchmaker_loop(
     // decline to pair, so it needs a list (tracker #19). In practice this holds one
     // or two entries; the arena has a handful of players, not a lobby.
     let mut waiting: Vec<(TicketRequest, Instant)> = Vec::new();
+    // Who queued recently, for the middle fallback tier. Not the same as `waiting`: a
+    // player who queued, got a bot and is now mid-fight has LEFT `waiting` but is
+    // exactly the person the next queuer should hold the door for.
+    let mut arrivals: Vec<(Uuid, Instant)> = Vec::new();
+    // Per-ticket earliest-fallback floor and the tier that set it, so a deadline can
+    // never move backwards into the past when the arena empties out. See [`next_floor`].
+    let mut floors: std::collections::HashMap<Uuid, (Instant, u8)> =
+        std::collections::HashMap::new();
     loop {
         // If a ticket is already waiting, race the next command against its fallback
         // deadline; otherwise just block for the next command.
         // The queue's next deadline is the OLDEST waiting ticket's — it is the one
         // that has earned a fallback first.
-        let oldest = waiting.iter().map(|(_, s)| *s).min();
+        // Prune the arrival log before anyone reads it, so a long-idle arena cannot
+        // keep quoting a player who left an hour ago.
+        let window = Duration::from_secs(config.recent_window_secs);
+        let cutoff = Instant::now();
+        arrivals.retain(|(_, at)| cutoff.saturating_duration_since(*at) <= window);
+        floors.retain(|tid, _| waiting.iter().any(|(t, _)| t.ticket_id == *tid));
+
+        let oldest_ticket = waiting.iter().min_by_key(|(_, s)| *s);
+        let oldest = oldest_ticket.map(|(_, s)| *s);
+        let oldest_user = oldest_ticket.map(|(t, _)| t.user_id);
+        let oldest_tid = oldest_ticket.map(|(t, _)| t.ticket_id);
         let next = if let Some(since) = oldest {
             // HUMANS FIRST. While anyone else is in a live match they are, by
             // definition, about to be free — so hold the queue open long enough to
@@ -1809,9 +2311,25 @@ async fn matchmaker_loop(
             // finishes and does NOT come back, `live_human_count()` drops to 0 and the
             // deadline collapses to `solo_fallback_secs`. Nobody is left waiting
             // minutes for a player who left.
-            let deadline = fallback_deadline(&config, &registry, since);
+            let recent = oldest_user
+                .map(|me| others_recent(&arrivals, me, window, cutoff))
+                .unwrap_or(0);
+            // Everyone in `waiting` except the ticket whose deadline this is.
+            let waiting_others = waiting.len().saturating_sub(1);
             let others_live = registry.live_human_count();
             let now = Instant::now();
+            let tid = oldest_tid.expect("waiting is non-empty");
+            let (floor, tier) = fallback_deadline(
+                &config,
+                &registry,
+                since,
+                recent,
+                waiting_others,
+                floors.get(&tid).copied(),
+                now,
+            );
+            floors.insert(tid, (floor, tier));
+            let deadline = floor;
             if now >= deadline {
                 // Pop the oldest — the one whose deadline just fired.
                 let idx = waiting
@@ -1830,6 +2348,42 @@ async fn matchmaker_loop(
                     );
                     continue;
                 }
+                // LAST CALL. Before minting a bot, look at who is actually standing in
+                // the queue. The bracket said "not yet" to these two; the deadline says
+                // "now or never", and a human out of bracket beats a bot.
+                //
+                // Stale tickets are pruned on Enqueue but not here — nothing arrived to
+                // trigger that pass — so re-check liveness, or we mint a ghost match
+                // against a client that has gone.
+                let mut live_tickets: Vec<(TicketRequest, Instant)> =
+                    Vec::with_capacity(waiting.len());
+                for (t, s) in std::mem::take(&mut waiting) {
+                    if t.rms.is_gone().await {
+                        info!(
+                            "matchmaker: discarded stale waiting ticket {} (RMS gone)",
+                            t.ticket_id
+                        );
+                    } else {
+                        live_tickets.push((t, s));
+                    }
+                }
+                waiting = live_tickets;
+
+                let shape: Vec<(Option<Skill>, Instant)> =
+                    waiting.iter().map(|(t, s)| (t.skill, *s)).collect();
+                if let Some(idx) = last_call_partner(&shape, lone.skill, Instant::now()) {
+                    let (partner, partner_since) = waiting.remove(idx);
+                    info!(
+                        "matchmaker: last call for ticket {} after {:.1}s — pairing with HUMAN {} out of bracket (they waited {:.1}s) rather than a bot",
+                        lone.ticket_id,
+                        waited.as_secs_f32(),
+                        partner.ticket_id,
+                        partner_since.elapsed().as_secs_f32(),
+                    );
+                    resolve(&registry, &config, &db, &[partner, lone], 0).await;
+                    continue;
+                }
+
                 info!(
                     "matchmaker: no human opponent for ticket {} after {:.1}s ({} other human(s) in a live match) — solo fallback (vs bot)",
                     lone.ticket_id,
@@ -1882,6 +2436,7 @@ async fn matchmaker_loop(
             "matchmaker: ticket {} (user {})",
             req.ticket_id, req.user_id
         );
+        arrivals.push((req.user_id, Instant::now()));
         record_match_queued(&db, req.ticket_id, req.user_id).await;
         // Push the captured 3-frame progression's first two frames now; the
         // `Succeeded` frame follows once the match resolves (pair or fallback). Sent to
@@ -2463,6 +3018,8 @@ mod tests {
             debug_ghost_user_id: None,
             bot_user_ids: Vec::new(),
             busy_fallback_secs: 230,
+            recent_fallback_secs: 30,
+            recent_window_secs: 300,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         tokio::spawn(matchmaker_loop(rx, config, registry.clone(), None));
@@ -2537,6 +3094,8 @@ mod tests {
             debug_ghost_user_id: None,
             bot_user_ids: Vec::new(),
             busy_fallback_secs: 230,
+            recent_fallback_secs: 30,
+            recent_window_secs: 300,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         tokio::spawn(matchmaker_loop(rx, config, registry.clone(), None));
@@ -2622,6 +3181,8 @@ mod tests {
             debug_ghost_user_id: None,
             bot_user_ids: Vec::new(),
             busy_fallback_secs: 230,
+            recent_fallback_secs: 30,
+            recent_window_secs: 300,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         tokio::spawn(matchmaker_loop(rx, config, registry.clone(), None));
@@ -2647,6 +3208,168 @@ mod tests {
         );
     }
 
+    /// WIRING TEST for the reported bug — drives the real actor, not the helper.
+    ///
+    /// `last_call_partner` passing in isolation proves nothing: this file already warns
+    /// that "a test of `fallback_delay` alone passes even if the loop never asks the
+    /// registry anything, which is how this feature would ship green and do nothing at
+    /// all." So assert on the frames the loop actually PUSHED.
+    ///
+    /// Two players outside the opening bracket (18 levels / 400 trophies apart) press
+    /// Fight 300 ms apart, and the solo fallback is 1 s — the shape the testers hit,
+    /// where the bracket has not widened once before the bot deadline arrives.
+    ///
+    /// With no DB both players resolve to the nil character UUID, so the *paired* path
+    /// is refused by the appearance guard and pushes `Failed`, while the *bot* path
+    /// pushes `Succeeded`. That difference is the probe:
+    ///   - fixed:   last call pairs them -> `Failed` on both, no `Succeeded` anywhere.
+    ///   - pre-fix: a bot each -> `Succeeded` on both and no `Failed` at all.
+    #[tokio::test]
+    async fn two_humans_queueing_together_get_each_other_not_two_bots() {
+        let registry = MatchRegistry::new(4);
+        let config = ArenaConfig {
+            advertise_host: "127.0.0.1".into(),
+            udp_port: 7777,
+            max_concurrent_matches: 4,
+            max_queued_players: 64,
+            solo_fallback_secs: 1,
+            debug_ghost_user_id: None,
+            bot_user_ids: Vec::new(),
+            busy_fallback_secs: 230,
+            recent_fallback_secs: 30,
+            recent_window_secs: 300,
+        };
+        let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
+        tokio::spawn(matchmaker_loop(rx, config, registry.clone(), None));
+
+        let (rms_a, mut recv_a) = unbounded_channel();
+        let (rms_b, mut recv_b) = unbounded_channel();
+
+        tx.send(MatchmakerCommand::Enqueue(TicketRequest {
+            ticket_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            rms: RmsHandle::Direct(rms_a),
+            skill: Some(Skill {
+                level: 62,
+                trophies: 610,
+            }),
+        }))
+        .unwrap();
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        tx.send(MatchmakerCommand::Enqueue(TicketRequest {
+            ticket_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            rms: RmsHandle::Direct(rms_b),
+            skill: Some(Skill {
+                level: 44,
+                trophies: 210,
+            }),
+        }))
+        .unwrap();
+
+        async fn drain(
+            rx: &mut tokio::sync::mpsc::UnboundedReceiver<MatchmakingMessage>,
+        ) -> (bool, bool) {
+            let (mut failed, mut succeeded) = (false, false);
+            for _ in 0..6 {
+                match tokio::time::timeout(Duration::from_millis(900), rx.recv()).await {
+                    Ok(Some(MatchmakingMessage::Failed { .. })) => failed = true,
+                    Ok(Some(MatchmakingMessage::Succeeded { .. })) => succeeded = true,
+                    Ok(Some(_)) => continue, // Searching / PotentialMatch
+                    _ => break,              // timeout or channel closed
+                }
+            }
+            (failed, succeeded)
+        }
+
+        let (failed_a, succeeded_a) = drain(&mut recv_a).await;
+        let (failed_b, succeeded_b) = drain(&mut recv_b).await;
+
+        assert!(
+            !succeeded_a && !succeeded_b,
+            "a bot match was handed out while another HUMAN was waiting in the queue \
+             (Succeeded a={succeeded_a} b={succeeded_b}) — the reported bug"
+        );
+        assert!(
+            failed_a && failed_b,
+            "the loop never attempted to pair them at last call (Failed a={failed_a} \
+             b={failed_b}); without this the no-Succeeded assertion above could pass \
+             simply because nothing happened at all"
+        );
+    }
+
+    /// WIRING TEST for the recent tier. `others_recent` passing in isolation says
+    /// nothing about whether the loop keeps an arrival log or ever reads it.
+    ///
+    /// A queues and takes a bot, so A is neither waiting nor in a live match — the hole
+    /// between `solo` and `busy` where two Discord-coordinated players kept missing each
+    /// other. B then queues alone. Under the old two-tier rule B is handed a bot after
+    /// `solo_fallback_secs`; with the arrival log wired, B holds for
+    /// `recent_fallback_secs` instead, which is the window A needs to come back.
+    #[tokio::test]
+    async fn a_recently_seen_player_makes_the_next_queuer_hold_the_door() {
+        let registry = MatchRegistry::new(4);
+        let config = ArenaConfig {
+            advertise_host: "127.0.0.1".into(),
+            udp_port: 7777,
+            max_concurrent_matches: 4,
+            max_queued_players: 64,
+            solo_fallback_secs: 1,
+            debug_ghost_user_id: None,
+            bot_user_ids: Vec::new(),
+            busy_fallback_secs: 230,
+            recent_fallback_secs: 6,
+            recent_window_secs: 300,
+        };
+        let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
+        tokio::spawn(matchmaker_loop(rx, config, registry.clone(), None));
+
+        let (rms_a, _keep_a) = unbounded_channel();
+        tx.send(MatchmakerCommand::Enqueue(TicketRequest {
+            ticket_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            rms: RmsHandle::Direct(rms_a),
+            skill: Some(Skill {
+                level: 50,
+                trophies: 400,
+            }),
+        }))
+        .unwrap();
+
+        // A falls back to a bot and leaves the queue. A is now "recent" but neither
+        // waiting nor (with no connected ENet peer) live.
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+
+        let (rms_b, mut recv_b) = unbounded_channel();
+        tx.send(MatchmakerCommand::Enqueue(TicketRequest {
+            ticket_id: Uuid::new_v4(),
+            user_id: Uuid::new_v4(),
+            rms: RmsHandle::Direct(rms_b),
+            skill: Some(Skill {
+                level: 50,
+                trophies: 400,
+            }),
+        }))
+        .unwrap();
+
+        // Comfortably past B's solo deadline (1 s), comfortably inside the recent one (6 s).
+        tokio::time::sleep(Duration::from_millis(3000)).await;
+
+        let mut succeeded = false;
+        while let Ok(msg) = recv_b.try_recv() {
+            if matches!(msg, MatchmakingMessage::Succeeded { .. }) {
+                succeeded = true;
+            }
+        }
+        assert!(
+            !succeeded,
+            "B was handed a bot after ~1 s despite another human having queued moments \
+             earlier — the arrival log is not reaching the deadline calculation"
+        );
+    }
+
     /// A CANCEL routed into the actor must DEQUEUE the waiting ticket so it never
     /// zombie-resolves on the solo-fallback timer. Before the fix, cancel was a no-op:
     /// the cancelled ticket stayed in `waiting` and still bot-matched after the timer,
@@ -2665,6 +3388,8 @@ mod tests {
             debug_ghost_user_id: None,
             bot_user_ids: Vec::new(),
             busy_fallback_secs: 230,
+            recent_fallback_secs: 30,
+            recent_window_secs: 300,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         tokio::spawn(matchmaker_loop(rx, config, registry.clone(), None));
@@ -2721,6 +3446,8 @@ mod tests {
             debug_ghost_user_id: None,
             bot_user_ids: Vec::new(),
             busy_fallback_secs: 230,
+            recent_fallback_secs: 30,
+            recent_window_secs: 300,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         tokio::spawn(matchmaker_loop(rx, config, registry.clone(), None));
