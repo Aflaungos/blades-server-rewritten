@@ -45,6 +45,15 @@ pub struct GetQuestsResponse {
     job_pools: Value,
     /// The featured DAILY quests (`quests_daily::select`) — a global, day-rotating set of
     /// story/side/event quests, level-scaled to the player. Previously an empty TODO.
+    /// Quests the server removed in the course of answering this request.
+    ///
+    /// The job rotation deletes the previous window's un-entered job rows; without
+    /// this the client is never told and keeps showing board entries that no longer
+    /// exist. Retail sends the field in 17.91% of captured `/quests` responses and
+    /// **never sends it empty** — it is a "there were deletions" signal, not a
+    /// always-present list — so it is skipped when nothing was removed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    deleted_quest_ids: Vec<Uuid>,
     game_event_quests: Vec<QuestWithId>,
     game_event_quests_in_warning: Vec<QuestWithId>, //TODO: warning-window variants unmodelled
     game_event_quests_finished: Vec<QuestWithId>,   //TODO: finished-history unmodelled
@@ -72,6 +81,8 @@ pub async fn get_quests(
     let mut conn = app_state.db_pool.get().await.unwrap();
     conn.transaction(|mut conn| {
         async move {
+            // Collected by the job rotation below and reported to the client.
+            let mut deleted_quest_ids: Vec<Uuid> = Vec::new();
             let character = {
                 use crate::schema::characters::dsl::*;
 
@@ -117,6 +128,8 @@ pub async fn get_quests(
                     use crate::schema::quests;
                     // Delete prior-window job rows for this character that are NOT part
                     // of the new set and have not been entered (no dungeon_state).
+                    // Whatever goes here is reported to the client as `deletedQuestIds`
+                    // — otherwise the board keeps showing entries we just removed.
                     let stale: Vec<Uuid> = quests::table
                         .filter(quests::character_id.eq(character_id_var))
                         .filter(quests::dungeon_state.is_null())
@@ -136,6 +149,7 @@ pub async fn get_quests(
                         )
                         .execute(&mut conn)
                         .await?;
+                        deleted_quest_ids.extend(stale.iter().copied());
                     }
                 }
                 // Upsert the current window's job rows (idempotent within the window).
@@ -208,6 +222,7 @@ pub async fn get_quests(
             );
 
             Ok(Json(GetQuestsResponse {
+                deleted_quest_ids,
                 quests: result_quests,
                 dungeon_generated_data_list: result_generated_data,
                 character: CompleteCharacterWithIdWithoutData {
@@ -1674,3 +1689,62 @@ mod quests_daily_tests {
     }
 }
 
+
+#[cfg(test)]
+mod deleted_quest_ids_tests {
+    use super::GetQuestsResponse;
+
+    /// Retail sends `deletedQuestIds` in 17.91% of captured `/quests` responses and
+    /// NEVER sends it empty — it is a "there were deletions" signal, not a list that
+    /// is always present. So an empty one must be omitted, not serialized as `[]`.
+    #[test]
+    fn an_empty_deletion_list_is_omitted_entirely() {
+        let json = serde_json::to_value(GetQuestsResponse {
+            quests: vec![],
+            dungeon_generated_data_list: vec![],
+            jobs: vec![],
+            character: blades_lib::user_data::CompleteCharacterWithIdWithoutData {
+                id: uuid::Uuid::nil(),
+                character: Default::default(),
+            },
+            job_pools: serde_json::json!([]),
+            deleted_quest_ids: vec![],
+            game_event_quests: vec![],
+            game_event_quests_in_warning: vec![],
+            game_event_quests_finished: vec![],
+        })
+        .unwrap();
+        assert!(
+            json.get("deletedQuestIds").is_none(),
+            "retail never sends an empty deletedQuestIds; got {json}",
+        );
+    }
+
+    /// ...and when something WAS deleted, it must be present and camelCased. This is
+    /// the control: a change that skipped the field unconditionally would pass the
+    /// test above and fail this one.
+    #[test]
+    fn a_non_empty_deletion_list_is_sent() {
+        let id = uuid::Uuid::parse_str("159bc1e7-454c-4e2a-90cf-e200c74b961a").unwrap();
+        let json = serde_json::to_value(GetQuestsResponse {
+            quests: vec![],
+            dungeon_generated_data_list: vec![],
+            jobs: vec![],
+            character: blades_lib::user_data::CompleteCharacterWithIdWithoutData {
+                id: uuid::Uuid::nil(),
+                character: Default::default(),
+            },
+            job_pools: serde_json::json!([]),
+            deleted_quest_ids: vec![id],
+            game_event_quests: vec![],
+            game_event_quests_in_warning: vec![],
+            game_event_quests_finished: vec![],
+        })
+        .unwrap();
+        assert_eq!(
+            json["deletedQuestIds"],
+            serde_json::json!(["159bc1e7-454c-4e2a-90cf-e200c74b961a"]),
+            "a real deletion must reach the client",
+        );
+    }
+}
