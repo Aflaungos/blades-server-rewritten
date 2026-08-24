@@ -1761,6 +1761,13 @@ fn try_paralyze(
     f.set_actor_state(ActorStateType::Paralyzed, now);
     f.clear_scheduled_states();
     f.blocking_until = None;
+    // The duration the op51 below announces is the duration the server must hold
+    // the lock for. Without this the lock ran on whatever `paralyze_secs` already
+    // held — rank 1's 2.0 s by default, or a previous FlashFreeze's value — so a
+    // rank-12 paralysis froze the victim for 2.0 s while telling the client 3.1 s,
+    // and `reconcile_paralysis` released them (and emitted the op51 remove) a second
+    // early. That early release is what makes the freeze read as weaker than retail.
+    f.paralyze_secs = secs;
     let obj = f.net_object_id;
     info!("combat: slot {target_slot} PARALYZED (poison {recent:.1} ≥ {threshold:.1}) for {secs}s");
     let frame = messages::change_combat_status_effect(obj, true, StatusEffectType::Paralyzed, secs);
@@ -5654,6 +5661,82 @@ mod shipped_effects_tests {
             assert!(c.fighters[0].negation_pools[0].remaining >= 100.0, "{name}: shipped ~116");
             assert_eq!(out.len(), 2, "{name}: emits its now-known status id");
         }
+    }
+
+    /// PARALYSIS MUST LAST WHAT IT ANNOUNCES.
+    ///
+    /// `try_paralyze` puts the rank's `_duration` on the wire in the op51 apply, but
+    /// used not to store it — so `reconcile_paralysis` released the victim on
+    /// `paralyze_secs`, which nobody had set. At rank 12 that meant a 2.0 s freeze
+    /// against an announced 3.1 s, released (and un-announced) a second early. The
+    /// owner's report was that paralysis lands but "the visual is not as clear as it
+    /// was in retail".
+    ///
+    /// Differential across ranks, so it cannot pass on a hard-coded constant.
+    #[test]
+    fn a_paralysis_lasts_its_own_ranks_duration_not_rank_ones() {
+        use super::super::state::DamageType;
+
+        let paralyse_at = |rank: u8| -> f32 {
+            let now = Instant::now();
+            let mut c = combat2(now);
+            // Enough accumulated poison to clear even the top rank's threshold.
+            c.fighters[1].record_element_damage(DamageType::Poison, 500.0, now);
+            let out = try_paralyze(&mut c, 0, 1, rank, now);
+            assert!(!out.is_empty(), "rank {rank} did not paralyse — the test would be vacuous");
+            assert!(c.fighters[1].is_paralyzed(), "rank {rank} target not locked");
+            c.fighters[1].paralyze_secs
+        };
+
+        let r1 = paralyse_at(1);
+        let r12 = paralyse_at(12);
+
+        // The shipped ranks: 2.0 at rank 1, 3.1 at rank 12.
+        assert!((r1 - 2.0).abs() < 0.001, "rank 1 should hold for 2.0s, got {r1}");
+        assert!((r12 - 3.1).abs() < 0.001, "rank 12 should hold for 3.1s, got {r12}");
+        assert!(r12 > r1, "a higher rank must freeze for longer");
+    }
+
+    /// …and the victim must still BE paralysed when the announced window is most of
+    /// the way through, then be released after it. This is the half that a stored-but-
+    /// unused field would not catch.
+    #[test]
+    fn a_rank12_paralysis_still_holds_at_three_seconds() {
+        use super::super::state::DamageType;
+        let now = Instant::now();
+        let mut c = combat2(now);
+        c.fighters[1].record_element_damage(DamageType::Poison, 500.0, now);
+        try_paralyze(&mut c, 0, 1, 12, now);
+
+        // 2.5 s in: rank 1's window has long lapsed, rank 12's has not.
+        reconcile_paralysis(&mut c.fighters[1], now + Duration::from_millis(2500));
+        assert!(
+            c.fighters[1].is_paralyzed(),
+            "a rank-12 paralysis must still hold at 2.5s — it announced 3.1s"
+        );
+
+        // Past 3.1 s: released.
+        reconcile_paralysis(&mut c.fighters[1], now + Duration::from_millis(3200));
+        assert!(!c.fighters[1].is_paralyzed(), "it must release after its own duration");
+    }
+
+    /// A paralysis must not inherit the duration of whatever last froze this fighter.
+    /// `paralyze_secs` persists on the Fighter, so a FlashFreeze earlier in the round
+    /// used to leak its duration into the next Paralyze.
+    #[test]
+    fn a_paralysis_does_not_inherit_a_previous_freezes_duration() {
+        use super::super::state::DamageType;
+        let now = Instant::now();
+        let mut c = combat2(now);
+        // Pretend an earlier effect left a long duration behind.
+        c.fighters[1].paralyze_secs = 99.0;
+        c.fighters[1].record_element_damage(DamageType::Poison, 500.0, now);
+
+        try_paralyze(&mut c, 0, 1, 1, now);
+        assert!(
+            (c.fighters[1].paralyze_secs - 2.0).abs() < 0.001,
+            "rank 1 must set its OWN 2.0s, not keep the stale 99.0"
+        );
     }
 
     /// FlashFreeze locks the TARGET, not the caster, for the rank's own duration.
