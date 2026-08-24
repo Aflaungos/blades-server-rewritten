@@ -99,7 +99,38 @@ That points at the same root cause as the known one-character-per-account
 destruction: a fresh `CompleteCharacter::default()` replacing a real character.
 `create_characters` (`server/src/character.rs:111`) builds exactly that default.
 
-**Not yet established: what writes the stub over a full character.** Confirming it
-needs a capture of the write, and capture has been off since **2026-08-01** — the
-ten capture units are idled, so the currently-reported stall is not recorded
-anywhere. Re-enabling them is the prerequisite for closing this.
+## The writer — FOUND (2026-08-25)
+
+`web/app/play/AutoTransfer.tsx`. When a **complete** character failed to import,
+`run()` fell through to:
+
+```ts
+const r = await post(templateAvailable ? { template: true } : { fresh: true });
+```
+
+**Automatically, on page load, over a transient failure, with no confirmation.**
+With no starter template configured `fresh` resolves to the arena server's bare
+`CompleteCharacter::default()`, and since `characters` carries `UNIQUE(user_id)` and
+`import_character` "overwrites all four payload columns of the existing row", that
+level-1 shell lands on top of the real character.
+
+That accounts for every observation above:
+
+- the stub is `CompleteCharacter::default()`-shaped — because it *is* one;
+- it alternates with the full character within an hour — the player reloads
+  `/play`; sometimes the import succeeds (249 KB), sometimes it fails (980 B);
+- it hits imported characters specifically — they are the ones with a capture to
+  re-import on every fresh browser session (the only guard was `sessionStorage`);
+- 34 of 74 characters sit in the shell state, one of them named `Imported` at
+  level 1.
+
+The name-mismatch branch immediately above already refused this substitution, with
+the comment *"which would OVERWRITE their arena character with a level-1 one
+(tracker #28)"*. The plain-failure path never had the same guard applied.
+
+Fixed in `dethele-com/newblades-project` PR #183: report the failure, change
+nothing, and offer the fallback as a button the player presses themselves.
+
+**Still open:** the 34 characters already reduced to shells are not repaired by that
+fix — it only stops new ones. Repairing them means re-transferring from each
+player's own capture.
