@@ -49,6 +49,7 @@ pub mod gamedata;
 pub mod input;
 pub mod loadout;
 pub mod messages;
+pub mod perks;
 pub mod messages_state;
 pub mod resolve;
 pub mod state;
@@ -57,6 +58,12 @@ pub mod tables;
 // Offline reproduction-differential test against retail capture s506 (round-start).
 // Test-only: no production code, just drives the engine over s506's timing and
 // diffs our s2c protocol sequence against the captured one.
+// End-to-end proof that each PERK changes a fight. Differential by construction:
+// every case runs perked and unperked and asserts the gap, so it cannot pass
+// against an engine that resolves perks and applies them nowhere.
+#[cfg(test)]
+mod perks_effect;
+
 #[cfg(test)]
 mod roundtrip_s506;
 

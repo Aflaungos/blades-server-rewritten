@@ -170,6 +170,10 @@ pub fn from_character(character: &CompleteCharacter, inventory: &CompleteInvento
 
     let mut weapon: Option<(&'static gamedata::WeaponStats, u64)> = None;
 
+    // (equipment_slot, armor_set) per equipped armour piece — Matching Set needs
+    // all four slots to agree on a set, so the test cannot be done per-item.
+    let mut armor_pieces: Vec<(u8, u8)> = Vec::new();
+
     // ability uuid -> total bonus ranks from jewellery, summed across slots
 
     let mut grade_bonus: std::collections::HashMap<String, u16> =
@@ -190,6 +194,7 @@ pub fn from_character(character: &CompleteCharacter, inventory: &CompleteInvento
             }
         } else if let Some(a) = gamedata::armor(&template) {
             lo.armor_rating += a.armor_rating;
+            armor_pieces.push((a.equipment_slot, a.armor_set));
         } else if let Some(s) = gamedata::shield(&template) {
             lo.has_shield = true;
             lo.block_rating += s.block_base;
@@ -222,6 +227,16 @@ pub fn from_character(character: &CompleteCharacter, inventory: &CompleteInvento
     // Additive across slots (the same ring in both hands gives +5+5), clamped to the
     // ability's own `maximum_level`.
     apply_grade_bonuses(&mut lo.abilities, &grade_bonus);
+    // Perks resolve HERE, after grading, so a perk raised by jewellery pays out
+    // at the raised rank exactly as a damage ability does.
+    lo.perks = super::perks::PerkBonuses::resolve(
+        &lo.abilities,
+        super::perks::matched_armor_set(&armor_pieces),
+    );
+    // Matching Set is a static gear property once the set test has passed, so it
+    // folds straight into the rating rather than being re-checked per hit.
+    lo.armor_rating += lo.perks.matching_set_armor;
+
     lo.paralyze_rank = lo
         .abilities
         .iter()

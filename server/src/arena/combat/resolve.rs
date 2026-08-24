@@ -1048,7 +1048,7 @@ fn resolve_swing(
 /// A spell/ability cast: cooldown-gated, resource-gated (stamina for maneuvers /
 /// magicka for spells), echoes `PerformExecuteAbility`, applies Spell-source damage,
 /// deducts the resource cost, and emits `PlayerStatsUpdate`(65) to both players.
-fn resolve_ability_cast(
+pub(super) fn resolve_ability_cast(
     combat: &mut MatchCombat,
     sender: usize,
     target_slot: usize,
@@ -1220,6 +1220,33 @@ fn resolve_ability_cast(
     // delivers it when the cast completes. Zero-delay abilities (maneuvers,
     // Frostbite, anything shipping no `channelDuration`) run inline exactly as
     // before, so this changes nothing for them.
+    // COMBAT FOCUS / WILLPOWER — resistance for as long as this cast is running.
+    // Granted at cast START, not at impact: the perks protect you *while* you are
+    // committed to the animation, which is precisely the window in which you cannot
+    // block. Both stack on a spell (one says "an ability", the other "a spell").
+    {
+        let perks = &combat.fighters[sender].loadout.perks;
+        let is_spell = super::gamedata::ability(&ea.ability_uuid)
+            .map(|a| a.kind == super::gamedata::AbilityKind::Spell)
+            .unwrap_or(false);
+        let bonus =
+            perks.combat_focus + if is_spell { perks.conservationist } else { 0.0 };
+        if bonus > 0.0 {
+            let rank = super::gamedata::ability_rank_clamped(&ea.ability_uuid, level as u16);
+            let window = rank
+                .map(|r| {
+                    r.get(super::gamedata::AbilityField::CastingDelay).unwrap_or(0.0)
+                        + r.channel_duration().unwrap_or(0.0)
+                })
+                .unwrap_or(0.0)
+                .max(super::perks::ABILITY_USE_MIN_WINDOW_SECS);
+            let expires = now + Duration::from_secs_f32(window);
+            combat.fighters[sender]
+                .transient_all_resistance
+                .push((bonus, expires));
+        }
+    }
+
     let delay = ability_impact_delay(&ea.ability_uuid, level);
     if delay.is_zero() {
         out.extend(apply_ability_impact(
@@ -1275,6 +1302,12 @@ fn apply_ability_impact(
         AbilityTag::Ward => out.extend(apply_ward(combat, sender, level, now)),
         AbilityTag::Absorb => out.extend(apply_absorb(combat, sender, level, now)),
         AbilityTag::ResistElements => out.extend(apply_resist_elements(combat, sender, level, now)),
+        // A perk is PASSIVE — it is never "cast", so having nothing to do at
+        // activation is correct. What was wrong is that nothing read perks
+        // ANYWHERE: all 20 shipped perks were parsed, carried a rank, and had no
+        // effect on any fight. They now resolve into `Loadout::perks` at parse time
+        // (see `combat::perks`) and are applied where each one belongs — the damage
+        // model, the block outcome, the regen tick and the cast window.
         AbilityTag::Perk => {}
         // A MANEUVER is a weapon attack, not a spell. It deals the attacker's WEAPON
         // damage on the Middle side — which the damage model already implements and
@@ -1336,9 +1369,12 @@ fn apply_ability_impact(
             out.extend(emit_damage(combat, sender, target_slot, &resolved, now));
         }
         AbilityTag::Paralyze | AbilityTag::Damage | AbilityTag::Generic => {
+            let caster = super::perks::CasterPerks::of(&combat.fighters[sender]);
+            let magicka_full_at_cast = caster.magicka_full;
             let resolved = RetailDamageModel.resolve_ability(
                 ability_uuid,
                 level,
+                &caster,
                 &combat.fighters[target_slot],
                 ActiveSide::Middle,
                 now,
@@ -1356,6 +1392,7 @@ fn apply_ability_impact(
                         ability_uuid: ability_uuid.to_string(),
                         ability_level: level,
                         remaining_ticks: total_ticks - 1,
+                        magicka_full_at_cast,
                         next_tick_at: now
                             + Duration::from_secs_f32(super::damage::CHANNEL_TICK_INTERVAL_SECS),
                     });
@@ -1457,6 +1494,82 @@ pub(super) fn land_due_impacts(combat: &mut MatchCombat, now: Instant) -> Vec<(u
 /// Neither the shield nor the dodge pool ships a `_duration`, so neither gets a timed
 /// expiry: the pool lasts until it is consumed. `reset_fighters_for_next_round` clears
 /// `negation_pools`, so it cannot outlive the round.
+/// Statuses this ability rank CURES on the fighter that used it.
+///
+/// Driven by the shipped `statuses_to_remove` list, which until now was parsed into
+/// `gamedata.rs` and read by nothing at all. Resist Elements carries
+/// `[4, 5, 6, 7, 8]` on every one of its 15 ranks (Burning, Frozen, Enervated,
+/// Poisoned, Blind) and IndomitableSmash carries the same on all 12 of its ranks —
+/// so casting RE while burning should have put the fire out, and never did.
+///
+/// The cure applies to the USER. Both abilities that ship the list are self-directed
+/// (a protective ward and a shake-it-off smash); nothing ships a list aimed at an
+/// opponent, so a target-side cure would be inventing a mechanic.
+///
+/// Ids outside the modelled range are skipped rather than guessed at.
+fn apply_status_cures(
+    combat: &mut MatchCombat,
+    slot: usize,
+    ability_uuid: &str,
+    level: u8,
+    _now: Instant,
+) -> Vec<(usize, Vec<u8>)> {
+    use super::state::StatusEffectType;
+    let mut out = Vec::new();
+    if slot >= combat.fighters.len() {
+        return out;
+    }
+    let Some(rank) = super::gamedata::ability_rank_clamped(ability_uuid, level.max(1) as u16)
+    else {
+        return out;
+    };
+    if rank.statuses_to_remove.is_empty() {
+        return out;
+    }
+
+    let cured: Vec<StatusEffectType> = rank
+        .statuses_to_remove
+        .iter()
+        .filter_map(|id| match id {
+            4 => Some(StatusEffectType::Burning),
+            5 => Some(StatusEffectType::Frozen),
+            6 => Some(StatusEffectType::Enervated),
+            7 => Some(StatusEffectType::Poisoned),
+            8 => Some(StatusEffectType::Blind),
+            _ => None,
+        })
+        .collect();
+
+    // Only announce what the fighter actually HAD. Emitting a remove for a status
+    // that was never applied would put traffic on the wire retail never sent.
+    let held: Vec<StatusEffectType> = {
+        let f = &combat.fighters[slot];
+        cured
+            .iter()
+            .copied()
+            .filter(|c| f.effects.iter().any(|e| e.effect == *c))
+            .collect()
+    };
+    if held.is_empty() {
+        return out;
+    }
+
+    combat.fighters[slot]
+        .effects
+        .retain(|e| !held.contains(&e.effect));
+
+    let obj = combat.fighters[slot].net_object_id;
+    for status in &held {
+        info!("combat: slot {slot} CURED {status:?} via {ability_uuid}");
+        // Duration on a remove is meaningless; retail carries 0.
+        let frame = messages::change_combat_status_effect(obj, false, *status, 0.0);
+        for dest in 0..combat.fighters.len() {
+            out.push((dest, frame.clone()));
+        }
+    }
+    out
+}
+
 fn apply_shipped_effects(
     combat: &mut MatchCombat,
     caster: usize,
@@ -1478,6 +1591,12 @@ fn apply_shipped_effects(
     let viewers = combat.fighters.len();
     // No shipped duration → until consumed. Round reset clears the pools.
     let until_consumed = now + Duration::from_secs(3600);
+
+    // CURES — the shipped `statuses_to_remove` list, applied to the CASTER. This is
+    // how Resist Elements puts out a fire that is already burning; see
+    // [`apply_status_cures`]. Runs first so the cast's own new statuses, applied
+    // below, cannot be cured by the same cast.
+    out.extend(apply_status_cures(combat, caster, ability_uuid, level, now));
 
     if let Some(cap) = r.maximum_damage_dodged() {
         if cap > 0.0 && caster < viewers {
@@ -2315,9 +2434,15 @@ fn apply_channel_ticks(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Ve
         .collect();
 
     for i in due {
-        let (caster, target, uuid, level) = {
+        let (caster, target, uuid, level, magicka_full_at_cast) = {
             let c = &combat.channels[i];
-            (c.caster_slot, c.target_slot, c.ability_uuid.clone(), c.ability_level)
+            (
+                c.caster_slot,
+                c.target_slot,
+                c.ability_uuid.clone(),
+                c.ability_level,
+                c.magicka_full_at_cast,
+            )
         };
         if target >= combat.fighters.len()
             || combat.fighters[target].is_dead()
@@ -2328,9 +2453,19 @@ fn apply_channel_ticks(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Ve
             continue;
         }
 
+        // Maximum Power is frozen at cast; Mettle is re-read live off the caster.
+        let caster_perks = super::perks::CasterPerks {
+            perks: &combat.fighters[caster].loadout.perks,
+            magicka_full: magicka_full_at_cast,
+            health_critical: super::perks::health_is_critical(
+                combat.fighters[caster].health,
+                combat.fighters[caster].max_health,
+            ),
+        };
         let resolved = RetailDamageModel.resolve_ability(
             &uuid,
             level,
+            &caster_perks,
             &combat.fighters[target],
             ActiveSide::Middle,
             now,
@@ -2770,7 +2905,7 @@ fn hex(bytes: &[u8]) -> String {
 ///
 /// After all fighters are ticked, emits `PlayerStatsUpdate`(65) for any fighter
 /// whose pools changed. [video-ground-truth §1; /tmp/arena-video-groundtruth.md]
-fn apply_regen_tick(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8>)> {
+pub(super) fn apply_regen_tick(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8>)> {
     use super::state::StatusEffectType;
 
     let mut out = Vec::new();
@@ -2849,18 +2984,37 @@ fn apply_regen_tick(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u
             }
         }
 
-        // Health regen: NOT APPLIED HERE, and note that `HEALTH_REGEN_RATE_PER_S`
-        // is referenced by no code at all — only by comments. Setting it does
-        // nothing; wiring health regen means adding a branch here (and honouring
-        // `BlockHealthRegen`, which is already decoded).
+        // PASSIVE health regen stays at zero. `HEALTH_REGEN_RATE_PER_S` is still
+        // referenced by no code but its own pinning test: `ShouldApplyRegeneration`
+        // returns false unconditionally in PvP, and switching universal health regen
+        // on would change how every fight feels. That remains an owner decision.
         //
-        // The captured wire shows ~0.20 %/s health, so the measured set says this
-        // should be non-zero. It was left at zero deliberately when the
-        // stamina/magicka rates were taken from the wire on 2026-08-22: the owner
-        // was asked about the two POOLS, and switching health on makes HP climb in
-        // every fight — a far larger change to how a match feels than a rate tweak,
-        // and one that contradicts a standing owner decision from 2026-08-02.
-        // Raise it as its own question rather than smuggling it in here.
+        // HEALING SURGE is a different thing and is applied here. It is a PERK —
+        // "Increases Health regeneration while Stamina is high, by up to {0} per
+        // second" — so it pays out only for a player who bought it, at the rank they
+        // bought. That reconciles the owner's report that health regenerates in a
+        // fight with the deliberate zero above: the measured wire range across 272
+        // fighters (1.4-14.2 HP/s) sits inside this perk's shipped ceiling (8.4 at
+        // rank 1 to 15.4 at rank 8), and the fighters showing no regen are the ones
+        // without the perk.
+        //
+        // `BlockHealthRegen`(50) suppresses it, exactly as 51/52 suppress the two
+        // pools. Nothing in combat emits 50, but an item property can set it.
+        let block_health = f
+            .effects
+            .iter()
+            .any(|e| e.effect == StatusEffectType::BlockHealthRegen && now < e.expires_at);
+        if !block_health && f.health < f.max_health && f.max_stamina > 0 {
+            let stamina_fraction = f.stamina as f32 / f.max_stamina as f32;
+            let rate = f.loadout.perks.healing_surge_rate(stamina_fraction);
+            // REGEN_TICK_INTERVAL is 1 s, so a per-second rate IS the per-tick
+            // amount. Rounded, and not floored to a minimum of 1: an unperked
+            // fighter must gain exactly nothing.
+            let heal = rate.round() as u32;
+            if heal > 0 {
+                f.health = (f.health + heal).min(f.max_health);
+            }
+        }
 
         // Stamina regen: 3.03 %/s — the captured wire rate (see the constant).
         if !block_stam && f.stamina < f.max_stamina {
