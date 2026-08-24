@@ -163,6 +163,11 @@ pub struct BlockOutcome {
     /// [`BlockOutcome::factor_for`] — physical and elemental respectively.
     pub block_piercing: f32,
     pub elem_block_piercing: f32,
+    /// `ElementalProtection` perk — added to `rating` for ELEMENTAL damage only,
+    /// and only when the block is made with a shield. Zero for an unperked or
+    /// shieldless defender, which makes the elemental branch of `factor_for`
+    /// byte-identical to what it was before the perk existed.
+    pub elem_rating_bonus: f32,
 }
 
 /// The dump's `PvpDefaultSettings` LATE-block divisors, kept for provenance. The
@@ -189,7 +194,8 @@ impl BlockOutcome {
             return 1.0 - tables::block_reduction(pierced, true);
         }
         if is_elemental(ty) {
-            let pierced = (self.rating - self.elem_block_piercing).max(0.0);
+            let pierced =
+                (self.rating + self.elem_rating_bonus - self.elem_block_piercing).max(0.0);
             return 1.0 - tables::block_reduction(pierced, false);
         }
         // Stamina/Magicka drains and raw Health are not blocked. This stays at 1.0
@@ -245,6 +251,7 @@ pub fn block_outcome(
         rating: 0.0,
         block_piercing: 0.0,
         elem_block_piercing: 0.0,
+        elem_rating_bonus: 0.0,
     };
     if target.actor_state() != ActorStateType::Blocking || active_side == ActiveSide::None {
         return none;
@@ -263,6 +270,12 @@ pub fn block_outcome(
         rating: target.block_rating(optimal),
         block_piercing: attacker.block_piercing_rating,
         elem_block_piercing: attacker.elem_block_piercing_rating,
+        // "while blocking with a shield" — a two-handed guard gets nothing.
+        elem_rating_bonus: if target.loadout.has_shield {
+            target.loadout.perks.elemental_block_rating
+        } else {
+            0.0
+        },
     }
 }
 
@@ -286,6 +299,7 @@ pub trait DamageModel {
         &self,
         ability_uuid: &str,
         ability_level: u8,
+        caster: &super::perks::CasterPerks<'_>,
         target: &Fighter,
         active_side: ActiveSide,
         now: Instant,
@@ -301,13 +315,26 @@ impl RetailDamageModel {
     /// lands here and not after the multiplier.]
     fn physical_base_after_armor(attacker: &Loadout, target: &Fighter) -> Vec<(DamageType, f32)> {
         let armor_rating = (target.loadout.armor_rating - attacker.armor_piercing_rating).max(0.0);
+
+        // Scout / Armsman / Barbarian add flat damage for LIGHT / VERSATILE / HEAVY
+        // weapons. It rides on the weapon's own damage, so it is added BEFORE armour
+        // and mitigated with it — a perk should not be a hole in the armour model.
+        // Applied to the FIRST physical component only: the perk is "+{0} Damage
+        // with <class> weapons", one bonus per swing, not one per damage type.
+        let mut weapon_bonus = attacker.perks.weapon_bonus(attacker.weapon.weight);
+
         attacker
             .weapon
             .base_by_type
             .iter()
             .map(|(ty, base)| {
+                let mut base = *base;
+                if is_physical(*ty) && weapon_bonus > 0.0 {
+                    base += weapon_bonus;
+                    weapon_bonus = 0.0;
+                }
                 let cut = if is_physical(*ty) {
-                    tables::armor_reduction(*base, armor_rating)
+                    tables::armor_reduction(base, armor_rating)
                 } else {
                     0.0
                 };
@@ -337,9 +364,16 @@ impl RetailDamageModel {
         // The mirrored stat drain is NOT appended here: it mirrors the element
         // *after* mitigation and is derived in [`append_mirrored_drains`], which
         // `finish_resolved` calls once the block factor has been applied.
+        // ENCHANTMENT SYNERGY — "Stacked enchantments are {0}% more effective."
+        // "Stacked" is the same element carried by more than one equipped
+        // enchantment; a lone enchantment is not stacked and gets nothing.
+        let synergy = attacker.perks.enchantment_synergy;
         for (ench_ty, magnitude) in enchant_tracks(attacker) {
             let amp = target.element_amp_for(ench_ty) * (1.0 + fortify_for(attacker, ench_ty));
-            components.push((ench_ty, magnitude * amp));
+            let stacked = synergy > 0.0
+                && attacker.enchants.iter().filter(|(t, _)| *t == ench_ty).count() > 1;
+            let synergy_mult = if stacked { 1.0 + synergy } else { 1.0 };
+            components.push((ench_ty, magnitude * amp * synergy_mult));
         }
         components
     }
@@ -402,6 +436,7 @@ impl DamageModel for RetailDamageModel {
         &self,
         ability_uuid: &str,
         ability_level: u8,
+        caster: &super::perks::CasterPerks<'_>,
         target: &Fighter,
         active_side: ActiveSide,
         now: Instant,
@@ -456,10 +491,27 @@ impl DamageModel for RetailDamageModel {
                 tables::ability_damage(super::gamedata::ids::FIREBALL, ability_level).unwrap_or(0.0),
             ),
         };
+        // MAXIMUM POWER / METTLE — the two magnitude perks. Maximum Power is
+        // spell-only ("Spells are {0}% more effective when cast while Magicka is
+        // full"); Mettle applies to any ability while health is critical. Applied to
+        // the BASE, so block and resistance still bite afterwards — a perk makes the
+        // spell bigger, it does not bypass the defender.
+        let is_spell = super::gamedata::ability(ability_uuid)
+            .map(|a| a.kind == super::gamedata::AbilityKind::Spell)
+            .unwrap_or(true);
+        let base = base * caster.magnitude_multiplier(is_spell);
+
+        // The caster's PERKS, and nothing else, are visible to `finish_resolved`.
+        // Every other field stays `Default` on purpose: switching on the caster's
+        // piercing ratings for spells is a real change to the damage model, and it
+        // is not this one's to make.
+        let mut caster_loadout = Loadout::default();
+        caster_loadout.perks = caster.perks.clone();
+
         // The mirrored stat drain is appended by `finish_resolved` from the
         // post-block value — see [`append_mirrored_drains`].
         let mut components = vec![(ty, base)];
-        finish_resolved(&Loadout::default(), target, source, active_side, &mut components, now)
+        finish_resolved(&caster_loadout, target, source, active_side, &mut components, now)
     }
 }
 
@@ -586,6 +638,26 @@ fn finish_resolved(
 ) -> ResolvedDamage {
     let mut hit_flags = flags::SHOW_DAMAGE | flags::HAS_ATTACKER;
     let continuous = source == DamageSource::StatusEffect;
+
+    // 0) AUGMENTED ELEMENTS — `Augmented{Flames,Frost,Shock,Poison}` add a FLAT
+    //    amount to that element ("Increases fire damage by {0}").
+    //
+    //    Direct hits only. A burning/poison DoT ticks several times a second, so
+    //    adding the full flat bonus to every tick would multiply the perk by the
+    //    tick count and dwarf its printed value. The bonus is added to an element
+    //    the attack ALREADY deals — the perk augments fire damage, it does not
+    //    grant it — so a component at zero stays at zero.
+    //    A CHANNELLED spell (`ContinuousSpell`) is excluded for the same reason as
+    //    a DoT: it re-enters here once per 0.2 s tick, so a per-tick flat bonus would
+    //    pay the perk 15 times for one cast.
+    let single_impact = !continuous && source != DamageSource::ContinuousSpell;
+    if single_impact && !attacker.perks.element_damage.is_empty() {
+        for (ty, v) in components.iter_mut() {
+            if is_elemental(*ty) && *v > 0.0 {
+                *v += attacker.perks.element_bonus(*ty);
+            }
+        }
+    }
 
     // 1) BLOCK — a fraction from the defender's Block Rating. NOT de-rated against
     //    continuous damage (`continuousDamageBlockingEffectiveness == 1`).
@@ -943,17 +1015,17 @@ mod tests {
     fn ability_damage_comes_from_the_shipped_rank() {
         let now = Instant::now();
         let m = RetailDamageModel;
-        let r1 = m.resolve_ability(gamedata::ids::FIREBALL, 1, &target(), ActiveSide::Middle, now);
-        let r3 = m.resolve_ability(gamedata::ids::FIREBALL, 3, &target(), ActiveSide::Middle, now);
+        let r1 = m.resolve_ability(gamedata::ids::FIREBALL, 1, &crate::arena::combat::perks::CasterPerks::none(), &target(), ActiveSide::Middle, now);
+        let r3 = m.resolve_ability(gamedata::ids::FIREBALL, 3, &crate::arena::combat::perks::CasterPerks::none(), &target(), ActiveSide::Middle, now);
         assert_eq!(r1.source, DamageSource::Spell);
         assert!((comp(&r1, DamageType::Fire) - 73.89).abs() < 0.01, "Fireball R1 = 73.89");
         assert!((comp(&r3, DamageType::Fire) - 150.24).abs() < 0.01, "Fireball R3 = 150.24");
         // A Shock spell drains Magicka as well.
-        let bolt = m.resolve_ability("7fc15804-1637-40a9-8dcc-3ea1eb0f778d", 1, &target(), ActiveSide::Middle, now);
+        let bolt = m.resolve_ability("7fc15804-1637-40a9-8dcc-3ea1eb0f778d", 1, &crate::arena::combat::perks::CasterPerks::none(), &target(), ActiveSide::Middle, now);
         assert!(comp(&bolt, DamageType::Shock) > 0.0);
         assert!((comp(&bolt, DamageType::Magicka) - comp(&bolt, DamageType::Shock)).abs() < 1e-3);
         // Paralyze deals Poison at its shipped 88.7 @ R1.
-        let par = m.resolve_ability(gamedata::ids::PARALYZE, 1, &target(), ActiveSide::Middle, now);
+        let par = m.resolve_ability(gamedata::ids::PARALYZE, 1, &crate::arena::combat::perks::CasterPerks::none(), &target(), ActiveSide::Middle, now);
         assert!((comp(&par, DamageType::Poison) - 88.7).abs() < 0.01);
     }
 
@@ -1148,7 +1220,7 @@ mod every_cast_does_something {
             }
             // Rank 1 is what a freshly-equipped ability resolves at, so it is the
             // floor that matters.
-            let r = m.resolve_ability(a.uuid, 1, &target(), ActiveSide::Middle, now);
+            let r = m.resolve_ability(a.uuid, 1, &crate::arena::combat::perks::CasterPerks::none(), &target(), ActiveSide::Middle, now);
             if r.total <= 0.0 {
                 dead.push(format!("{} ({}, tag {tag:?})", a.editor_name, a.uuid));
             }

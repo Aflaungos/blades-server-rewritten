@@ -618,6 +618,11 @@ pub struct Loadout {
     /// (`ArmorPiercingPhysicalPropertyLogic`) — subtracted from the defender's
     /// Armor Rating before the physical reduction. [Phase 3.3]
     pub armor_piercing_rating: f32,
+
+    /// Resolved perk bonuses, computed once at parse time. `Default` (every
+    /// field zero) for a fighter with no perks, which every application site
+    /// treats as a no-op.
+    pub perks: super::perks::PerkBonuses,
     /// Attacker-side `Fortify <Element> Damage` — a 0..1 fraction per element that
     /// raises that element track's amplification ceiling. [Phase 3.6]
     pub element_fortify: Vec<(DamageType, f32)>,
@@ -747,6 +752,10 @@ pub struct ActiveChannel {
     /// Ticks still owed, EXCLUDING the one the cast already emitted.
     pub remaining_ticks: u32,
     pub next_tick_at: Instant,
+    /// Was the caster's magicka full at CAST time? Maximum Power's condition is
+    /// evaluated once, when the spell goes off — the cast itself spends magicka, so
+    /// re-reading it per tick would turn the perk off for every tick but the first.
+    pub magicka_full_at_cast: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -945,6 +954,11 @@ pub struct Fighter {
     /// pipeline AFTER block (same insertion point as loadout resistances). Duration = 11.5s
     /// (`ResistElementsAbility._resistanceDuration` from multi-session op51 analysis).
     pub transient_resistances: Vec<(DamageType, f32, Instant)>, // (type, flat_amount, expires_at)
+    /// Resistance against EVERY damage type, as (flat_amount, expires_at).
+    /// Combat Focus and Willpower grant this for the duration of a cast; unlike
+    /// `transient_resistances` it is not keyed by type, because the shipped text
+    /// is "Resistance to all damage".
+    pub transient_all_resistance: Vec<(f32, Instant)>,
     /// While set and in the future this fighter is STAGGERED
     /// (`CombatParameters.baseStaggerDuration` 1.5 s): inputs are dropped, exactly
     /// like `Paralyzed`, and the actor-state is `Staggered`. [Phase 3.13]
@@ -1122,6 +1136,7 @@ impl Fighter {
             can_be_paralyzed: true, // players can be paralysed (vs boss innate immunity)
             negation_pools: Vec::new(),
             transient_resistances: Vec::new(),
+            transient_all_resistance: Vec::new(),
             staggered_until: None,
             announced_statuses: Vec::new(),
             consumables_used: 0,
@@ -1425,16 +1440,27 @@ impl Fighter {
     /// Return the sum of transient Resist-Elements resistances for `ty` (non-expired
     /// only). Called by the damage pipeline to add to loadout resistances. [§4.3]
     pub fn transient_resistance_against(&self, ty: DamageType, now: Instant) -> f32 {
-        self.transient_resistances
+        // The all-types band (Combat Focus / Willpower) applies to every type, so it
+        // is summed in here rather than at each call site.
+        let all: f32 = self
+            .transient_all_resistance
+            .iter()
+            .filter(|(_, exp)| now < *exp)
+            .map(|(v, _)| *v)
+            .sum();
+        let per_type: f32 = self
+            .transient_resistances
             .iter()
             .filter(|(t, _, exp)| *t == ty && now < *exp)
             .map(|(_, v, _)| *v)
-            .sum()
+            .sum();
+        all + per_type
     }
 
     /// Prune expired transient resistances.
     pub fn prune_transient_resistances(&mut self, now: Instant) {
         self.transient_resistances.retain(|(_, _, exp)| now < *exp);
+        self.transient_all_resistance.retain(|(_, exp)| now < *exp);
     }
 
     pub fn is_dead(&self) -> bool {
@@ -1945,6 +1971,7 @@ impl MatchCombat {
             f.damage_history.clear(); // ClearDamageHistory on round reset (§5.5)
             f.negation_pools.clear();
             f.transient_resistances.clear();
+            f.transient_all_resistance.clear();
             f.staggered_until = None;
             // A new round starts with nothing announced: the client resets its own
             // effect layer, so replaying removes for last round's statuses would be
