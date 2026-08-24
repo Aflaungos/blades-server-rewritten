@@ -7,8 +7,8 @@ use actix_web::{
 };
 use diesel::{
     ExpressionMethods, QueryDsl, SelectableHelper,
-    dsl::jsonb_set_create_if_missing,
-    sql_types::{Array, Text},
+    dsl::sql,
+    sql_types::Jsonb,
 };
 use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt};
 use serde::Deserialize;
@@ -67,53 +67,44 @@ async fn update_data(
         async move {
             use crate::schema::characters::dsl::*;
 
-            // I can’t figure how to do that in a single request. And I can’t put a for_update in an update statement...
-
-            // lock the row fo update (that would have been avoidable if I could put everything in a single transaction)
-            characters
-                .filter(id.eq(character_id))
-                .filter(user_id.eq(session.session.user_id))
-                .for_update()
-                .execute(&mut conn)
-                .await
-                .unwrap();
-
+            // ONE write, not one per field.
+            //
+            // This used to take the row lock and then issue a separate UPDATE per
+            // present field, each a `jsonb_set` over the whole `data` column. That
+            // column averages 96 kB and reaches 244 kB, so every request rewrote a
+            // TOASTed value up to three times and wrote three sets of WAL. Measured
+            // on prod, median latency for this route went from 12-31 ms through
+            // 20 August to ~900 ms after — the volume never changed, the payloads
+            // grew. (The old code carried a comment saying a single request could
+            // not be worked out; it can.)
+            //
+            // All three destinations are TOP-LEVEL keys, so `data || patch` is
+            // exactly equivalent to three depth-1 `jsonb_set` calls with
+            // create_if_missing — same create-or-replace semantics, one pass.
+            let mut patch = serde_json::Map::new();
             if let Some(new_flags) = body.0.data.new_flags {
-                let new_data_updated_row = diesel::update(characters)
-                    .filter(id.eq(character_id))
-                    .filter(user_id.eq(session.session.user_id))
-                    .set(
-                        data.eq(jsonb_set_create_if_missing::<_, Array<Text>, _, _, _, _>(
-                            data,
-                            vec!["new-flags"],
-                            JsonDbWrapper(new_flags),
-                            true,
-                        )),
-                    )
-                    .execute(&mut conn)
-                    .await?;
-
-                if new_data_updated_row == 0 {
-                    return Err(BladeApiError::new(StatusCode::BAD_REQUEST, 1003, 2));
-                }
-            };
-
+                patch.insert("new-flags".to_string(), new_flags);
+            }
             if let Some(dialog) = body.0.data.dialog {
-                let dialog_updated_row = diesel::update(characters)
+                patch.insert("dialog".to_string(), dialog);
+            }
+            // `customization` is merged here too, but the appearance branch below
+            // still runs for the wallet debit and the response body it owes the
+            // client. It no longer performs its own write.
+            let has_customization = body.0.data.customization.is_some();
+            if let Some(customization) = body.0.data.customization.clone() {
+                patch.insert("customization".to_string(), customization);
+            }
+
+            if !patch.is_empty() {
+                let updated = diesel::update(characters)
                     .filter(id.eq(character_id))
                     .filter(user_id.eq(session.session.user_id))
-                    .set(
-                        data.eq(jsonb_set_create_if_missing::<_, Array<Text>, _, _, _, _>(
-                            data,
-                            vec!["dialog"],
-                            JsonDbWrapper(dialog),
-                            true,
-                        )),
-                    )
+                    .set(data.eq(sql::<Jsonb>("data || ")
+                        .bind::<Jsonb, _>(serde_json::Value::Object(patch))))
                     .execute(&mut conn)
                     .await?;
-
-                if dialog_updated_row == 0 {
+                if updated == 0 {
                     return Err(BladeApiError::new(StatusCode::BAD_REQUEST, 1003, 2));
                 }
             }
@@ -123,23 +114,10 @@ async fn update_data(
             // race live in its `Morphs` + face/body presets, so this one write covers all
             // three. Previously discarded (Option<()> + assert) → the change never saved
             // and the client hung after the NPC (Viventus). [ground truth: SA3 capture]
-            if let Some(customization) = body.0.data.customization {
-                let cust_updated_row = diesel::update(characters)
-                    .filter(id.eq(character_id))
-                    .filter(user_id.eq(session.session.user_id))
-                    .set(
-                        data.eq(jsonb_set_create_if_missing::<_, Array<Text>, _, _, _, _>(
-                            data,
-                            vec!["customization"],
-                            JsonDbWrapper(customization),
-                            true,
-                        )),
-                    )
-                    .execute(&mut conn)
-                    .await?;
-                if cust_updated_row == 0 {
-                    return Err(BladeApiError::new(StatusCode::BAD_REQUEST, 1003, 2));
-                }
+            if has_customization {
+                // The customization blob was already persisted by the single merge
+                // above; this branch exists for the wallet debit and the response
+                // body retail owes the client.
 
                 // Retail's appearance-change response is the (charged) wallet + the
                 // inventory versions — the client updates its wallet display from it, so
