@@ -109,6 +109,22 @@ pub enum MatchmakerCommand {
 pub struct TicketRequest {
     pub ticket_id: Uuid,
     pub user_id: Uuid,
+    /// The character this player is queueing AS.
+    ///
+    /// The client tells us, in `matches/create`'s `playerId` — capture-confirmed: that
+    /// UUID appears 3,198 times in `/characters/{id}/...` paths in the corpus and zero
+    /// times where an account id belongs. We used to bind the request body to `_body`
+    /// and throw it away, then load `characters WHERE user_id = ?` and take whatever row
+    /// Postgres happened to return first. An account with more than one character
+    /// therefore fought as an ARBITRARY one — wrong gear, wrong name, wrong stats — and
+    /// the choice could change between queries. Reported after the first human-vs-human
+    /// match: "I changed to dwarven mail and frost, but it looked like I was fighting
+    /// flappety in dragon bone... I may have fought you in my equipment too."
+    ///
+    /// `None` only when the client omitted it; the loader then falls back to the
+    /// player's strongest character, which is at least deterministic and agrees with
+    /// [`load_skill`].
+    pub character_id: Option<Uuid>,
     pub rms: RmsHandle,
     /// What we know about this player's strength, for the pairing bracket.
     /// `None` when the lookup failed or the player has no character yet — an
@@ -321,7 +337,11 @@ async fn record_match_resolved(
 /// Re-enable only OFF the actor: a spawned task, a bounded `tokio::time::timeout`,
 /// and/or a per-user cache, so a slow `characters` query can't stall matches.
 #[allow(dead_code)]
-async fn load_loadout(db: &Option<DbPool>, user_id: Uuid) -> crate::arena::combat::Loadout {
+async fn load_loadout(
+    db: &Option<DbPool>,
+    user_id: Uuid,
+    character_id: Option<Uuid>,
+) -> crate::arena::combat::Loadout {
     use crate::arena::combat::loadout;
     let Some(db) = db else {
         return loadout::starter();
@@ -329,13 +349,18 @@ async fn load_loadout(db: &Option<DbPool>, user_id: Uuid) -> crate::arena::comba
     let Ok(mut conn) = db.get().await else {
         return loadout::starter();
     };
-    let row = characters::table
+    // ALWAYS scoped by user_id, even when the client named a character: `playerId`
+    // arrives from the client and is not trustworthy on its own. Filtering on both means
+    // a forged id selects nothing and we fall back, rather than loading somebody else's
+    // character into the arena.
+    let rows = characters::table
         .filter(characters::user_id.eq(user_id))
         .select(CharacterDbEntryCharacterWalletInventory::as_select())
         .load(&mut conn)
         .await
         .ok()
-        .and_then(|rows| rows.into_iter().next());
+        .unwrap_or_default();
+    let row = pick_character(rows, character_id);
     match row {
         Some(r) => loadout_from_row(&r),
         None => loadout::starter(),
@@ -356,6 +381,28 @@ async fn load_loadout(db: &Option<DbPool>, user_id: Uuid) -> crate::arena::comba
 /// client's deserializer would reject). `equippedItems` now carries retail's per-item
 /// `grade` and `arcaneTier` (`Item`), both omitted when absent so an item that has
 /// neither serializes byte-identically to before they were modelled.
+/// Choose which of the player's characters enters the arena.
+///
+/// Named character wins. Otherwise the STRONGEST by (trophies, level) — the same
+/// ordering [`load_skill`] uses, so the character you are bracketed as is the character
+/// you actually fight as. Previously these disagreed: skill took the max, the loadout
+/// took an arbitrary row, so a player could be matched against opponents chosen for
+/// their best character while fighting as their worst.
+fn pick_character(
+    rows: Vec<CharacterDbEntryCharacterWalletInventory>,
+    character_id: Option<Uuid>,
+) -> Option<CharacterDbEntryCharacterWalletInventory> {
+    if let Some(want) = character_id {
+        if let Some(hit) = rows.iter().position(|r| r.id == want) {
+            return rows.into_iter().nth(hit);
+        }
+        // Fall through: the id named a character this user does not own, or one that has
+        // since been deleted. Better a deterministic fallback than no match at all.
+    }
+    rows.into_iter()
+        .max_by_key(|r| (r.character.0.matchmaking_pvp_trophies, r.character.0.level))
+}
+
 fn loadout_from_row(r: &CharacterDbEntryCharacterWalletInventory) -> crate::arena::combat::Loadout {
     use crate::arena::combat::loadout;
     let mut lo = loadout::from_character(&r.character.0, &r.inventory.0);
@@ -1003,6 +1050,106 @@ mod human_priority_tests {
         let second = next_floor(first, 0, 0, since, delay, now + Duration::from_millis(500));
         assert_eq!(first, second, "same tier, same floor — no creep");
         assert_eq!(first, since + delay);
+    }
+
+    /// THE REPORTED BUG, second half. After the first human-vs-human match:
+    /// "I changed to dwarven mail and frost, but it looked like I was fighting flappety
+    /// in dragon bone... I think I may have fought you in my equipment too."
+    ///
+    /// An account can own several characters. `load_loadout` used to run
+    /// `characters WHERE user_id = ?` and take `rows.into_iter().next()` — whatever
+    /// Postgres returned first, with no ORDER BY. So the arena fought as an ARBITRARY
+    /// character: wrong gear, wrong name, wrong stats, and the choice free to change
+    /// between queries.
+    ///
+    /// The client tells us which character is queueing, in `matches/create`'s
+    /// `playerId`. We bound the body to `_body` and threw it away.
+    #[test]
+    fn the_named_character_is_the_one_that_enters_the_arena() {
+        let wanted = Uuid::new_v4();
+        let rows = vec![
+            character_row(Uuid::new_v4(), 900, 100), // strongest, and NOT the one playing
+            character_row(wanted, 120, 41),          // the character actually queueing
+        ];
+        let picked = pick_character(rows, Some(wanted)).expect("a row is returned");
+        assert_eq!(
+            picked.id, wanted,
+            "the arena must field the character the client named, not the best one on \
+             the account"
+        );
+    }
+
+    /// `playerId` arrives from the client, so it is not trusted on its own — the query
+    /// is always scoped by user_id as well. Here the named id is simply not among this
+    /// user's rows, which is what a forged or stale id looks like by the time it reaches
+    /// the picker: fall back rather than return nothing.
+    #[test]
+    fn an_unknown_character_id_falls_back_instead_of_stranding_the_player() {
+        let mine = Uuid::new_v4();
+        let rows = vec![character_row(mine, 300, 55)];
+        let picked = pick_character(rows, Some(Uuid::new_v4())).expect("falls back");
+        assert_eq!(picked.id, mine, "an id this user does not own must not select it");
+    }
+
+    /// No character named: deterministic, and the SAME ordering `load_skill` uses. These
+    /// used to disagree — skill took the max across all characters, the loadout took an
+    /// arbitrary row — so a player could be bracketed as their strongest character and
+    /// fight as another.
+    #[test]
+    fn the_fallback_is_the_strongest_character_not_an_arbitrary_row() {
+        let best = Uuid::new_v4();
+        let rows = vec![
+            character_row(Uuid::new_v4(), 100, 90),
+            character_row(best, 850, 60), // highest trophies wins, as load_skill does
+            character_row(Uuid::new_v4(), 300, 99),
+        ];
+        assert_eq!(pick_character(rows, None).expect("a row").id, best);
+    }
+
+    /// Trophies first, level only as the tie-break — matching `load_skill`'s
+    /// `max_by_key(|s| (s.trophies, s.level))` exactly.
+    #[test]
+    fn the_fallback_breaks_trophy_ties_by_level() {
+        let higher_level = Uuid::new_v4();
+        let rows = vec![
+            character_row(Uuid::new_v4(), 400, 30),
+            character_row(higher_level, 400, 80),
+        ];
+        assert_eq!(pick_character(rows, None).expect("a row").id, higher_level);
+    }
+
+    /// An account with no characters must not panic — matchmaking degrades to the
+    /// starter loadout rather than refusing to queue.
+    #[test]
+    fn no_characters_is_none_not_a_panic() {
+        assert!(pick_character(Vec::new(), Some(Uuid::new_v4())).is_none());
+        assert!(pick_character(Vec::new(), None).is_none());
+    }
+
+    fn character_row(
+        id: Uuid,
+        trophies: i64,
+        level: u16,
+    ) -> crate::models::CharacterDbEntryCharacterWalletInventory {
+        use crate::json_db::JsonDbWrapper;
+        let mut c = blades_lib::user_data::CompleteCharacter::default();
+        c.matchmaking_pvp_trophies = trophies;
+        c.level = level;
+        crate::models::CharacterDbEntryCharacterWalletInventory {
+            id,
+            user_id: Uuid::new_v4(),
+            character: JsonDbWrapper(c),
+            data: JsonDbWrapper(Default::default()),
+            wallet: JsonDbWrapper(Default::default()),
+            inventory: JsonDbWrapper(blades_lib::user_data::CompleteInventory {
+                backpack: Default::default(),
+                loadout: Default::default(),
+                treasury: Default::default(),
+                overflow_treasury: Default::default(),
+                backpack_version: 1,
+                treasury_version: 0,
+            }),
+        }
     }
 
     /// THE REPORTED BUG. Two testers press Fight seconds apart and never meet.
@@ -2555,7 +2702,7 @@ async fn resolve(
     for t in tickets {
         let lo = match tokio::time::timeout(
             std::time::Duration::from_millis(1500),
-            load_loadout(db, t.user_id),
+            load_loadout(db, t.user_id, t.character_id),
         )
         .await
         {
@@ -2610,7 +2757,7 @@ async fn resolve(
             for i in 0..bots {
                 let lo = match tokio::time::timeout(
                     std::time::Duration::from_millis(1500),
-                    load_loadout(db, ghost_id),
+                    load_loadout(db, ghost_id, None),
                 )
                 .await
                 {
@@ -2840,32 +2987,44 @@ struct MatchTicket {
 /// Returns `None` rather than an error on any failure — no character, no database,
 /// a malformed row. Matchmaking must degrade to "pair anyone" rather than refuse
 /// to queue someone because a lookup went wrong.
-async fn load_skill(app_state: &Arc<ServerGlobal>, user_id: Uuid) -> Option<Skill> {
+async fn load_skill(
+    app_state: &Arc<ServerGlobal>,
+    user_id: Uuid,
+    character_id: Option<Uuid>,
+) -> Option<Skill> {
     use crate::schema::characters;
     use diesel::{ExpressionMethods, QueryDsl};
     use diesel_async::RunQueryDsl;
 
     let mut conn = app_state.db_pool.get().await.ok()?;
-    let rows: Vec<serde_json::Value> = characters::table
+    let rows: Vec<(Uuid, serde_json::Value)> = characters::table
         .filter(characters::user_id.eq(user_id))
-        .select(characters::character)
+        .select((characters::id, characters::character))
         .load(&mut conn)
         .await
         .ok()?;
-    // A user may own several characters and the request does not say which is
-    // queueing. Take the strongest — it is the one they are most likely playing in
-    // the arena, and it is the conservative choice: it cannot under-state them into
-    // an easier bracket.
-    rows.into_iter()
-        .filter_map(|c| {
-            Some(Skill {
-                level: c.get("level")?.as_i64()? as i32,
-                trophies: c
-                    .get("matchmakingPvpTrophies")
-                    .and_then(|v| v.as_i64())
-                    .unwrap_or(0),
-            })
+    let skill_of = |c: &serde_json::Value| {
+        Some(Skill {
+            level: c.get("level")?.as_i64()? as i32,
+            trophies: c
+                .get("matchmakingPvpTrophies")
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
         })
+    };
+    // The request DOES say which character is queueing — `matches/create`'s `playerId`.
+    // Bracket on that one, so the character you are matched as is the character you
+    // fight as. This used to take the max across all of a player's characters while
+    // `load_loadout` took an arbitrary row, so the two could disagree.
+    if let Some(want) = character_id {
+        if let Some((_, c)) = rows.iter().find(|(id, _)| *id == want) {
+            return skill_of(c);
+        }
+    }
+    // No character named (or it is not this user's): strongest, matching
+    // `pick_character`'s fallback so the two stay in agreement.
+    rows.into_iter()
+        .filter_map(|(_, c)| skill_of(&c))
         .max_by_key(|s| (s.trophies, s.level))
 }
 
@@ -2873,7 +3032,7 @@ async fn load_skill(app_state: &Arc<ServerGlobal>, user_id: Uuid) -> Option<Skil
 pub async fn create_match(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
-    _body: web::Json<CreateMatchRequest>,
+    body: web::Json<CreateMatchRequest>,
 ) -> Result<Json<CreateMatchResponse>, BladeApiError> {
     let session = session.get_session_or_error()?;
     let ticket_id = Uuid::new_v4();
@@ -2901,7 +3060,11 @@ pub async fn create_match(
     // synchronous over its queue and never blocks pairing on a database round trip.
     // A failed lookup is not fatal: `compatible` treats an unknown skill as
     // matchable, so the worst case is the old behaviour for that one player.
-    let skill = load_skill(&app_state, session.session.user_id).await;
+    // `playerId` is the CHARACTER queueing, not the account — capture-confirmed: that
+    // UUID appears 3,198 times in `/characters/{id}/...` paths in the corpus and never
+    // where an account id belongs. We used to bind this body to `_body` and discard it.
+    let character_id = body.player_id;
+    let skill = load_skill(&app_state, session.session.user_id, character_id).await;
 
     app_state
         .arena
@@ -2909,6 +3072,7 @@ pub async fn create_match(
         .send(MatchmakerCommand::Enqueue(TicketRequest {
             ticket_id,
             user_id: session.session.user_id,
+            character_id,
             rms: RmsHandle::Session(session.session.clone()),
             skill,
         }))
@@ -3029,6 +3193,7 @@ mod tests {
         tx.send(MatchmakerCommand::Enqueue(TicketRequest {
             ticket_id: Uuid::new_v4(),
             user_id: Uuid::new_v4(),
+            character_id: None,
             rms: RmsHandle::Direct(rms_a),
             skill: None,
         }))
@@ -3036,6 +3201,7 @@ mod tests {
         tx.send(MatchmakerCommand::Enqueue(TicketRequest {
             ticket_id: Uuid::new_v4(),
             user_id: Uuid::new_v4(),
+            character_id: None,
             rms: RmsHandle::Direct(rms_b),
             skill: None,
         }))
@@ -3107,6 +3273,7 @@ mod tests {
         tx.send(MatchmakerCommand::Enqueue(TicketRequest {
             ticket_id: tid_a,
             user_id: Uuid::new_v4(),
+            character_id: None,
             rms: RmsHandle::Direct(rms_a),
             skill: None,
         }))
@@ -3114,6 +3281,7 @@ mod tests {
         tx.send(MatchmakerCommand::Enqueue(TicketRequest {
             ticket_id: tid_b,
             user_id: Uuid::new_v4(),
+            character_id: None,
             rms: RmsHandle::Direct(rms_b),
             skill: None,
         }))
@@ -3193,6 +3361,7 @@ mod tests {
         tx.send(MatchmakerCommand::Enqueue(TicketRequest {
             ticket_id: Uuid::new_v4(),
             user_id: Uuid::new_v4(),
+            character_id: None,
             rms: RmsHandle::Direct(rms_a),
             skill: None,
         }))
@@ -3248,6 +3417,7 @@ mod tests {
         tx.send(MatchmakerCommand::Enqueue(TicketRequest {
             ticket_id: Uuid::new_v4(),
             user_id: Uuid::new_v4(),
+            character_id: None,
             rms: RmsHandle::Direct(rms_a),
             skill: Some(Skill {
                 level: 62,
@@ -3261,6 +3431,7 @@ mod tests {
         tx.send(MatchmakerCommand::Enqueue(TicketRequest {
             ticket_id: Uuid::new_v4(),
             user_id: Uuid::new_v4(),
+            character_id: None,
             rms: RmsHandle::Direct(rms_b),
             skill: Some(Skill {
                 level: 44,
@@ -3330,6 +3501,7 @@ mod tests {
         tx.send(MatchmakerCommand::Enqueue(TicketRequest {
             ticket_id: Uuid::new_v4(),
             user_id: Uuid::new_v4(),
+            character_id: None,
             rms: RmsHandle::Direct(rms_a),
             skill: Some(Skill {
                 level: 50,
@@ -3346,6 +3518,7 @@ mod tests {
         tx.send(MatchmakerCommand::Enqueue(TicketRequest {
             ticket_id: Uuid::new_v4(),
             user_id: Uuid::new_v4(),
+            character_id: None,
             rms: RmsHandle::Direct(rms_b),
             skill: Some(Skill {
                 level: 50,
@@ -3400,6 +3573,7 @@ mod tests {
         tx.send(MatchmakerCommand::Enqueue(TicketRequest {
             ticket_id: tid,
             user_id: uid,
+            character_id: None,
             rms: RmsHandle::Direct(rms),
             skill: None,
         }))
@@ -3458,6 +3632,7 @@ mod tests {
         tx.send(MatchmakerCommand::Enqueue(TicketRequest {
             ticket_id: tid,
             user_id: uid,
+            character_id: None,
             rms: RmsHandle::Direct(rms),
             skill: None,
         }))
