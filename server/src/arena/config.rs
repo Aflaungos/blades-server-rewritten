@@ -80,6 +80,28 @@ pub struct ArenaConfig {
     /// `solo_fallback_secs` the moment nobody is (see `matchmaker_loop`). A player who
     /// really is alone never waits longer than they do today.
     pub busy_fallback_secs: u64,
+    /// How long a queued player waits for a HUMAN before falling back to a bot, when
+    /// **more than one human has queued recently** but nobody is in a live match right
+    /// now (env `ARENA_RECENT_FALLBACK_SECS`, default 30 s).
+    ///
+    /// The third tier, and it exists because the other two leave a hole.
+    /// `busy_fallback_secs` only applies while somebody is *mid-match*; the moment they
+    /// finish, `live_human_count()` drops to 0 and the deadline collapses back to
+    /// `solo_fallback_secs` (4 s). But a player between fights — results card, menus,
+    /// re-queuing — is not in a match and is exactly the partner you want to wait for.
+    /// Two people coordinating on Discord kept landing in that hole.
+    ///
+    /// 30 s is chosen against `matchmaker::bracket_for`: the bracket goes unlimited at
+    /// 30 s, so this is the first tier at which the whole schedule is reachable. Below
+    /// it the later widening steps are dead code.
+    pub recent_fallback_secs: u64,
+    /// How far back to look for other humans when deciding whether
+    /// `recent_fallback_secs` applies (env `ARENA_RECENT_WINDOW_SECS`, default 300 s).
+    ///
+    /// Five minutes spans a fight plus the results card plus a re-queue (measured
+    /// human-vs-AI matches: 81, 110, 78, 110, 84 s), so two players trading fights stay
+    /// "recent" to each other across the whole cycle.
+    pub recent_window_secs: u64,
 }
 
 impl ArenaConfig {
@@ -99,6 +121,8 @@ impl ArenaConfig {
             // the 1st waits). Bump ARENA_SOLO_FALLBACK_SECS to widen the pairing window.
             solo_fallback_secs: parse("ARENA_SOLO_FALLBACK_SECS", 4),
             busy_fallback_secs: parse("ARENA_BUSY_FALLBACK_SECS", 230),
+            recent_fallback_secs: parse("ARENA_RECENT_FALLBACK_SECS", 30),
+            recent_window_secs: parse("ARENA_RECENT_WINDOW_SECS", 300),
             // DEBUG ghost opponent (off when unset / unparseable → normal bot).
             debug_ghost_user_id: env::var("ARENA_DEBUG_GHOST")
                 .ok()
