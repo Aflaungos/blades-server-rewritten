@@ -1,5 +1,6 @@
 pub mod arena_economy;
 pub mod arena_ladder;
+pub mod arena_season;
 pub mod avatar;
 pub mod combat;
 pub mod config;
@@ -13,6 +14,7 @@ pub mod match_registry;
 pub mod matchmaker;
 pub mod matchmaking;
 pub mod presence;
+pub mod pvp_tuning;
 pub mod udp;
 
 use serde::Serialize;

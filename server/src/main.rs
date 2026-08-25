@@ -510,6 +510,7 @@ async fn main() -> Result<()> {
                     .service(admin::recent_matches)
                     .service(admin::bind_device)
                     .service(admin::recent_devices)
+                    .service(admin::arena_season_rollover)
                     .service(
                         Files::new(
                             "/bundles.blades.bgs.services/",

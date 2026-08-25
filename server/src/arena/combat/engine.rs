@@ -1175,6 +1175,7 @@ impl MatchInstance {
     fn broadcast_match_end_results(&self, out: &mut Vec<(usize, Vec<u8>)>) {
         use crate::arena::arena_economy::{self, MatchEconomyOutcome};
         use crate::arena::arena_ladder::{self, MatchOutcome};
+        use crate::arena::arena_season;
 
         let (winner_uuid, loser_uuid) = self.combat.winner_loser_uuids();
         let game_session_id = uuid::Uuid::parse_str(&self.combat.game_session_id).ok();
@@ -1208,8 +1209,15 @@ impl MatchInstance {
             let outcome = MatchOutcome { rounds_won, rounds_lost, win: is_winner };
 
             let level = if p.level > 0 { p.level } else { f.loadout.level };
-            let payout = arena_ladder::match_reward(level, outcome);
-            let trophy_delta = arena_ladder::trophy_delta(is_winner, p.trophies, opponent_trophies);
+            // The arena the match is fought in — the third input to the shipped
+            // reward tables. Read off the PRE-match trophy high-water mark, which
+            // is what the ladder promotes on, so a promotion earned by this very
+            // match does not retroactively raise its own payout.
+            let arena = arena_ladder::tier_for_trophies(p.high_water).arena;
+            let payout = arena_ladder::match_reward(level, outcome, arena);
+            let scoring = arena_season::active_scoring();
+            let trophy_delta =
+                arena_ladder::trophy_delta(outcome, p.trophies, opponent_trophies, scoring);
 
             // Post-match counters, computed once so the card and the durable write are
             // literally the same numbers.

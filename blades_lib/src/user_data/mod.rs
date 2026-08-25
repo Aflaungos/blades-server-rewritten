@@ -110,6 +110,13 @@ pub struct CompleteCharacter {
     pub pvp_trophies: i64,
     pub highest_arena_reached: u64,
     pub highest_level_arena_reached: u64,
+    // When the character last reached a NEW ladder rung, unix seconds. Retail
+    // ships it on every character and inside every `pvpSeasonHistory` block; we
+    // used to drop it silently on round-trip (no field -> serde discards it), so
+    // an imported character lost the timestamp and an archived season block came
+    // out one key short of retail's. `default` so existing rows deserialize.
+    #[serde(default)]
+    pub highest_level_arena_reached_time_secs: i64,
     pub number_pvp_match_played: i64,
     pub trophy_count_modifier: i64,
     pub pvp_season_id: Uuid,
@@ -168,6 +175,7 @@ impl Default for CompleteCharacter {
             pvp_trophies: 0,
             highest_arena_reached: 1,
             highest_level_arena_reached: 1,
+            highest_level_arena_reached_time_secs: 0,
             number_pvp_match_played: 0,
             trophy_count_modifier: 0,
             pvp_season_id: Uuid::default(),
