@@ -578,6 +578,74 @@ pub async fn arena_season_rollover(
 
 #[cfg(test)]
 mod tests {
+    // --- season rollover: the dry-run default ------------------------------
+    //
+    // `arena_season_rollover` zeroes every player's trophies. Its only
+    // safeguard against doing that by accident is that `apply` must be
+    // *explicitly* true — the handler's `if !body.apply { continue; }` sits
+    // between the plan and the UPDATE. The doc comment promises that "a
+    // missing or mistyped field reports what would happen and changes
+    // nothing"; these tests hold that promise to account, because the cost of
+    // it silently becoming false is every player's standing.
+    //
+    // Scope: this covers the request half — how `apply` is decoded. The
+    // handler's guard itself needs a live DB and is not exercised here.
+    mod season_rollover_defaults {
+        use super::super::SeasonRolloverRequest;
+
+        #[test]
+        fn an_empty_body_is_a_dry_run() {
+            let r: SeasonRolloverRequest = serde_json::from_str("{}").unwrap();
+            assert!(!r.apply, "POST with `{{}}` must not write");
+        }
+
+        #[test]
+        fn an_absent_body_is_a_dry_run() {
+            // The handler does `body.map(..).unwrap_or_default()`, so a
+            // bodyless POST lands on Default.
+            assert!(
+                !SeasonRolloverRequest::default().apply,
+                "a bodyless POST must not write"
+            );
+        }
+
+        #[test]
+        fn a_mistyped_apply_field_is_a_dry_run() {
+            // The exact footgun the doc comment names: someone types `aply`
+            // (or `Apply`, or `apply_now`) and expects a wipe. They must get
+            // a report instead. If anyone adds `deny_unknown_fields` this
+            // becomes a 400 — also safe, but this test would then need
+            // rewriting rather than deleting.
+            for typo in [r#"{"aply":true}"#, r#"{"Apply":true}"#, r#"{"apply_now":true}"#] {
+                let r: SeasonRolloverRequest = serde_json::from_str(typo)
+                    .unwrap_or_else(|e| panic!("{typo} should parse or 400, got {e}"));
+                assert!(!r.apply, "{typo} must not arm the wipe");
+            }
+        }
+
+        #[test]
+        fn apply_true_is_the_only_thing_that_arms_it() {
+            // The positive control. Without this the three tests above would
+            // still pass if `apply` were hard-wired to false, and the
+            // endpoint would be silently inert rather than safe.
+            let r: SeasonRolloverRequest = serde_json::from_str(r#"{"apply":true}"#).unwrap();
+            assert!(r.apply, "an explicit `apply: true` must still work");
+        }
+
+        #[test]
+        fn apply_is_not_coerced_from_a_truthy_string_or_number() {
+            // serde is strict about this, but the assertion pins it: a config
+            // templating layer that stringifies booleans must fail loudly,
+            // not arm a wipe.
+            for loose in [r#"{"apply":"true"}"#, r#"{"apply":1}"#] {
+                assert!(
+                    serde_json::from_str::<SeasonRolloverRequest>(loose).is_err(),
+                    "{loose} must be rejected, never read as true"
+                );
+            }
+        }
+    }
+
     use super::*;
     use blades_lib::user_data::{
         CompleteCharacter, CompleteCharacterData, CompleteInventory, CompleteWallet,
