@@ -339,7 +339,11 @@ impl RetailDamageModel {
     /// The attacker's per-type PHYSICAL base **after** the defender's Armor Rating,
     /// before the swing/combo factor. [Phase 3.3 — see the module doc for why armor
     /// lands here and not after the multiplier.]
-    fn physical_base_after_armor(attacker: &Loadout, target: &Fighter) -> Vec<(DamageType, f32)> {
+    fn physical_base_after_armor(
+        attacker: &Loadout,
+        target: &Fighter,
+        now: Instant,
+    ) -> Vec<(DamageType, f32)> {
         let armor_rating = (target.loadout.armor_rating - attacker.armor_piercing_rating).max(0.0);
 
         // Scout / Armsman / Barbarian add flat damage for LIGHT / VERSATILE / HEAVY
@@ -348,6 +352,21 @@ impl RetailDamageModel {
         // Applied to the FIRST physical component only: the perk is "+{0} Damage
         // with <class> weapons", one bonus per swing, not one per damage type.
         let mut weapon_bonus = attacker.perks.weapon_bonus(attacker.weapon.weight);
+
+        // PDOC — `Opportunist Physical`, "Increases physical damage by {0} against
+        // targets suffering a condition". Added HERE, to the base, so the combo and
+        // crit multipliers in `swing_components` multiply it. That placement is the
+        // whole point: retail accumulates situational ADDITIVES into the base and then
+        // applies the factors, so on a deep combo a flat 25.2 is worth ~104. Adding it
+        // in `finish_resolved` step 0 instead — the obvious spot, next to the other
+        // flat bonuses — would land it AFTER the multiplier and discard most of it.
+        //
+        // One bonus per swing, not one per damage type: same rule as `weapon_bonus`.
+        let mut pdoc = if attacker.opportunist_physical > 0.0 && target.is_conditioned(now) {
+            attacker.opportunist_physical
+        } else {
+            0.0
+        };
 
         attacker
             .weapon
@@ -358,6 +377,10 @@ impl RetailDamageModel {
                 if is_physical(*ty) && weapon_bonus > 0.0 {
                     base += weapon_bonus;
                     weapon_bonus = 0.0;
+                }
+                if is_physical(*ty) && pdoc > 0.0 {
+                    base += pdoc;
+                    pdoc = 0.0;
                 }
                 let cut = if is_physical(*ty) {
                     tables::armor_reduction(base, armor_rating)
@@ -376,12 +399,13 @@ impl RetailDamageModel {
         active_side: ActiveSide,
         swing_factor: f32,
         combo_count: u32,
+        now: Instant,
     ) -> Vec<(DamageType, f32)> {
         let weight = attacker.weapon.weight.unwrap_or(tables::Weight::Light);
         let scale = swing_multiplier(weight, combo_count, active_side) * swing_factor;
 
         let mut components: Vec<(DamageType, f32)> = Vec::new();
-        for (ty, base) in Self::physical_base_after_armor(attacker, target) {
+        for (ty, base) in Self::physical_base_after_armor(attacker, target, now) {
             components.push((ty, base * scale));
         }
         // Enchant tracks: independent of the physical combo roll (capture-validated,
@@ -394,12 +418,32 @@ impl RetailDamageModel {
         // "Stacked" is the same element carried by more than one equipped
         // enchantment; a lone enchantment is not stacked and gets nothing.
         let synergy = attacker.perks.enchantment_synergy;
+        // EDOC — `Opportunist Elemental`. Same gate as PDOC, but it lands on the
+        // enchant track, which sits OUTSIDE `scale`. So elemental damage does not
+        // scale with crit/combo while physical does — the asymmetry the community
+        // guides describe, and it falls out of the existing structure rather than
+        // being imposed.
+        let edoc = if attacker.opportunist_elemental > 0.0 && target.is_conditioned(now) {
+            attacker.opportunist_elemental
+        } else {
+            0.0
+        };
+        let mut edoc_left = edoc;
         for (ench_ty, magnitude) in enchant_tracks(attacker) {
-            let amp = target.element_amp_for(ench_ty) * (1.0 + fortify_for(attacker, ench_ty));
+            // Fortify is a FLAT add and is paid once per hit in `finish_resolved`
+            // step 0, alongside the Augmented* perks it shares its shape with — not
+            // as a multiplier here, and not once per enchant track.
+            let amp = target.element_amp_for(ench_ty);
             let stacked = synergy > 0.0
                 && attacker.enchants.iter().filter(|(t, _)| *t == ench_ty).count() > 1;
             let synergy_mult = if stacked { 1.0 + synergy } else { 1.0 };
-            components.push((ench_ty, magnitude * amp * synergy_mult));
+            let mut v = magnitude * amp * synergy_mult;
+            // Once per swing, on the first elemental track, mirroring PDOC.
+            if edoc_left > 0.0 {
+                v += edoc_left;
+                edoc_left = 0.0;
+            }
+            components.push((ench_ty, v));
         }
         components
     }
@@ -454,7 +498,7 @@ impl DamageModel for RetailDamageModel {
         now: Instant,
     ) -> ResolvedDamage {
         let mut components =
-            Self::swing_components(attacker, target, active_side, swing_factor, combo_count);
+            Self::swing_components(attacker, target, active_side, swing_factor, combo_count, now);
         finish_resolved(attacker, target, source, active_side, &mut components, now, 1.0)
     }
 
@@ -542,6 +586,7 @@ impl DamageModel for RetailDamageModel {
         // — so copying them is the complete fix and touches nothing else.
         let mut caster_loadout = Loadout::default();
         caster_loadout.perks = caster.perks.clone();
+        caster_loadout.element_fortify = caster.element_fortify.to_vec();
         caster_loadout.elem_resist_piercing = caster.elem_resist_piercing;
         caster_loadout.elem_resist_piercing_rating = caster.elem_resist_piercing_rating;
         // The ABILITY's own `_elementalResistancePiercing`, the same field the weapon
@@ -747,10 +792,20 @@ fn finish_resolved(
     //    a DoT: it re-enters here once per 0.2 s tick, so a per-tick flat bonus would
     //    pay the perk 15 times for one cast.
     let single_impact = !continuous && source != DamageSource::ContinuousSpell;
-    if single_impact && !attacker.perks.element_damage.is_empty() {
+    // `Fortify <Element> Damage` gear joins the Augmented* perks here. Same shipped
+    // shape ("Increases frost damage by {0}", no percent), so same treatment: a flat
+    // add, once per hit, on the SHARED path — which is the fix. It used to be read in
+    // exactly one place, inside `swing_components`, reachable only from the weapon
+    // path. Every damaging spell is elemental, so a frost build's Fortify Frost was
+    // discarded on 100% of its spells. A tier-10 suffix is 137.32 against
+    // AugmentedFrost's 18.60 — 7.4x the perk, applied to nothing.
+    //
+    // `single_impact` keeps a 15-tick channel from paying it 15 times, exactly as it
+    // already does for the perks.
+    if single_impact {
         for (ty, v) in components.iter_mut() {
             if is_elemental(*ty) && *v > 0.0 {
-                *v += attacker.perks.element_bonus(*ty);
+                *v += attacker.perks.element_bonus(*ty) + fortify_for(attacker, *ty);
             }
         }
     }
@@ -901,6 +956,131 @@ mod tests {
     /// An un-armored, un-blocking L100 target.
     pub(super) fn target() -> Fighter {
         Fighter::new(1, 565, Loadout { level: 100, ..Default::default() }, Instant::now())
+    }
+
+    /// A target suffering an elemental condition — the PDOC/EDOC gate.
+    pub(super) fn conditioned_target(now: Instant) -> Fighter {
+        use crate::arena::combat::state::{ActiveEffect, StatusEffectType};
+        let mut f = target();
+        f.effects.push(ActiveEffect {
+            effect: StatusEffectType::Poisoned,
+            damage_type: DamageType::Poison,
+            value: 0.0,
+            per_tick_damage: 0.0,
+            expires_at: now + Duration::from_secs(5),
+            last_tick: now,
+            is_transient_resist: false,
+        });
+        f
+    }
+
+    /// THE PDOC PLACEMENT — the thing the owner flagged: "There is a special thing
+    /// about PDOC in how it applies to critical hits which really makes for a lot of
+    /// damage."
+    ///
+    /// PDOC is added to the physical BASE, so the combo and crit multipliers multiply
+    /// it. Adding it in `finish_resolved` step 0 instead — the obvious spot, beside the
+    /// other flat bonuses — would land it AFTER the multiplier and discard most of it.
+    ///
+    /// A single hit cannot tell the two apart. Comparing TWO combo depths can: if PDOC
+    /// is pre-multiplier the gain scales with the combo factor; if post-multiplier the
+    /// gain is the same flat number at every depth.
+    #[test]
+    fn pdoc_scales_with_the_combo_multiplier() {
+        let m = RetailDamageModel;
+        let now = Instant::now();
+        const PDOC: f32 = 25.20; // the SHIPPED OpportunistPhysical t10
+
+        let gain_at = |combo: u32| -> f32 {
+            let mut with = poison_dagger();
+            with.opportunist_physical = PDOC;
+            let without = poison_dagger();
+            let a = comp(&m.resolve_attack(&with, &conditioned_target(now),
+                DamageSource::Attack, ActiveSide::Left, 1.0, combo, now), DamageType::Slashing);
+            let b = comp(&m.resolve_attack(&without, &conditioned_target(now),
+                DamageSource::Attack, ActiveSide::Left, 1.0, combo, now), DamageType::Slashing);
+            a - b
+        };
+
+        let shallow = gain_at(0);
+        let deep = gain_at(3);
+        assert!(shallow > 0.0, "PDOC must contribute at all, got {shallow}");
+        assert!(
+            deep > shallow * 1.5,
+            "PDOC must be MULTIPLIED by the combo: depth-0 gain {shallow:.1} vs \
+             depth-3 gain {deep:.1}. Equal gains mean it landed after the multiplier."
+        );
+    }
+
+    /// The gate. `_triggerStatusEffects = [4,5,6,7]` in the shipped asset — Burning,
+    /// Frozen, Enervated, Poisoned. An unconditioned target pays nothing.
+    #[test]
+    fn pdoc_pays_nothing_against_an_unconditioned_target() {
+        let m = RetailDamageModel;
+        let now = Instant::now();
+        let mut a = poison_dagger();
+        a.opportunist_physical = 25.20;
+        let with = comp(&m.resolve_attack(&a, &target(),
+            DamageSource::Attack, ActiveSide::Left, 1.0, 0, now), DamageType::Slashing);
+        let without = comp(&m.resolve_attack(&poison_dagger(), &target(),
+            DamageSource::Attack, ActiveSide::Left, 1.0, 0, now), DamageType::Slashing);
+        assert!((with - without).abs() < 0.01, "no condition, no PDOC");
+    }
+
+    /// Staggered / Blind / Paralyzed are NOT in `_triggerStatusEffects`, so they must
+    /// not arm it — a distinction that would be invisible without the extracted asset.
+    #[test]
+    fn pdoc_is_not_armed_by_stagger_or_paralysis() {
+        use crate::arena::combat::state::{ActiveEffect, StatusEffectType};
+        let m = RetailDamageModel;
+        let now = Instant::now();
+        for effect in [StatusEffectType::Staggered, StatusEffectType::Paralyzed, StatusEffectType::Blind] {
+            let mut t = target();
+            t.effects.push(ActiveEffect {
+                effect,
+                damage_type: DamageType::None,
+                value: 0.0,
+                per_tick_damage: 0.0,
+                expires_at: now + Duration::from_secs(5),
+                last_tick: now,
+                is_transient_resist: false,
+            });
+            let mut a = poison_dagger();
+            a.opportunist_physical = 25.20;
+            let with = comp(&m.resolve_attack(&a, &t,
+                DamageSource::Attack, ActiveSide::Left, 1.0, 0, now), DamageType::Slashing);
+            let without = comp(&m.resolve_attack(&poison_dagger(), &t,
+                DamageSource::Attack, ActiveSide::Left, 1.0, 0, now), DamageType::Slashing);
+            assert!(
+                (with - without).abs() < 0.01,
+                "{effect:?} is not one of the shipped triggers [4,5,6,7] — it must not arm PDOC"
+            );
+        }
+    }
+
+    /// EDOC lands on the enchant track, which sits OUTSIDE the combo/crit multiplier.
+    /// So elemental damage does NOT scale with crit while physical does — the
+    /// asymmetry the community guides describe, falling out of the existing structure.
+    #[test]
+    fn edoc_does_not_scale_with_the_combo_multiplier() {
+        let m = RetailDamageModel;
+        let now = Instant::now();
+        let gain_at = |combo: u32| -> f32 {
+            let mut with = poison_dagger();
+            with.opportunist_elemental = 25.20;
+            let a = comp(&m.resolve_attack(&with, &conditioned_target(now),
+                DamageSource::Attack, ActiveSide::Left, 1.0, combo, now), DamageType::Poison);
+            let b = comp(&m.resolve_attack(&poison_dagger(), &conditioned_target(now),
+                DamageSource::Attack, ActiveSide::Left, 1.0, combo, now), DamageType::Poison);
+            a - b
+        };
+        let shallow = gain_at(0);
+        let deep = gain_at(3);
+        assert!(shallow > 0.0, "EDOC must contribute, got {shallow}");
+        assert!(
+            (deep - shallow).abs() < 0.5,
+            "EDOC must NOT be multiplied by the combo: {shallow:.1} vs {deep:.1}"
+        );
     }
 
     fn comp(rd: &ResolvedDamage, ty: DamageType) -> f32 {
@@ -1056,6 +1236,97 @@ mod tests {
         wall.loadout.resistances = vec![(DamageType::Poison, 100_000.0)];
         let rd3 = m.resolve_attack(&poison_dagger(), &wall, DamageSource::Attack, ActiveSide::Right, 1.0, 0, now);
         assert!((comp(&rd3, DamageType::Poison) - 137.32 * 0.05).abs() < 0.5);
+    }
+
+    /// THE FORTIFY BUG — EDIR's twin, on the same frost build.
+    ///
+    /// `Fortify <Element> Damage` was read in exactly ONE place: inside
+    /// `swing_components`, reachable only from `resolve_attack`. `resolve_ability`
+    /// never calls it, and the `caster_loadout` it built left `element_fortify` empty
+    /// — two independent reasons a spell could never see it. Every damaging spell in
+    /// the shipped table is elemental, so a frost build's Fortify Frost was discarded
+    /// on 100% of its spells.
+    ///
+    /// Scale: a tier-10 suffix is 137.32 against AugmentedFrost's 18.60 — 7.4x the
+    /// perk, applied to nothing.
+    #[test]
+    fn fortify_element_applies_to_spells_not_only_weapons() {
+        let m = RetailDamageModel;
+        let now = Instant::now();
+        // Fireball is the module's standing reference spell; the bug is path-shaped,
+        // not element-specific, so any elemental spell exercises it.
+        let spell = gamedata::ids::FIREBALL;
+
+        let bare = m.resolve_ability(
+            spell, 1, &crate::arena::combat::perks::CasterPerks::none(), &target(), ActiveSide::Middle, now);
+
+        let fortify = vec![(DamageType::Fire, 137.32_f32)];
+        let perks = crate::arena::combat::perks::PerkBonuses::default();
+        let fortified_caster = crate::arena::combat::perks::CasterPerks {
+            perks: &perks,
+            magicka_full: false,
+            health_critical: false,
+            elem_resist_piercing: 0.0,
+            elem_resist_piercing_rating: 0.0,
+            element_fortify: &fortify,
+        };
+        let fortified = m.resolve_ability(
+            spell, 1, &fortified_caster, &target(), ActiveSide::Middle, now);
+
+        let gain = comp(&fortified, DamageType::Fire) - comp(&bare, DamageType::Fire);
+        assert!(
+            (gain - 137.32).abs() < 0.5,
+            "Fortify must add its flat 137.32 to a SPELL, got {gain}"
+        );
+    }
+
+    /// It is a FLAT add, not a multiplier. The shipped text is "Increases frost damage
+    /// by {0}." with no percent sign, where `Haste` beside it reads "{0}%".
+    ///
+    /// The old code stored a `curve_fraction` and applied `(1.0 + f) x`. At tier 10
+    /// that coincides exactly with the flat value — the weapon-enchant base and the
+    /// fortify magnitude share one curve — which is why the bug survived. At tier 8 it
+    /// under-paid by about a third, and with no matching weapon enchant it paid zero.
+    #[test]
+    fn fortify_element_is_flat_not_a_multiplier() {
+        let m = RetailDamageModel;
+        let now = Instant::now();
+        // Two attackers differing ONLY in the size of their poison enchant track.
+        let mk = |ench_tier: u8| {
+            let mut a = poison_dagger();
+            a.element_fortify = vec![(DamageType::Poison, 89.74)]; // tier 8
+            a.enchants = vec![(DamageType::Poison, ench_tier)];
+            a
+        };
+        let small = m.resolve_attack(
+            &mk(4), &target(), DamageSource::Attack, ActiveSide::Right, 1.0, 0, now);
+        let large = m.resolve_attack(
+            &mk(10), &target(), DamageSource::Attack, ActiveSide::Right, 1.0, 0, now);
+
+        // A flat add contributes the SAME amount to both. A multiplier would scale
+        // with the track it multiplies, so the gap would differ.
+        let base_small = comp(&small, DamageType::Poison);
+        let base_large = comp(&large, DamageType::Poison);
+        let mut nofort4 = mk(4);
+        nofort4.element_fortify.clear();
+        let mut nofort10 = mk(10);
+        nofort10.element_fortify.clear();
+        let plain_small = comp(&m.resolve_attack(
+            &nofort4, &target(), DamageSource::Attack, ActiveSide::Right, 1.0, 0, now), DamageType::Poison);
+        let plain_large = comp(&m.resolve_attack(
+            &nofort10, &target(), DamageSource::Attack, ActiveSide::Right, 1.0, 0, now), DamageType::Poison);
+
+        let gain_small = base_small - plain_small;
+        let gain_large = base_large - plain_large;
+        assert!(
+            (gain_small - gain_large).abs() < 0.5,
+            "a flat add pays the same regardless of the track it sits on: \
+             {gain_small} vs {gain_large}"
+        );
+        assert!(
+            (gain_small - 89.74).abs() < 0.5,
+            "and it pays its own magnitude, got {gain_small}"
+        );
     }
 
     /// WEAKNESS is a separate flat INCREASE, capped at ×1 of the component — it no
