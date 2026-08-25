@@ -1072,7 +1072,28 @@ pub(super) fn resolve_ability_cast(
         .iter()
         .find(|a| a.instance_uuid == ea.ability_uuid)
         .map(|a| (a.level, a.tag))
-        .unwrap_or((1, super::state::AbilityTag::Generic));
+        .unwrap_or_else(|| {
+            // A miss used to fall through silently to `Generic`, which routes to the
+            // DAMAGE arm — so an unrecognised cast was treated as a DAMAGE SPELL and
+            // fired at the opponent for whatever the model returned. Nothing said so in
+            // the log, which is why the reported "0 damage effect on the opponent" was
+            // undiagnosable from outside.
+            //
+            // Classify from gamedata instead. A cast carrying a TEMPLATE uuid now routes
+            // correctly — a maneuver stays a maneuver rather than becoming a spell, which
+            // matters because a maneuver's damage comes from the WEAPON and it ships no
+            // ability damage field of its own. An instance uuid gamedata cannot resolve
+            // still lands on `Generic`, and the `ships_damage` guard below then stops it
+            // fabricating a hit.
+            let tag = super::loadout::ability_tag_for_template(&ea.ability_uuid);
+            debug!(
+                "combat: slot {sender} cast ability {} — not in the equipped loadout \
+                 ({} equipped); classified from gamedata as {tag:?} at level 1",
+                ea.ability_uuid,
+                combat.fighters[sender].loadout.abilities.len(),
+            );
+            (1, tag)
+        });
 
     // Resource gate (spec §1, bug 2): reject the cast (no effect, no cooldown set,
     // no damage) if the caster lacks the required stamina (maneuvers) or magicka
@@ -1367,6 +1388,22 @@ fn apply_ability_impact(
             last_hit_total = resolved.total;
             block_flags = resolved.flags;
             out.extend(emit_damage(combat, sender, target_slot, &resolved, now));
+        }
+        AbilityTag::Paralyze | AbilityTag::Damage | AbilityTag::Generic
+            if !super::damage::ships_damage(ability_uuid, level) =>
+        {
+            // This ability ships neither `_damage` nor `_damagePerSecond`. Resolving it
+            // as a hit yields exactly 0.0, and `emit_damage` has no zero guard — it puts
+            // an op50 on the wire addressed to the TARGET, so the opponent wears a
+            // floating `0` for a buff that was cast on the caster.
+            //
+            // Fall through to `apply_shipped_effects` below, which every arm reaches:
+            // whatever defensive or control fields the rank DOES ship still apply. The
+            // cast keeps its cost and cooldown. It simply stops pretending to be a hit.
+            debug!(
+                "combat: slot {sender} ability {ability_uuid} (tag {tag:?}) ships no \
+                 damage number — no op50 emitted (buff or mis-tagged cast)",
+            );
         }
         AbilityTag::Paralyze | AbilityTag::Damage | AbilityTag::Generic => {
             let caster = super::perks::CasterPerks::of(&combat.fighters[sender]);
@@ -6438,6 +6475,119 @@ mod report_31_high_block_stun {
     /// `UI.Help.Skills.Description`: *"You do not get stunned when your ability
     /// attack is blocked high."* Driven through the real c2s cast path.
     #[test]
+    /// THE REPORTED BUG: "RE shows a 0 damage effect on the opponent."
+    ///
+    /// An ability shipping neither `_damage` nor `_damagePerSecond` used to be routed
+    /// through the damage model anyway, resolve to exactly 0.0, and be handed to
+    /// `emit_damage` — which has no zero guard and addresses op50 to the TARGET. So a
+    /// buff cast on yourself painted a floating `0` on your opponent.
+    ///
+    /// `MagickaSurge` and `EchoWeapon` are the shipped examples: `kind: Spell`,
+    /// `damage_type: None`, so they classify as `Generic` and land in the damage arm.
+    /// Red before the `ships_damage` guard — each emitted one op50 per viewer.
+    #[test]
+    fn a_buff_that_ships_no_damage_number_emits_no_damage_frame() {
+        for editor in ["MagickaSurge", "EchoWeapon"] {
+            let now = Instant::now();
+            let mut c = combat(now, 2);
+            // Above every shipped cost — MagickaSurge alone is 425, and the harness
+            // fighter's pool is 345, so `max_magicka` silently fails the resource gate
+            // and the cast never reaches the damage arm at all.
+            c.fighters[0].magicka = 100_000;
+            c.fighters[0].stamina = 100_000;
+            let out = super::on_c2s_input(&mut c, 0, &cast_frame(uuid_of(editor)), now);
+            assert!(
+                !out.is_empty(),
+                "precondition: {editor} must actually CAST — an empty frame list means \
+                 the resource gate rejected it and this test proves nothing"
+            );
+            assert_eq!(
+                op50_count(&out),
+                0,
+                "{editor} ships no damage number — it must not paint a 0 on the opponent"
+            );
+        }
+    }
+
+    /// Non-vacuity control for the guard above: an ability that DOES ship a damage
+    /// number must still hit. Without this, deleting the damage arm entirely would pass.
+    #[test]
+    fn an_ability_that_ships_damage_still_emits_its_damage_frame() {
+        let now = Instant::now();
+        let mut c = combat(now, 2);
+        c.fighters[0].magicka = c.fighters[0].max_magicka;
+        let cast = super::on_c2s_input(&mut c, 0, &cast_frame(uuid_of("IceSpike")), now);
+        // Ice Spike ships `ChannelDuration 1.12`, so the impact is SCHEDULED, not
+        // inline — the cast frame carries no op50 and the hit arrives on a later tick.
+        assert_eq!(op50_count(&cast), 0, "the wind-up defers the hit");
+        let landed = super::land_due_impacts(&mut c, now + Duration::from_millis(1200));
+        assert!(
+            op50_count(&landed) > 0,
+            "Ice Spike ships `_damage` — it must still land a hit once its wind-up ends"
+        );
+    }
+
+    /// The predicate itself, against the shipped table: damage spells and channels are
+    /// in, buffs are out, and an ability gamedata does not know at all is out — we have
+    /// no number for it, and a fabricated 0 is worse than silence.
+    #[test]
+    fn ships_damage_reads_the_shipped_table() {
+        use super::super::damage::ships_damage;
+        assert!(ships_damage(uuid_of("IceSpike"), 1), "direct damage");
+        assert!(ships_damage(uuid_of("Frostbite"), 1), "damage per second");
+        assert!(!ships_damage(uuid_of("MagickaSurge"), 1), "a buff");
+        assert!(!ships_damage(uuid_of("EchoWeapon"), 1), "a buff");
+        assert!(
+            !ships_damage("00000000-0000-0000-0000-000000000000", 1),
+            "an ability gamedata does not know"
+        );
+    }
+
+    /// A cast whose uuid is not in the equipped loadout used to be blindly relabelled
+    /// `Generic` — i.e. treated as a damage SPELL. A maneuver's damage comes from the
+    /// WEAPON and it ships no ability damage field, so under the `ships_damage` guard
+    /// that relabelling would have silently deleted every mis-looked-up bash. Classify
+    /// from gamedata instead, so a maneuver stays a maneuver.
+    ///
+    /// This is not hypothetical: `Loadout::default()` carries no abilities, so every
+    /// cast in this test module takes the fallback path.
+    #[test]
+    fn an_unknown_cast_is_classified_from_gamedata_not_assumed_to_be_a_spell() {
+        let now = Instant::now();
+        let mut c = combat(now, 2);
+        c.fighters[0].stamina = c.fighters[0].max_stamina;
+        assert!(
+            c.fighters[0].loadout.abilities.is_empty(),
+            "precondition: the lookup must miss, or this proves nothing"
+        );
+        let out = super::on_c2s_input(&mut c, 0, &cast_frame(uuid_of("ShieldBash")), now);
+        assert!(
+            op50_count(&out) > 0,
+            "a shield bash still lands its weapon hit — it must not be mistaken for a \
+             damage spell and then dropped for shipping no damage field"
+        );
+    }
+
+    /// op37 cast frame for `uuid` — the separator-anchored layout from `input.rs`.
+    fn cast_frame(uuid: &str) -> Vec<u8> {
+        let mut f = vec![
+            0xBE, 0x36, 0x04, 0x1F, 0x70, 0x77, 0x0A, 0x35, 0x02, 0x00, 0x00, 0x38, 0x03, 0x25,
+            0x24, 0x00,
+        ];
+        f.extend_from_slice(uuid.as_bytes());
+        f
+    }
+
+    fn op50_count(out: &[(usize, Vec<u8>)]) -> usize {
+        out.iter()
+            .filter(|(_, f)| {
+                f.len() > 2
+                    && f[1] == 0x36
+                    && arena_proto::parse_netdata(&f[2..]).int(3) == Some(50)
+            })
+            .count()
+    }
+
     fn a_maneuver_blocked_high_does_not_stun_its_caster() {
         let now = Instant::now();
         let mut c = combat(now, 2);
