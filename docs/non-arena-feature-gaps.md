@@ -44,7 +44,7 @@ representatively or left lenient — never invented silently.
 | **Loadouts** | `POST /loadouts/current`, `/loadouts/profiles/{n}` | ✅ Done | Equip/unequip (backpack↔slot), set ability slots, save named profiles. |
 | **Chests** | `POST /chests/{id}/collect` | ✅ Done* | Treasury model + collect grants loot, removes chest. *Loot is a representative capture-derived bundle (per-tier tables not captured). |
 | **Daily login reward** | `POST /towns/current/rewards/current`(+`/collect`) | ✅ Done | 7-reward 24h rotation (stackables or a chest), once per period. |
-| **Daily/Sigil quest events** | `POST /gameevents` | ✅ Done (advertise) | 32-event library; 2-3 active per day with current windows. **Playing** the event quest needs quest defs — see below. |
+| **Daily/Sigil quest events** | `POST /gameevents`, `gameEventQuests[]` in `POST /quests` | ✅ Done (playable) | 39-event library on its real 39-day recurrence / 2-day window; each open instance mints a per-character `GAME_EVENT` quest with objectives, dungeon data and its five milestone rewards. `gameEventQuestsInWarning` announces what opens within 24 h. `gameEventQuestsFinished` stays empty — the discriminator is not determinable from the corpus. See `docs/quest-and-event-model.md`. |
 | **Guild** | create/view/search/leaderboard/join/leave/kick/chat | ✅ Done | New tables; full social CRUD + typed message board. Exchange ("gift") deferred — see below. |
 | **Salvage** | `POST /salvages` | ✅ Done* | Remove gear → grant materials. *Representative yield (retail randomises). 122 recipes. |
 | **Repair** | `POST /repairs` | ✅ Done | Restores every listed item to max condition for its `(itemTemplateId, temperingLevel)` **and charges gold**, both from APK tables (`item_durability.json` + `repair_costs.json`, built by `script/extract_item_repair_data.py`). Replaces the capture-derived durability table that covered 218 of 1113 templates and silently left the rest damaged — tracker #30's "Repair all does not repair all". Treasury-held gear is still out of scope (our `Treasury` models only chests). |
@@ -52,7 +52,7 @@ representatively or left lenient — never invented silently.
 | **Crafting / temper / enchant** | `GET/POST /crafts`, `/crafts/{id}/finish` | ✅ Done* | Plain craft mints a timed job (`server_state.craft_jobs`); a `POST /crafts` carrying an `itemId` **tempers** (sets `temperingLevel`, keeps enchants) or **enchants** (applies a captured `ENCHANTING` outcome — `item_mod_recipes.json`, 23 recipes) an existing item, pulled into the job + re-added by `/finish`. *Input/gold cost lenient (not captured). |
 | **Guild exchange ("gift")** | `GET/POST /guilds/current/exchanges`(+`/donate`,`/redeem`) | ✅ Done | `guild_exchanges` table; create request, donate (debits donor stackable), redeem (credits requester the donated sum). |
 | **Abyss** | `POST /abysses/current`(+`/start`,`/update`,`/end`) | ⛔ Asset-blocked | Endless-dungeon generation must match the client (seed+defs); needs the **Unity asset export** (dungeon/floor defs) — see "Resources" note. |
-| **Event-quest *playing*** | (existing accept→dungeon→complete flow) | ⛔ Asset-blocked | `/gameevents` advertises the library; *playing* a quest needs `parsed.json` quest/dungeon defs so `generate_quest_data` matches the client — needs the **Unity asset export**. |
+| **Event-quest *playing*** | `gameEventQuests[]` → accept→dungeon→complete | ✅ Done | No longer asset-blocked: `parsed.json` now carries 171 quests / 417 dungeons, and all 39 event templates resolve in it with objective ids and `version` matching the captures exactly. |
 | **Town building** | `POST /towns/current/buildings`(+`/{id}/{upgrade,complete,destroy,styles/{id}}`,`/props`,`/name`) | ⛔ Documented | Capture-derivable but mutates the **opaque nested town JSONB** (`districts[].segments[].buildings[]`, client-validated) → high risk; outside the original stated scope. Shapes below. |
 
 ## Resources & the asset-export blocker
@@ -95,9 +95,23 @@ features become implementable.
 - `POST /towns/current/buildings` (place), `/{id}/upgrade`, `/{id}/complete`, `/{id}/destroy`, `/{id}/styles/{styleId}`, `/props`, `/name`.
 - **Plan**: model the town JSONB (currently served verbatim as opaque `Value`) into a structured `Town` with buildings; place/upgrade cost gold + grant townXp, with a build timer (gems = instant). This is the main townXp sink (townXp is currently only echoed in rewards).
 
-### Event-quest playing (quest definitions)
-- `/gameevents` now advertises the event library and the quest accept→dungeon→complete flow exists, **but** `GameData` (`deploy/static/parsed.json`) is a 67-byte stub, so accepting/playing a quest with no definition fails.
-- **Plan**: extend `extract_static_data.py` to derive `parsed.json` quest/dungeon definitions (objectives, rewards, spawn/loot) from `quests/{id}/accept` + `dungeons/current/exit` captures, so both event quests and regular quests become playable for non-imported characters. High value, unblocks the whole quest loop.
+### Event-quest playing (quest definitions) — DONE
+
+`parsed.json` is no longer a 67-byte stub: it carries 171 quests, 417 dungeons, 1113
+item templates and 63 interactables. 165 of the 171 quests resolve to a real dungeon
+(the other 6 are the nil-dungeon dialogue "daily job" quests, handled explicitly);
+all 39 event templates resolve, with objective ids and `version` matching the retail
+captures exactly. Event quests, ordinary quests and their rewards are wired — see
+`docs/quest-and-event-model.md`.
+
+Still open in the quest area:
+- **Town jobs are listed but not enterable** — `enter_quest_dungeon` 404s for a
+  runtime-generated job. All 17 dungeon templates the job generator uses DO exist in
+  `parsed.json`, so synthesising the dungeon from `jobSetup` is tractable.
+- **Enemy level lacks the per-spawn-group cap**, so quests are harder than retail
+  above ~level 40.
+- **29 of 171 quests have no captured completion reward** and pay nothing (logged).
+  They need a capture, not a guessed constant.
 
 ## Testing (no server/DB)
 
