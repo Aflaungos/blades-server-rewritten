@@ -40,6 +40,7 @@ use uuid::Uuid;
 
 use crate::{
     BladeApiError, ServerGlobal,
+    arena::arena_season::{self, SeasonConfig},
     arena::matchmaker::{RecentTicketView, query_recent_matches},
     json_db::JsonDbWrapper,
     models::{CharacterDbAlone, CharacterDbEntry, QuestDbEntry, UserDBEntry},
@@ -412,6 +413,167 @@ pub async fn recent_devices(
     .await
     .map_err(|_| BladeApiError::new(StatusCode::INTERNAL_SERVER_ERROR, IMPORT_SERVICE_ID, 11))?;
     Ok(Json(rows))
+}
+
+
+// ------------------------------------------------------------ arena season
+
+/// `POST /…/api/dev/v1/arena-season-rollover` request.
+///
+/// **Defaults to a dry run.** The rollover zeroes every player's trophies, so it
+/// only writes when the caller explicitly says `"apply": true` — a missing or
+/// mistyped field reports what would happen and changes nothing.
+#[derive(Deserialize, Debug, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SeasonRolloverRequest {
+    /// Write the changes. Absent or false = report only.
+    #[serde(default)]
+    pub apply: bool,
+    /// Roll into this season id instead of the one this build calls current.
+    /// Only useful for re-running an older rollover; normally omitted.
+    #[serde(default)]
+    pub season_id: Option<Uuid>,
+}
+
+/// What the rollover did (or would do).
+#[derive(Serialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct SeasonRolloverResponse {
+    /// False when this was a dry run.
+    pub applied: bool,
+    /// The season everyone was rolled into.
+    pub season_id: Uuid,
+    /// Its human-facing number.
+    pub season_number: u32,
+    /// Characters examined.
+    pub characters_seen: usize,
+    /// Characters whose counters were (or would be) zeroed.
+    pub characters_reset: usize,
+    /// Of those, how many had a previous season to file into `pvpSeasonHistory`.
+    pub characters_archived: usize,
+    /// Characters already in this season — left untouched.
+    pub characters_already_current: usize,
+    /// Rows whose `character` JSONB would not deserialize; skipped, never written.
+    pub characters_unreadable: usize,
+    /// The largest standing that was archived, as a sanity line for the operator.
+    pub highest_archived_trophies: i64,
+}
+
+/// One `characters` row, narrowed to what the rollover touches.
+#[derive(diesel::QueryableByName)]
+struct SeasonRolloverRow {
+    #[diesel(sql_type = diesel::sql_types::Uuid)]
+    id: Uuid,
+    #[diesel(sql_type = diesel::sql_types::Jsonb)]
+    character: Value,
+}
+
+/// `POST /…/api/dev/v1/arena-season-rollover` — close the season every character
+/// is in and open the current one.
+///
+/// For each character: archive its live PvP block into `pvpSeasonHistory` under
+/// the season it was in, zero every live PvP counter, and stamp the new
+/// `pvpSeasonId`. See `arena::arena_season` for the capture evidence behind that
+/// behaviour, and `docs/arena-season-model.md` for how to run this.
+///
+/// Idempotent by construction: a character already stamped with the target
+/// season is skipped, so re-running after a partial failure resumes rather than
+/// wiping the players it already moved.
+#[post("/blades.bgs.services/api/dev/v1/arena-season-rollover")]
+pub async fn arena_season_rollover(
+    req: HttpRequest,
+    app_state: web::Data<Arc<ServerGlobal>>,
+    body: Option<web::Json<SeasonRolloverRequest>>,
+) -> Result<Json<SeasonRolloverResponse>, BladeApiError> {
+    check_import_token(&app_state, &req)?;
+    let body = body.map(|b| b.into_inner()).unwrap_or_default();
+
+    let season: &SeasonConfig = match body.season_id {
+        Some(id) => arena_season::SEASONS
+            .iter()
+            .find(|s| s.id == id)
+            .ok_or_else(|| BladeApiError::new(StatusCode::BAD_REQUEST, IMPORT_SERVICE_ID, 12))?,
+        None => arena_season::season_at(arena_season::now_unix())
+            .or_else(|| arena_season::SEASONS.last())
+            .ok_or_else(|| {
+                BladeApiError::new(StatusCode::SERVICE_UNAVAILABLE, IMPORT_SERVICE_ID, 13)
+            })?,
+    };
+
+    let mut conn = app_state.db_pool.get().await.unwrap();
+    let rows: Vec<SeasonRolloverRow> =
+        diesel::sql_query("SELECT id, character FROM characters ORDER BY id")
+            .get_results(&mut conn)
+            .await
+            .map_err(|e| {
+                warn!("season rollover: could not read characters: {e}");
+                BladeApiError::new(StatusCode::INTERNAL_SERVER_ERROR, IMPORT_SERVICE_ID, 14)
+            })?;
+
+    let mut resp = SeasonRolloverResponse {
+        applied: body.apply,
+        season_id: season.id,
+        season_number: season.number,
+        characters_seen: rows.len(),
+        characters_reset: 0,
+        characters_archived: 0,
+        characters_already_current: 0,
+        characters_unreadable: 0,
+        highest_archived_trophies: 0,
+    };
+
+    for row in rows {
+        let mut ch: CompleteCharacter = match serde_json::from_value(row.character.clone()) {
+            Ok(c) => c,
+            Err(e) => {
+                warn!("season rollover: character {} does not deserialize: {e}", row.id);
+                resp.characters_unreadable += 1;
+                continue;
+            }
+        };
+        let standing = ch.pvp_trophies;
+        let outcome = arena_season::roll_character_into(&mut ch, season);
+        if !outcome.reset {
+            resp.characters_already_current += 1;
+            continue;
+        }
+        resp.characters_reset += 1;
+        if outcome.archived_under.is_some() {
+            resp.characters_archived += 1;
+            resp.highest_archived_trophies = resp.highest_archived_trophies.max(standing);
+        }
+
+        if !body.apply {
+            continue;
+        }
+        let updated = serde_json::to_value(&ch).map_err(|e| {
+            warn!("season rollover: character {} does not serialize: {e}", row.id);
+            BladeApiError::new(StatusCode::INTERNAL_SERVER_ERROR, IMPORT_SERVICE_ID, 15)
+        })?;
+        diesel::sql_query("UPDATE characters SET character = $1 WHERE id = $2")
+            .bind::<diesel::sql_types::Jsonb, _>(updated)
+            .bind::<diesel::sql_types::Uuid, _>(row.id)
+            .execute(&mut conn)
+            .await
+            .map_err(|e| {
+                warn!("season rollover: write failed for character {}: {e}", row.id);
+                BladeApiError::new(StatusCode::INTERNAL_SERVER_ERROR, IMPORT_SERVICE_ID, 16)
+            })?;
+    }
+
+    log::info!(
+        "arena season rollover ({}) into season {} (#{}) — seen {}, reset {}, archived {}, \
+         already current {}, unreadable {}",
+        if body.apply { "APPLIED" } else { "dry run" },
+        resp.season_id,
+        resp.season_number,
+        resp.characters_seen,
+        resp.characters_reset,
+        resp.characters_archived,
+        resp.characters_already_current,
+        resp.characters_unreadable,
+    );
+    Ok(Json(resp))
 }
 
 #[cfg(test)]
