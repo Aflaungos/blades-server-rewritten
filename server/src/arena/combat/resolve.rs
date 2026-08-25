@@ -2504,6 +2504,13 @@ fn apply_channel_ticks(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Ve
                 combat.fighters[caster].health,
                 combat.fighters[caster].max_health,
             ),
+            // Each channel TICK re-enters the damage model, so EDIR has to be carried
+            // here too — otherwise a frost build's Elemental Damage Ignores Resistance
+            // would apply to the first tick and to nothing after it.
+            elem_resist_piercing: combat.fighters[caster].loadout.elem_resist_piercing,
+            elem_resist_piercing_rating: combat.fighters[caster]
+                .loadout
+                .elem_resist_piercing_rating,
         };
         let resolved = RetailDamageModel.resolve_ability(
             &uuid,
@@ -4789,6 +4796,121 @@ mod tests {
     /// also pins the SCHEDULE, which is where the first cut was wrong — advancing
     /// `next_tick_at` from the delivery instant instead of the scheduled one let slack
     /// compound, dropping 4 of 15 ticks and stretching a 3.0 s channel to 3.6 s.
+    /// THE REPORTED BUG: "Frostbite and Ice spike quite surely damage too little."
+    ///
+    /// Every other frost test in this module fires at a defender with ZERO resistance
+    /// — `make_prod_scale_combat` uses `starter()`, which pushes no `resistances` entry
+    /// — which is precisely why the suite was blind to this. Give the target one
+    /// Resist Frost affix and the old model collapsed the whole channel to ~14 damage:
+    /// `resistance_reduction` subtracts a FLAT rating, and a channel re-entered it once
+    /// per tick, 15 times, slamming every tick into the 95% cap.
+    ///
+    /// The captures disagree, and they are the same captures this model was built from:
+    /// 118 ContinuousSpell frames across s615+s616 carry per-tick magnitudes of
+    /// 39.33-45.00, i.e. `dps x 0.2` with nothing subtracted. A defender with a t4
+    /// resist could not have produced a 44.997 tick under the old model — the ceiling
+    /// was 2.25.
+    #[test]
+    fn report31_frost_resistance_is_charged_once_per_cast_not_once_per_tick() {
+        use super::super::gamedata;
+        use super::super::state::DamageType;
+        let r = gamedata::ability_rank_clamped(FROSTBITE_UUID, FROSTBITE_RANK as u16)
+            .expect("Frostbite rank 4 is in the shipped table");
+        let dps = r.damage_per_second().expect("Frostbite ships damagePerSecond");
+        let channel = r
+            .get(gamedata::AbilityField::ChannelMaxLength)
+            .expect("Frostbite ships channelMaxLength");
+        let unresisted = dps * channel;
+
+        // One Resist Frost t4 affix, as resolved by loadout.rs (1941 x 0.018090).
+        const RATING: f32 = 35.11;
+
+        let now = Instant::now();
+        let mut combat = make_prod_scale_combat(now);
+        combat.fighters[1].loadout.resistances = vec![(DamageType::Frost, RATING)];
+
+        let mut out = cast_frostbite(&mut combat, now);
+        out.extend(run_channel(&mut combat, now));
+        let dmg = damage_frames(&out);
+        let viewers = combat.fighters.len();
+        let frost: f32 = dmg
+            .iter()
+            .filter(|(src, _, _)| *src == super::super::state::DamageSource::ContinuousSpell as u8)
+            .flat_map(|(_, _, comps)| comps.iter())
+            .filter(|(t, _)| *t == 5)
+            .map(|(_, v)| *v)
+            .sum::<f32>()
+            / viewers as f32;
+
+        // The whole channel pays the resistance ONCE, the same as a single hit of the
+        // same total would. `continuous` also applies the shipped 0.75 effectiveness.
+        let expected_loss = RATING
+            * gamedata::combat_params::REDUCTION_PER_RESISTANCE_RATING
+            * gamedata::combat_params::CONTINUOUS_DAMAGE_RESISTANCE_EFFECTIVENESS;
+        assert!(
+            (frost - (unresisted - expected_loss)).abs() < 1.0,
+            "a resisted Frostbite channel must lose the rating ONCE ({expected_loss:.1} off \
+             {unresisted:.1}), got {frost:.1}"
+        );
+        // The load-bearing half: it must not be the old ~14.
+        assert!(
+            frost > unresisted * 0.75,
+            "one resist affix must not delete the spell — {frost:.1} of {unresisted:.1}"
+        );
+    }
+
+    /// EDIR — "Elemental Damage Ignores Resistance" — must work on elemental SPELLS.
+    ///
+    /// It did not. `resolve_ability` built a `Loadout::default()` and copied only the
+    /// caster's perks, so `elem_resist_piercing_rating` was 0 on every spell and every
+    /// channel tick. A frost build wearing four EDIR pieces got nothing from any of
+    /// them; the WEAPON path (`resolve.rs`, which clones the real loadout) had honoured
+    /// them the whole time. Reported by a player running exactly that build.
+    #[test]
+    fn edir_gear_pierces_resistance_on_a_frost_channel() {
+        use super::super::gamedata;
+        use super::super::state::DamageType;
+        const RATING: f32 = 35.11; // one Resist Frost t4 affix on the defender
+
+        let channel_frost = |edir: f32| -> f32 {
+            let now = Instant::now();
+            let mut combat = make_prod_scale_combat(now);
+            combat.fighters[1].loadout.resistances = vec![(DamageType::Frost, RATING)];
+            combat.fighters[0].loadout.elem_resist_piercing_rating = edir;
+            let mut out = cast_frostbite(&mut combat, now);
+            out.extend(run_channel(&mut combat, now));
+            let viewers = combat.fighters.len();
+            damage_frames(&out)
+                .iter()
+                .filter(|(src, _, _)| {
+                    *src == super::super::state::DamageSource::ContinuousSpell as u8
+                })
+                .flat_map(|(_, _, comps)| comps.iter())
+                .filter(|(t, _)| *t == 5)
+                .map(|(_, v)| *v)
+                .sum::<f32>()
+                / viewers as f32
+        };
+
+        let bare = channel_frost(0.0);
+        let pierced = channel_frost(RATING); // enough EDIR to cancel the affix
+
+        assert!(
+            pierced > bare,
+            "EDIR must raise damage through resistance: {pierced:.1} vs {bare:.1}"
+        );
+
+        let r = gamedata::ability_rank_clamped(FROSTBITE_UUID, FROSTBITE_RANK as u16)
+            .expect("Frostbite rank 4");
+        let unresisted = r.damage_per_second().expect("dps")
+            * r.get(gamedata::AbilityField::ChannelMaxLength).expect("channel");
+        assert!(
+            (pierced - unresisted).abs() < 1.0,
+            "EDIR equal to the defender's rating should fully cancel it: {pierced:.1} vs \
+             {unresisted:.1} unresisted"
+        );
+    }
+
     #[test]
     fn report31_frostbite_streams_evenly_over_its_channel() {
         use super::super::gamedata;

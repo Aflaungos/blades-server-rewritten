@@ -455,7 +455,7 @@ impl DamageModel for RetailDamageModel {
     ) -> ResolvedDamage {
         let mut components =
             Self::swing_components(attacker, target, active_side, swing_factor, combo_count);
-        finish_resolved(attacker, target, source, active_side, &mut components, now)
+        finish_resolved(attacker, target, source, active_side, &mut components, now, 1.0)
     }
 
     fn resolve_ability(
@@ -527,17 +527,43 @@ impl DamageModel for RetailDamageModel {
             .unwrap_or(true);
         let base = base * caster.magnitude_multiplier(is_spell);
 
-        // The caster's PERKS, and nothing else, are visible to `finish_resolved`.
-        // Every other field stays `Default` on purpose: switching on the caster's
-        // piercing ratings for spells is a real change to the damage model, and it
-        // is not this one's to make.
+        // The caster's PERKS **and elemental-resistance piercing**.
+        //
+        // The piercing ratings used to be left at `Default` — the note here said
+        // switching them on for spells was "a real change to the damage model, and
+        // it is not this one's to make". The consequence is that
+        // `Elemental Damage Ignores Resistance` gear did NOTHING on elemental SPELLS,
+        // which is the one place its own text promises it works. A player with four
+        // EDIR pieces on a frost build got zero benefit from all four; the weapon path
+        // (`resolve.rs`, which clones the real loadout) honoured them the whole time.
+        //
+        // `finish_resolved` reads exactly three things from `attacker` —
+        // `perks.element_bonus`, `perks.element_damage`, and these two piercing fields
+        // — so copying them is the complete fix and touches nothing else.
         let mut caster_loadout = Loadout::default();
         caster_loadout.perks = caster.perks.clone();
+        caster_loadout.elem_resist_piercing = caster.elem_resist_piercing;
+        caster_loadout.elem_resist_piercing_rating = caster.elem_resist_piercing_rating;
+        // The ABILITY's own `_elementalResistancePiercing`, the same field the weapon
+        // path adds in `resolve.rs`. A spell that ships one was ignoring it too.
+        if let Some(erp) = super::gamedata::ability_rank_clamped(ability_uuid, ability_level.max(1) as u16)
+            .and_then(|r| r.elemental_resistance_piercing())
+        {
+            caster_loadout.elem_resist_piercing_rating += erp;
+        }
 
         // The mirrored stat drain is appended by `finish_resolved` from the
         // post-block value — see [`append_mirrored_drains`].
         let mut components = vec![(ty, base)];
-        finish_resolved(&caster_loadout, target, source, active_side, &mut components, now)
+        finish_resolved(
+            &caster_loadout,
+            target,
+            source,
+            active_side,
+            &mut components,
+            now,
+            resistance_scale_for(source, ability_uuid, ability_level),
+        )
     }
 }
 
@@ -582,6 +608,39 @@ pub const CHANNEL_TICK_INTERVAL_SECS: f32 = super::gamedata::combat_params::GLOB
 /// can release early, so this is the maximum, not a promise; the capture's 1..13 spread
 /// is exactly that (a full 15 also needs no frame to be dropped, and these are UDP
 /// captures).
+/// The share of the defender's flat resistance one call should charge.
+///
+/// **A channelled spell was paying the full resistance on EVERY tick.**
+/// `resistance_reduction` subtracts a flat `rating x REDUCTION_PER_RESISTANCE_RATING`,
+/// and a channel re-enters the whole pipeline once per `CHANNEL_TICK_INTERVAL_SECS`
+/// — 15 times for a 3 s Frostbite. So a defender with one Resist Frost affix
+/// (~35 rating) slammed every tick into the 95% cap and took **14.4 damage from a
+/// full channel**, 0.4% of a 3240 HP bar. Reported as "Frostbite and Ice spike quite
+/// surely damage too little".
+///
+/// The captures say otherwise, and they are the same captures this model was built
+/// from: 118 `ContinuousSpell` frames across s615+s616 carry per-tick magnitudes of
+/// 39.33 - 45.00, matching `dps x 0.2` with nothing subtracted. Under the old model a
+/// defender with a t4 resist could not have produced a 44.997 tick — the ceiling was
+/// 2.25.
+///
+/// So the flat cost is charged ONCE PER CAST, spread across the ticks: a full channel
+/// loses exactly `rating`, the same as a single hit of the same total would. This
+/// mirrors the rule already applied to flat BONUSES, which are paid only on
+/// `single_impact` — the asymmetry was that the code refused to pay a flat bonus per
+/// tick while still charging a flat penalty per tick.
+///
+/// 1.0 for everything else, so every capture-pinned single-hit test is untouched.
+fn resistance_scale_for(source: DamageSource, ability_uuid: &str, ability_level: u8) -> f32 {
+    if source != DamageSource::ContinuousSpell {
+        return 1.0;
+    }
+    match channel_ticks(ability_uuid, ability_level) {
+        Some(t) if t > 1 => 1.0 / t as f32,
+        _ => 1.0,
+    }
+}
+
 pub fn channel_ticks(ability_uuid: &str, ability_level: u8) -> Option<u32> {
     let r = super::gamedata::ability_rank_clamped(ability_uuid, ability_level.max(1) as u16)?;
     r.damage_per_second()?;
@@ -661,9 +720,20 @@ fn finish_resolved(
     active_side: ActiveSide,
     components: &mut Vec<(DamageType, f32)>,
     now: Instant,
+    // What share of the defender's flat resistance THIS call should charge. 1.0
+    // everywhere except a channelled-spell tick, which charges 1/ticks so the whole
+    // channel pays the resistance ONCE. See `resistance_scale_for`.
+    resistance_scale: f32,
 ) -> ResolvedDamage {
     let mut hit_flags = flags::SHOW_DAMAGE | flags::HAS_ATTACKER;
-    let continuous = source == DamageSource::StatusEffect;
+    // A channelled spell IS continuous damage, so the shipped
+    // CONTINUOUS_DAMAGE_RESISTANCE_EFFECTIVENESS (0.75) applies to it too. Only
+    // `StatusEffect` used to qualify, which left `ContinuousSpell` paying full
+    // effectiveness on every one of its ticks.
+    let continuous = matches!(
+        source,
+        DamageSource::StatusEffect | DamageSource::ContinuousSpell
+    );
 
     // 0) AUGMENTED ELEMENTS — `Augmented{Flames,Frost,Shock,Poison}` add a FLAT
     //    amount to that element ("Increases fire damage by {0}").
@@ -714,7 +784,8 @@ fn finish_resolved(
             attacker.elem_resist_piercing,
             attacker.elem_resist_piercing_rating,
         ) + target.transient_resistance_against(*ty, now);
-        let resisted = tables::resistance_reduction(before, rating, continuous);
+        let resisted =
+            tables::resistance_reduction(before, rating * resistance_scale, continuous);
         let gained = tables::weakness_increase(before, target.weakness_rating_against(*ty), continuous);
         *v = (before - resisted + gained).max(0.0);
         if resisted > 0.0 && is_elemental(*ty) {
