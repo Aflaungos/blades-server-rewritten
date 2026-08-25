@@ -654,6 +654,74 @@ impl QuestsDailyData {
     }
 }
 
+/// One milestone payout as retail's `/complete` body actually granted it.
+///
+/// The client is shown the tier under `rewards[]` with the gem currency listed as a
+/// `stackableItems` entry; the `/complete` body moves that same gem count into
+/// `currencies`. Rather than re-deriving which uuid is a currency, this is the
+/// granting form taken verbatim from the captured responses.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PayableTier {
+    #[serde(default)]
+    pub reward: crate::economy::RewardGrant,
+    #[serde(default)]
+    pub observations: u64,
+}
+
+/// One event-quest TEMPLATE, keyed by `gldQuestId` (`event_quests.json`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventQuestTemplate {
+    #[serde(default)]
+    pub gld_quest_id: Uuid,
+    #[serde(default)]
+    pub version: u64,
+    #[serde(default)]
+    pub objective_ids: Vec<Uuid>,
+    /// The five milestone rewards, in wire form (what the client displays).
+    #[serde(default)]
+    pub rewards: Vec<crate::economy::RewardGrant>,
+    /// The bonus paid alongside the last milestone.
+    #[serde(default)]
+    pub final_reward: Option<crate::economy::RewardGrant>,
+    /// The granting form of each milestone, keyed by completion index as a string
+    /// (`"0".."4"`). Every one of the 39 committed templates has all five observed.
+    #[serde(default)]
+    pub payable_rewards: HashMap<String, PayableTier>,
+}
+
+impl EventQuestTemplate {
+    /// What the `completion`-th completion of this quest pays.
+    ///
+    /// Prefers the observed `/complete` body for that index; falls back to the wire
+    /// tier when a corpus is missing that index (none of the committed templates
+    /// are, but a hand-edited file could be). Returns `None` past the last tier —
+    /// retail's instances are exhausted after five completions.
+    pub fn payout(&self, completion: usize) -> Option<crate::economy::RewardGrant> {
+        if completion >= self.rewards.len().max(self.payable_rewards.len()) {
+            return None;
+        }
+        if let Some(tier) = self.payable_rewards.get(&completion.to_string()) {
+            return Some(tier.reward.clone());
+        }
+        self.rewards.get(completion).cloned()
+    }
+
+    /// How many times an instance of this quest can be completed.
+    pub fn milestone_count(&self) -> usize {
+        self.rewards.len().max(self.payable_rewards.len())
+    }
+}
+
+/// `event_quests.json` — the capture-derived event-quest template table.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct EventQuestsData {
+    #[serde(default)]
+    pub templates: HashMap<Uuid, EventQuestTemplate>,
+}
+
 /// `global_shop_free.json` — the offers retail gave away for nothing.
 ///
 /// A wrapper struct rather than a bare `Vec`, so the file keeps a named key and
@@ -750,4 +818,8 @@ pub struct StaticData {
     pub smith_craftables: SmithCraftables,
     /// Daily-rotation quest model + level-scaling table (`quests_daily.json`).
     pub quests_daily: QuestsDailyData,
+    /// Event-quest ("Sigil") templates keyed by `gldQuestId` (`event_quests.json`):
+    /// objective ids, wire version, and the five milestone rewards each instance
+    /// pays. Without this an event quest can be advertised but not paid.
+    pub event_quests: EventQuestsData,
 }

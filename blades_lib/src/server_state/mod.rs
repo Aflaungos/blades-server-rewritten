@@ -102,4 +102,14 @@ pub struct ServerState {
     /// the catalog against the shop itself.
     #[serde(default)]
     pub shops: HashMap<Uuid, MerchantWindow>,
+    /// How many times each event-quest INSTANCE has been completed, keyed by the
+    /// per-character instance quest id.
+    ///
+    /// An event quest is repeatable: the Nth completion pays the Nth milestone from
+    /// `event_quests.json`, so the count is what selects the payout. It lives here
+    /// rather than on the quest row because it must not appear on the wire — retail
+    /// sends no such field and the quest body is serialized straight to the client.
+    /// `#[serde(default)]` so rows written before this field deserialize cleanly.
+    #[serde(default)]
+    pub event_quest_completions: HashMap<Uuid, u32>,
 }

@@ -71,6 +71,11 @@ pub fn generate_quest_data(
         r#type: QuestType::Normal,
         version: dungeon_info.version,
         objective_statuses: objective_statuses.clone(),
+        // An ordinary quest carries none of the event fields; the event path in
+        // `server::quest::event_quests` fills them in after calling this.
+        game_event_quest_data: None,
+        rewards: None,
+        final_reward: None,
     };
 
     // Nil-dungeon (dialogue-only) quests have no dungeon to generate — short-circuit to a
@@ -160,6 +165,9 @@ fn dialogue_quest(
         r#type: QuestType::Normal,
         version,
         objective_statuses,
+        game_event_quest_data: None,
+        rewards: None,
+        final_reward: None,
     }
 }
 

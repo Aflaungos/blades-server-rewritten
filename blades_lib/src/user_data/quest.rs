@@ -3,16 +3,47 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
-#[serde(rename_all = "UPPERCASE")]
+use crate::economy::RewardGrant;
+
+/// The `type` discriminator on a quest.
+///
+/// All three values are taken from the pre-shutdown corpus, where the counts over
+/// retail `/quests`, `/accept`, `/objectives` and `/complete` bodies are
+/// `NORMAL` 2332, `GAME_EVENT` 2753, `JOB` 285. `JOB` is modelled here for
+/// completeness — the job board is still served as raw `Value` — but `GAME_EVENT`
+/// is load-bearing: without it an event quest cannot be told apart from an ordinary
+/// one, and the two are paid differently (see [`Quest::rewards`]).
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq)]
 pub enum QuestType {
+    #[serde(rename = "NORMAL")]
     Normal,
+    #[serde(rename = "GAME_EVENT")]
+    GameEvent,
+    #[serde(rename = "JOB")]
+    Job,
 }
 
-#[derive(Serialize, Deserialize, Debug, Copy, Clone)]
+/// Objective status.
+///
+/// `Completed` is not an embellishment: the client reports objective completion as
+/// `{"status":"Completed","progress":1.0}` and an enum that only knew `Active`
+/// rejected the whole body. 137 of the 139 `/objectives` calls ever made against
+/// this server answered
+/// `400 Json deserialize error: unknown variant 'Completed', expected 'Active'`,
+/// which means no quest could be finished through the normal flow at all.
+#[derive(Serialize, Deserialize, Debug, Copy, Clone, PartialEq, Eq)]
 #[serde(rename_all = "PascalCase")]
 pub enum QuestStatus {
     Active,
+    Completed,
+}
+
+/// The `gameEventQuestData` block an event quest carries: which event instance it
+/// belongs to, as `"<eventId>::<startTimeSecs>"`.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct GameEventQuestData {
+    pub game_event_instance_id: String,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -58,6 +89,26 @@ pub struct Quest {
     /// rather than pushing the narrowing back down here.
     pub seed: serde_json::Number,
     pub gld_quest_id: Uuid,
+    /// Which event instance this quest belongs to. Present on, and only on, a
+    /// `GAME_EVENT` quest (2753 of 2753 captured event quests carry it; no `NORMAL`
+    /// or `JOB` quest ever does), so it is skipped when absent rather than sent as
+    /// `null`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub game_event_quest_data: Option<GameEventQuestData>,
+    /// The five milestone rewards an event quest pays, in order. The Nth completion
+    /// of the instance pays `rewards[N]`; the last one additionally pays
+    /// [`Self::final_reward`].
+    ///
+    /// The tier order is measured, not assumed: across 93 retail instances the
+    /// observed payout matched `rewards[completion_index]` 91/93 times on the first
+    /// completion, 67/68 on the second, 59/60 on the third, 56/57 on the fourth, and
+    /// every one of the 54 observed fifth completions paid `rewards[4]` merged with
+    /// `finalReward`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rewards: Option<Vec<RewardGrant>>,
+    /// The one-off bonus paid alongside the last milestone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_reward: Option<RewardGrant>,
     pub completed: bool,
 }
 

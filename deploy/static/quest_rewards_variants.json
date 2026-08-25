@@ -1,0 +1,691 @@
+{
+ "1c369004-be30-40b2-ad7b-4102e6b224f0": {
+  "chosenObservations": 1,
+  "alternatives": [
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 500,
+     "chests": [
+      {
+       "id": "121",
+       "level": 37,
+       "tier": 3
+      }
+     ],
+     "currencies": {
+      "470c8f58-a8dd-4c07-8c92-843b785e1139": 35
+     },
+     "townXp": 0
+    }
+   }
+  ]
+ },
+ "30a53534-e8d2-43ef-82f7-d706b6ef8a97": {
+  "chosenObservations": 1,
+  "alternatives": [
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 1000,
+     "chests": [
+      {
+       "id": "1",
+       "level": 47,
+       "tier": 4
+      }
+     ],
+     "items": [
+      {
+       "id": "870b716d-11cd-49d7-bd39-c32058d57582",
+       "itemTemplateId": "a948c18d-9895-44fe-afd7-0dcb8789d41e"
+      }
+     ],
+     "townXp": 0
+    }
+   }
+  ]
+ },
+ "334e582f-95ba-4263-b381-ac6d91eabe92": {
+  "chosenObservations": 1,
+  "alternatives": [
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 50,
+     "chests": [
+      {
+       "id": "102",
+       "level": 37,
+       "tier": 1
+      }
+     ],
+     "stackableItems": {
+      "dba6adde-b1f3-4146-8155-91426652495a": 2,
+      "eca5bd64-5e5d-4d0d-bfa3-b6fd427be029": 2
+     },
+     "townXp": 0
+    }
+   }
+  ]
+ },
+ "4439f370-5da7-4154-92fc-44ce2a4fe2b4": {
+  "chosenObservations": 1,
+  "alternatives": [
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 270,
+     "chests": [
+      {
+       "id": "2",
+       "level": 8,
+       "tier": 2
+      }
+     ],
+     "currencies": {
+      "f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2": 500
+     },
+     "stackableItems": {
+      "89ece62c-9ff6-470a-a152-d45ef4e0c222": 2
+     },
+     "townXp": 0
+    }
+   },
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 270,
+     "chests": [
+      {
+       "id": "1",
+       "level": 4,
+       "tier": 2
+      }
+     ],
+     "currencies": {
+      "f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2": 500
+     },
+     "stackableItems": {
+      "89ece62c-9ff6-470a-a152-d45ef4e0c222": 2
+     },
+     "townXp": 0
+    }
+   },
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 270,
+     "chests": [
+      {
+       "id": "87",
+       "level": 37,
+       "tier": 2
+      }
+     ],
+     "currencies": {
+      "f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2": 500
+     },
+     "stackableItems": {
+      "89ece62c-9ff6-470a-a152-d45ef4e0c222": 2
+     },
+     "townXp": 0
+    }
+   }
+  ]
+ },
+ "4f552ec2-83d7-4b13-b290-c78ef6816939": {
+  "chosenObservations": 1,
+  "alternatives": [
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 8300,
+     "chests": [
+      {
+       "id": "123",
+       "level": 37,
+       "tier": 5
+      }
+     ],
+     "stackableItems": {
+      "4e9ad4aa-45c4-4363-9b57-6920ee7091ba": 1
+     },
+     "townXp": 115
+    }
+   }
+  ]
+ },
+ "4fdd7a79-8d5b-4751-a87d-d913d5f62d1f": {
+  "chosenObservations": 1,
+  "alternatives": [
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 210,
+     "chests": [
+      {
+       "id": "2",
+       "level": 4,
+       "tier": 3
+      }
+     ],
+     "stackableItems": {
+      "a0d41fd5-b0f7-4872-aabb-64028fc781f9": 1
+     },
+     "townXp": 50
+    }
+   },
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 210,
+     "chests": [
+      {
+       "id": "1",
+       "level": 4,
+       "tier": 3
+      }
+     ],
+     "stackableItems": {
+      "a0d41fd5-b0f7-4872-aabb-64028fc781f9": 1
+     },
+     "townXp": 50
+    }
+   },
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 210,
+     "chests": [
+      {
+       "id": "84",
+       "level": 37,
+       "tier": 3
+      }
+     ],
+     "stackableItems": {
+      "a0d41fd5-b0f7-4872-aabb-64028fc781f9": 1
+     },
+     "townXp": 50
+    }
+   }
+  ]
+ },
+ "559b9345-27ae-4ccf-8482-5905b266bb7f": {
+  "chosenObservations": 1,
+  "alternatives": [
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 400,
+     "chests": [
+      {
+       "id": "121",
+       "level": 37,
+       "tier": 3
+      }
+     ],
+     "currencies": {
+      "470c8f58-a8dd-4c07-8c92-843b785e1139": 30
+     },
+     "townXp": 0
+    }
+   }
+  ]
+ },
+ "73420485-569d-41f9-8356-38dc5e4f37fc": {
+  "chosenObservations": 1,
+  "alternatives": [
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 500,
+     "items": [
+      {
+       "durability": 168.75,
+       "id": "953e0f3a-5f9b-4fb0-a7da-e17cec36c80a",
+       "itemTemplateId": "99007305-7e07-42ae-a1b2-aa5f3fa08fd7",
+       "temperingLevel": 0
+      }
+     ],
+     "townXp": 0
+    }
+   }
+  ]
+ },
+ "8057a28b-92c2-4a84-97d6-2d991d6fe84f": {
+  "chosenObservations": 1,
+  "alternatives": [
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 600,
+     "items": [
+      {
+       "durability": 283.33,
+       "id": "34e5ae00-850b-4b3b-9064-056e50b80697",
+       "itemTemplateId": "8def746b-3102-457e-92fd-42cef6feb97b",
+       "temperingLevel": 0
+      }
+     ],
+     "townXp": 0
+    }
+   }
+  ]
+ },
+ "84b3343b-c973-40d2-97fd-377aa49bf880": {
+  "chosenObservations": 1,
+  "alternatives": [
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 200,
+     "chests": [
+      {
+       "id": "75",
+       "level": 37,
+       "tier": 2
+      }
+     ],
+     "currencies": {
+      "470c8f58-a8dd-4c07-8c92-843b785e1139": 20
+     },
+     "townXp": 0
+    }
+   }
+  ]
+ },
+ "b2c782d5-5def-4176-8053-7c940082f2a8": {
+  "chosenObservations": 1,
+  "alternatives": [
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 175,
+     "items": [
+      {
+       "durability": 93.75,
+       "id": "2dc9315e-6c38-4c44-9ea9-3cdab7881f74",
+       "itemTemplateId": "dfa6be04-f10e-46ff-8ba8-8d7b4bb0ce3b",
+       "temperingLevel": 0
+      }
+     ],
+     "townXp": 0
+    }
+   }
+  ]
+ },
+ "bd14583c-4061-4157-996c-3335c33f0c62": {
+  "chosenObservations": 1,
+  "alternatives": [
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 500,
+     "chests": [
+      {
+       "id": "121",
+       "level": 37,
+       "tier": 2
+      }
+     ],
+     "items": [
+      {
+       "durability": 175.0,
+       "id": "6f781608-279f-4b25-8308-77f06206b88d",
+       "itemTemplateId": "894a8d94-9ee7-49d7-a78e-102026a06f80",
+       "temperingLevel": 0
+      }
+     ],
+     "stackableItems": {
+      "eca5bd64-5e5d-4d0d-bfa3-b6fd427be029": 4
+     },
+     "townXp": 0
+    }
+   }
+  ]
+ },
+ "c2c3c16d-695d-4e69-b609-40e8ec800b83": {
+  "chosenObservations": 1,
+  "alternatives": [
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 350,
+     "chests": [
+      {
+       "id": "121",
+       "level": 37,
+       "tier": 2
+      }
+     ],
+     "currencies": {
+      "f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2": 750
+     },
+     "stackableItems": {
+      "8b7d0044-3a38-4ee0-af45-d2892b0f508d": 20
+     },
+     "townXp": 0
+    }
+   }
+  ]
+ },
+ "cf4c4255-b5f9-49da-a61c-2396c1b0aed0": {
+  "chosenObservations": 1,
+  "alternatives": [
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 600,
+     "items": [
+      {
+       "durability": 193.75,
+       "id": "bf8b7974-16fa-4882-b627-8d70d784a7ba",
+       "itemTemplateId": "9094f0d1-20c8-4013-ab38-77177a009a78",
+       "temperingLevel": 0
+      }
+     ],
+     "townXp": 0
+    }
+   },
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 600,
+     "items": [
+      {
+       "durability": 193.75,
+       "id": "475abfb4-f330-4795-b5f8-0f17479ad543",
+       "itemTemplateId": "9094f0d1-20c8-4013-ab38-77177a009a78",
+       "temperingLevel": 0
+      }
+     ],
+     "townXp": 0
+    }
+   }
+  ]
+ },
+ "d4a88399-0518-4b72-872c-de8cbb191dae": {
+  "chosenObservations": 2,
+  "alternatives": [
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 170,
+     "chests": [
+      {
+       "id": "2",
+       "level": 4,
+       "tier": 2
+      }
+     ],
+     "currencies": {
+      "470c8f58-a8dd-4c07-8c92-843b785e1139": 50,
+      "f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2": 250
+     },
+     "townXp": 0
+    }
+   },
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 170,
+     "chests": [
+      {
+       "id": "1",
+       "level": 7,
+       "tier": 2
+      }
+     ],
+     "currencies": {
+      "470c8f58-a8dd-4c07-8c92-843b785e1139": 50,
+      "f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2": 250
+     },
+     "townXp": 0
+    }
+   },
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 170,
+     "chests": [
+      {
+       "id": "61",
+       "level": 37,
+       "tier": 2
+      }
+     ],
+     "currencies": {
+      "470c8f58-a8dd-4c07-8c92-843b785e1139": 50,
+      "f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2": 250
+     },
+     "townXp": 0
+    }
+   }
+  ]
+ },
+ "e0212e3f-5f6a-458c-8544-78d3532b2cb9": {
+  "chosenObservations": 1,
+  "alternatives": [
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 200,
+     "chests": [
+      {
+       "id": "29",
+       "level": 26,
+       "tier": 2
+      }
+     ],
+     "stackableItems": {
+      "574ab81c-1ba1-4127-a4aa-e9cbba5767ad": 5,
+      "6bd960ca-9af3-4b33-9ec0-5c06d50ad43e": 5
+     },
+     "townXp": 0
+    }
+   },
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 200,
+     "chests": [
+      {
+       "id": "65",
+       "level": 37,
+       "tier": 2
+      }
+     ],
+     "stackableItems": {
+      "574ab81c-1ba1-4127-a4aa-e9cbba5767ad": 5,
+      "6bd960ca-9af3-4b33-9ec0-5c06d50ad43e": 5
+     },
+     "townXp": 0
+    }
+   },
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 200,
+     "chests": [
+      {
+       "id": "67",
+       "level": 37,
+       "tier": 2
+      }
+     ],
+     "stackableItems": {
+      "574ab81c-1ba1-4127-a4aa-e9cbba5767ad": 5,
+      "6bd960ca-9af3-4b33-9ec0-5c06d50ad43e": 5
+     },
+     "townXp": 0
+    }
+   },
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 200,
+     "chests": [
+      {
+       "id": "70",
+       "level": 37,
+       "tier": 2
+      }
+     ],
+     "stackableItems": {
+      "574ab81c-1ba1-4127-a4aa-e9cbba5767ad": 5,
+      "6bd960ca-9af3-4b33-9ec0-5c06d50ad43e": 5
+     },
+     "townXp": 0
+    }
+   },
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 200,
+     "chests": [
+      {
+       "id": "73",
+       "level": 37,
+       "tier": 2
+      }
+     ],
+     "stackableItems": {
+      "574ab81c-1ba1-4127-a4aa-e9cbba5767ad": 5,
+      "6bd960ca-9af3-4b33-9ec0-5c06d50ad43e": 5
+     },
+     "townXp": 0
+    }
+   },
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 200,
+     "chests": [
+      {
+       "id": "79",
+       "level": 37,
+       "tier": 2
+      }
+     ],
+     "stackableItems": {
+      "574ab81c-1ba1-4127-a4aa-e9cbba5767ad": 5,
+      "6bd960ca-9af3-4b33-9ec0-5c06d50ad43e": 5
+     },
+     "townXp": 0
+    }
+   }
+  ]
+ },
+ "e53a430b-35f4-4848-8b4e-c1f0089e098a": {
+  "chosenObservations": 5,
+  "alternatives": [
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 105,
+     "chests": [
+      {
+       "id": "1",
+       "level": 2,
+       "tier": 2
+      }
+     ],
+     "currencies": {
+      "f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2": 250
+     },
+     "stackableItems": {
+      "e7193116-d761-479b-8a20-5633737977f5": 145
+     },
+     "townXp": 0
+    }
+   },
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 105,
+     "chests": [
+      {
+       "id": "6",
+       "level": 2,
+       "tier": 2
+      }
+     ],
+     "currencies": {
+      "f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2": 250
+     },
+     "stackableItems": {
+      "e7193116-d761-479b-8a20-5633737977f5": 145
+     },
+     "townXp": 0
+    }
+   }
+  ]
+ },
+ "eda206ed-1783-46a5-bb21-1f1528e87ffe": {
+  "chosenObservations": 1,
+  "alternatives": [
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 100,
+     "items": [
+      {
+       "durability": 62.5,
+       "id": "132bdfb0-0ed6-4ffc-ac8c-73ba7aaf2c98",
+       "itemTemplateId": "c469682f-6fb5-4323-b06e-b20c21d0ad44",
+       "temperingLevel": 0
+      }
+     ],
+     "townXp": 0
+    }
+   },
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 100,
+     "items": [
+      {
+       "durability": 62.5,
+       "id": "10b290d9-d3aa-48c8-abb1-f1f83c0b30d9",
+       "itemTemplateId": "c469682f-6fb5-4323-b06e-b20c21d0ad44",
+       "temperingLevel": 0
+      }
+     ],
+     "townXp": 0
+    }
+   },
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 100,
+     "items": [
+      {
+       "durability": 62.5,
+       "id": "5d5d77f2-1cc1-4250-8eea-ea81199b019c",
+       "itemTemplateId": "c469682f-6fb5-4323-b06e-b20c21d0ad44",
+       "temperingLevel": 0
+      }
+     ],
+     "townXp": 0
+    }
+   },
+   {
+    "n": 1,
+    "value": {
+     "characterXp": 100,
+     "items": [
+      {
+       "durability": 62.5,
+       "id": "8948245b-9ab6-4068-ac00-ad4e375624dc",
+       "itemTemplateId": "c469682f-6fb5-4323-b06e-b20c21d0ad44",
+       "temperingLevel": 0
+      }
+     ],
+     "townXp": 0
+    }
+   }
+  ]
+ }
+}

@@ -14,8 +14,9 @@ use blades_lib::features::challenges::ChallengeTemplate;
 use blades_lib::features::daily_reward::DailyRewardDef;
 use blades_lib::features::game_events::EventDef;
 use blades_lib::static_data::{
-    Announcement, AbyssStaticData, FreeProductIds, GiftDef, ItemModRecipe, QuestsDailyData, Recipe,
-    RecipeCraftingTypes, ShopBundle, ShopData, SmithCraftables, SmithCraftablesFile, StaticData,
+    Announcement, AbyssStaticData, EventQuestsData, FreeProductIds, GiftDef, ItemModRecipe,
+    QuestsDailyData, Recipe, RecipeCraftingTypes, ShopBundle, ShopData, SmithCraftables,
+    SmithCraftablesFile, StaticData,
 };
 use log::warn;
 use serde::de::DeserializeOwned;
@@ -106,8 +107,13 @@ pub fn load(dir: &Path) -> StaticData {
     // chain — the same behaviour as before the table existed.
     let recipe_crafting_types: RecipeCraftingTypes =
         read_json(&dir.join("recipe_crafting_types.json"));
+    // `read_uuid_map`, not `read_json`: the file carries a `_meta` provenance block
+    // (coverage, the list of quests no capture covers, where the numbers came from).
+    // Through `read_json` a single non-UUID key fails the WHOLE map and every quest
+    // silently pays nothing — the exact silent-emptying failure `read_uuid_map`
+    // exists to prevent.
     let quest_rewards: HashMap<Uuid, RewardGrant> =
-        read_json(&dir.join("quest_rewards.json"));
+        read_uuid_map(&dir.join("quest_rewards.json"));
     let abyss: AbyssStaticData = read_json(&dir.join("abyss.json"));
     // The forge craftables file has a rich schema; deserialize the raw shape and resolve
     // it into by-recipe / by-template lookups (a missing file → empty lookups, and the
@@ -116,6 +122,7 @@ pub fn load(dir: &Path) -> StaticData {
         read_json(&dir.join("smith_craftables.json"));
     let smith_craftables = SmithCraftables::from_raw(smith_craftables_raw);
     let quests_daily: QuestsDailyData = read_json(&dir.join("quests_daily.json"));
+    let event_quests: EventQuestsData = read_json(&dir.join("event_quests.json"));
 
     StaticData {
         gifts: gifts.into_iter().map(|g| (g.global_gift_id, g)).collect::<HashMap<_, _>>(),
@@ -139,6 +146,7 @@ pub fn load(dir: &Path) -> StaticData {
         abyss,
         smith_craftables,
         quests_daily,
+        event_quests,
     }
 }
 
@@ -219,6 +227,26 @@ mod tests {
         assert!(
             !sd.quests_daily.level_scaling.enemy_level_from_player_level.offset_by_skull.is_empty(),
             "quests_daily.json levelScaling"
+        );
+        // The event calendar and its milestone tables must both survive the load, and
+        // must agree with each other — an event whose template is missing would
+        // advertise a Sigil quest that pays nothing.
+        assert_eq!(sd.game_events.len(), 39, "game_events.json");
+        assert_eq!(sd.event_quests.templates.len(), 39, "event_quests.json");
+        for def in &sd.game_events {
+            assert!(
+                sd.event_quests.templates.contains_key(&def.quest_id),
+                "event {} has no milestone table",
+                def.event_id
+            );
+        }
+        // `quest_rewards.json` carries a `_meta` block. Read through `read_json` a
+        // single non-UUID key fails the WHOLE map, so this count is what proves the
+        // table is being read with `read_uuid_map` and is not silently empty.
+        assert!(
+            sd.quest_rewards.len() > 150,
+            "quest_rewards.json loaded only {} entries — is _meta emptying it?",
+            sd.quest_rewards.len()
         );
     }
 

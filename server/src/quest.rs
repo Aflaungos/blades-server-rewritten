@@ -43,8 +43,6 @@ pub struct GetQuestsResponse {
     /// Per-pool rotation timers (`[{id, endTime, nextStartTime}]`, epoch seconds)
     /// computed relative to *now* by [`jobs_gen`] — no longer frozen constants.
     job_pools: Value,
-    /// The featured DAILY quests (`quests_daily::select`) — a global, day-rotating set of
-    /// story/side/event quests, level-scaled to the player. Previously an empty TODO.
     /// Quests the server removed in the course of answering this request.
     ///
     /// The job rotation deletes the previous window's un-entered job rows; without
@@ -54,9 +52,24 @@ pub struct GetQuestsResponse {
     /// always-present list — so it is skipped when nothing was removed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     deleted_quest_ids: Vec<Uuid>,
+    /// The event ("Sigil") quests whose instance window is open right now — one
+    /// stored, per-character `GAME_EVENT` row per active event. Their `questId` is a
+    /// per-character INSTANCE id and their `gldQuestId` is the template, which is why
+    /// everything downstream must resolve through `gldQuestId`.
     game_event_quests: Vec<QuestWithId>,
-    game_event_quests_in_warning: Vec<QuestWithId>, //TODO: warning-window variants unmodelled
-    game_event_quests_finished: Vec<QuestWithId>,   //TODO: finished-history unmodelled
+    /// Events opening within the next 24 h. MEASURED: retail's warning array is
+    /// "starting soon", not "ending soon" — all 686 captured entries had a start time
+    /// between 0.1 h and 24.0 h in the FUTURE, and there was always exactly one.
+    /// These are announcements, so they are not persisted: a warning quest has no
+    /// stored progress until its window opens.
+    game_event_quests_in_warning: Vec<QuestWithId>,
+    /// Deliberately empty. Retail sent 101 entries across the corpus, and the
+    /// discriminator is not determinable from it: every one sat 1–48 h after its
+    /// instance start — i.e. INSIDE the same 48 h window that the active array uses —
+    /// and carried `completed: false`, so it is neither "window elapsed" nor "player
+    /// finished it". Sending a guess here would put quests on the player's finished
+    /// list that retail would not have. See docs/quest-and-event-model.md.
+    game_event_quests_finished: Vec<QuestWithId>,
 }
 
 /// Split stored quest rows into the client's `quests[]` and `generatedData[]`.
@@ -80,8 +93,16 @@ pub struct GetQuestsResponse {
 ///   Skipping is the honest answer: with no dungeon we can neither render it nor let
 ///   anyone play it, and advertising it is what hangs the client.
 ///
+/// A `GAME_EVENT` row is routed to `gameEventQuests[]` instead of `quests[]`, and
+/// only while its instance is still open — `open_event_instances` carries the
+/// instance ids the event calendar says are live right now. A stored row whose
+/// window has closed is simply not advertised (the row stays, so a re-opened window
+/// finds the player's milestone progress where they left it).
+///
 /// The invariant the client relies on, and the one the tests pin: **every quest in
-/// `quests[]` has a matching entry in `generatedData[]`, keyed by the same id.**
+/// `quests[]` or `gameEventQuests[]` has a matching entry in `generatedData[]`,
+/// keyed by the same id.** Retail holds it for event quests too — in every captured
+/// response the event instance's id was also in `dungeonGeneratedDataList`.
 fn split_quest_rows(
     rows: impl Iterator<
         Item = (
@@ -90,20 +111,35 @@ fn split_quest_rows(
             Option<blades_lib::user_data::DungeonGeneratedData>,
         ),
     >,
-) -> (Vec<QuestWithId>, Vec<DungeonGeneratedDataWithId>) {
+    open_event_instances: &std::collections::HashSet<Uuid>,
+) -> (
+    Vec<QuestWithId>,
+    Vec<QuestWithId>,
+    Vec<DungeonGeneratedDataWithId>,
+) {
     let mut quests = Vec::new();
+    let mut event_quests = Vec::new();
     let mut generated = Vec::new();
     for (quest_id, info, generated_data) in rows {
         if jobs_gen::is_job_row(&info) {
             continue;
         }
+        let is_event = matches!(info.r#type, blades_lib::user_data::QuestType::GameEvent);
+        if is_event && !open_event_instances.contains(&quest_id) {
+            continue;
+        }
         let Some(inner) = generated_data else {
             continue;
         };
-        quests.push(QuestWithId { quest_id, quest: info });
+        let with_id = QuestWithId { quest_id, quest: info };
+        if is_event {
+            event_quests.push(with_id);
+        } else {
+            quests.push(with_id);
+        }
         generated.push(DungeonGeneratedDataWithId { quest_id, inner });
     }
-    (quests, generated)
+    (quests, event_quests, generated)
 }
 
 #[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/quests")]
@@ -225,6 +261,72 @@ pub async fn get_quests(
                 }
             }
 
+            // ---- Event ("Sigil") quests: mint the instances whose window is open ----
+            // One stored GAME_EVENT row per (character, event instance). Deterministic
+            // id, so re-fetching within the window resolves the SAME row and the
+            // player's objective progress and milestone count survive. Inserting is
+            // what makes /objectives and /complete able to find the quest at all.
+            let player_level = character.character.0.level as i64;
+            let minted = event_quests::mint(
+                &globals.static_data,
+                &globals.game_data,
+                character_id_var,
+                player_level,
+                now as i64,
+            );
+            let open_event_instances: std::collections::HashSet<Uuid> =
+                minted.iter().map(|m| m.quest_id).collect();
+            for m in &minted {
+                use crate::schema::quests;
+                insert_into(quests::table)
+                    .values(&QuestDbEntry {
+                        id: m.quest_id,
+                        character_id: character_id_var,
+                        info: JsonDbWrapper(m.quest.clone()),
+                        generated_data: JsonDbWrapper(m.dungeon.clone()),
+                        dungeon_state: None,
+                    })
+                    .on_conflict((quests::id, quests::character_id))
+                    .do_nothing()
+                    .execute(&mut conn)
+                    .await?;
+            }
+
+            // Retire event rows whose window has closed and that the player never
+            // entered. Without this each character accrues a dead row per event per
+            // window — about 365 a year — and the client keeps being told about
+            // instances that no longer exist. Same shape as the job prune above: only
+            // rows with no `dungeon_state` are removed (an entered run is left alone),
+            // and whatever goes is reported as `deletedQuestIds`.
+            {
+                use crate::schema::quests;
+                let stale: Vec<Uuid> = quests::table
+                    .filter(quests::character_id.eq(character_id_var))
+                    .filter(quests::dungeon_state.is_null())
+                    .select(QuestDbEntry::as_select())
+                    .load(&mut conn)
+                    .await?
+                    .into_iter()
+                    .filter(|q| {
+                        matches!(
+                            q.info.0.r#type,
+                            blades_lib::user_data::QuestType::GameEvent
+                        ) && !open_event_instances.contains(&q.id)
+                    })
+                    .map(|q| q.id)
+                    .collect();
+                if !stale.is_empty() {
+                    diesel::delete(
+                        quests::table
+                            .filter(quests::character_id.eq(character_id_var))
+                            .filter(quests::id.eq_any(&stale)),
+                    )
+                    .execute(&mut conn)
+                    .await?;
+                    deleted_quest_ids.extend(stale.iter().copied());
+                }
+            }
+
             // we could have done an inner join to check the get the user id, but the user has already been checked previously.
             let quests = {
                 use crate::schema::quests::dsl::*;
@@ -236,20 +338,20 @@ pub async fn get_quests(
                     .await?
             };
 
-            let (result_quests, result_generated_data) = split_quest_rows(
+            let (result_quests, game_event_quests, result_generated_data) = split_quest_rows(
                 quests
                     .into_iter()
                     .map(|q| (q.id, q.info.0, q.generated_data.0)),
+                &open_event_instances,
             );
 
-            // Featured daily quests: a global, deterministic day-rotating set (SAME for
-            // every player), level-scaled to this character. Uses the same `now` as the
-            // job rotation so both refresh at the 05:00 boundary together.
-            let game_event_quests = quests_daily::select(
-                &globals.static_data.quests_daily,
+            // Events opening within the next 24h, announced but not yet playable.
+            let game_event_quests_in_warning = event_quests::upcoming(
+                &globals.static_data,
                 &globals.game_data,
-                now,
-                character.character.0.level as i64,
+                character_id_var,
+                player_level,
+                now as i64,
             );
 
             Ok(Json(GetQuestsResponse {
@@ -263,7 +365,7 @@ pub async fn get_quests(
                 jobs,
                 game_event_quests,
                 game_event_quests_finished: Vec::new(),
-                game_event_quests_in_warning: Vec::new(),
+                game_event_quests_in_warning,
                 job_pools,
             }))
         }
@@ -369,30 +471,132 @@ async fn accept_quest(
     let to_insert = QuestDbEntry {
         id: quest_id,
         character_id,
-        info: JsonDbWrapper(quest.clone()),
-        generated_data: JsonDbWrapper(dungeon_generated_data.clone()),
+        info: JsonDbWrapper(quest),
+        generated_data: JsonDbWrapper(dungeon_generated_data),
         dungeon_state: None,
     };
 
+    // Accepting an already-accepted quest returns the STORED row rather than failing
+    // on the (id, character_id) primary key. The client re-sends /accept on a retry
+    // or a reconnect, and a 500 there strands the player on a quest they cannot open;
+    // it must also not reset progress they already made, so the stored row wins.
     {
-        use crate::schema::quests::dsl::*;
-
-        insert_into(quests::table())
+        use crate::schema::quests;
+        insert_into(quests::table)
             .values(&to_insert)
+            .on_conflict((quests::id, quests::character_id))
+            .do_nothing()
             .execute(&mut conn)
             .await?;
     }
+    let stored = {
+        use crate::schema::quests;
+        quests::table
+            .filter(quests::id.eq(quest_id))
+            .filter(quests::character_id.eq(character_id))
+            .select(QuestDbEntry::as_select())
+            .load(&mut conn)
+            .await?
+            .into_iter()
+            .next()
+            .unwrap_or(to_insert)
+    };
 
     Ok(Json(AcceptQuestResponse {
         quest: QuestWithId {
-            quest_id: quest_id,
-            quest,
+            quest_id,
+            quest: stored.info.0,
         },
-        dungeon_generated_data: dungeon_generated_data.map(|v| DungeonGeneratedDataWithId {
-            quest_id: quest_id,
-            inner: v,
-        }),
+        dungeon_generated_data: stored
+            .generated_data
+            .0
+            .map(|inner| DungeonGeneratedDataWithId { quest_id, inner }),
     }))
+}
+
+/// What completing `quest_id` pays, and the bookkeeping that goes with it.
+///
+/// Two populations, and telling them apart is the whole point:
+///
+/// * **An ordinary quest** pays a fixed amount from `quest_rewards.json`. That table
+///   is keyed by the TEMPLATE id, so the lookup goes through `gldQuestId` first and
+///   only falls back to the row id. It used to be the other way round, against a
+///   table keyed by whatever id happened to be in the captured URL — which for an
+///   event quest is a per-character instance, so 78 of its 148 keys belonged to
+///   instances that will never exist again and every event quest paid nothing.
+///
+/// * **An event quest** is repeatable and pays a MILESTONE: the Nth completion pays
+///   `rewards[N]`, and the last one additionally pays `finalReward`. Measured across
+///   93 retail instances — 91/93 first completions, 67/68 second, 59/60 third, 56/57
+///   fourth, and all 54 observed fifth completions paid the last tier merged with
+///   `finalReward`. Past the last milestone the instance is exhausted and pays
+///   nothing.
+///
+/// A quest with no captured reward pays an empty grant and is logged. No number is
+/// synthesised for it: observed `characterXp` spreads over 200–900 with no rule that
+/// predicts it from level, category or objective count, so a constant would be a
+/// fabrication wearing a fallback's clothes. `quest_rewards.json._meta` lists exactly
+/// which quests are in that state.
+fn resolve_completion_reward(
+    static_data: &blades_lib::static_data::StaticData,
+    quest_id: Uuid,
+    quest: &blades_lib::user_data::Quest,
+    server_state: &mut blades_lib::server_state::ServerState,
+) -> RewardGrant {
+    if matches!(quest.r#type, blades_lib::user_data::QuestType::GameEvent) {
+        let Some(tmpl) = static_data.event_quests.templates.get(&quest.gld_quest_id) else {
+            log::warn!(
+                "[quest] event quest {quest_id} (template {}) has no entry in \
+                 event_quests.json — paying nothing",
+                quest.gld_quest_id
+            );
+            return RewardGrant::default();
+        };
+        let completion = *server_state
+            .event_quest_completions
+            .entry(quest_id)
+            .or_insert(0) as usize;
+        let Some(mut reward) = tmpl.payout(completion) else {
+            return RewardGrant::default(); // instance exhausted
+        };
+        if completion + 1 == tmpl.milestone_count() {
+            if let Some(final_reward) = &tmpl.final_reward {
+                merge_reward(&mut reward, final_reward);
+            }
+        }
+        server_state
+            .event_quest_completions
+            .insert(quest_id, completion as u32 + 1);
+        return reward;
+    }
+
+    // Template first: `quest_rewards.json` is keyed by gldQuestId.
+    if let Some(r) = static_data.quest_rewards.get(&quest.gld_quest_id) {
+        return r.clone();
+    }
+    if let Some(r) = static_data.quest_rewards.get(&quest_id) {
+        return r.clone();
+    }
+    log::warn!(
+        "[quest] no captured reward for quest {quest_id} (template {}) — paying nothing",
+        quest.gld_quest_id
+    );
+    RewardGrant::default()
+}
+
+/// Add `extra` into `into`. Used for the last event milestone, which retail paid as
+/// the tier and the `finalReward` in a single `/complete` body.
+fn merge_reward(into: &mut RewardGrant, extra: &RewardGrant) {
+    for (id, n) in &extra.currencies {
+        *into.currencies.entry(*id).or_insert(0) += *n;
+    }
+    for (id, n) in &extra.stackable_items {
+        *into.stackable_items.entry(*id).or_insert(0) += *n;
+    }
+    into.items.extend(extra.items.iter().cloned());
+    into.chests.extend(extra.chests.iter().cloned());
+    into.character_xp += extra.character_xp;
+    into.town_xp += extra.town_xp;
 }
 
 // ---------------------------------------------------------------------------
@@ -461,20 +665,12 @@ pub async fn complete_quest(
 
             quest_entry.info.0.completed = true;
 
-            // Look up the capture-derived reward. Lenient: unknown quest → empty reward.
-            let reward = globals
-                .static_data
-                .quest_rewards
-                .get(&quest_id)
-                // Also try by gldQuestId (event quests use gldQuestId ≠ quest_id).
-                .or_else(|| {
-                    globals
-                        .static_data
-                        .quest_rewards
-                        .get(&quest_entry.info.0.gld_quest_id)
-                })
-                .cloned()
-                .unwrap_or_default();
+            let reward = resolve_completion_reward(
+                &globals.static_data,
+                quest_id,
+                &quest_entry.info.0,
+                &mut entry.server_state.0,
+            );
 
             let mut tracker = InventoryChangeTracker::default();
             apply_reward(
@@ -554,27 +750,35 @@ struct ObjectivesRequest {
     objective_updates: std::collections::HashMap<Uuid, ObjectiveUpdate>,
 }
 
+/// One objective's absolute progress as the client reports it.
+///
+/// The client sends exactly `{status, progress}` — 1409 of 1409 captured
+/// `objectiveUpdates` entries have those two keys and nothing else. In particular it
+/// never sends `completed`, so completion has to be read off `status == Completed`.
+/// Reading a `completed` flag that never arrives left `any_newly_completed` false on
+/// every request, which silently disabled the objective-reward path entirely.
 #[derive(Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
 struct ObjectiveUpdate {
     status: blades_lib::user_data::QuestStatus,
     progress: f64,
-    #[serde(default)]
-    completed: bool,
 }
 
 /// Wire shape for the objectives response.
 ///
-/// Per captures there are two cases:
-/// 1. Pure progress update (no objective yet completed): `{ quest:{...} }`.
-/// 2. An objective reaches `Completed` status: `{ reward:{...}, inventory:{...},
-///    character:{...}, quest:{...} }`.
+/// The retail corpus has exactly three shapes, and the key the quest comes back
+/// under is part of the contract:
 ///
-/// We always include all fields and rely on `skip_serializing_if` to omit the empty
-/// reward/inventory/character when no reward is due. In practice the client ignores
-/// extra empty fields, but this matches the narrow case 1 wire exactly too (the
-/// captured case-1 body was purely `{quest:{...}}`). We therefore split on whether the
-/// reward is empty.
+/// | shape | n | when |
+/// |---|---|---|
+/// | `{quest}` | 856 | ordinary quest, no objective reward |
+/// | `{gameEventQuest}` | 363 | event quest — **always** just the quest |
+/// | `{character, inventory, quest, reward}` | 42 | ordinary quest whose objective carries a reward |
+///
+/// Two things follow. An event quest never pays here (its milestones are paid at
+/// `/complete`), and an ordinary quest pays only what that OBJECTIVE is worth in
+/// `parsed.json` — not the whole quest reward, which is what this handler used to
+/// grant and which would have double-paid against `/complete`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ObjectivesResponse {
@@ -584,7 +788,62 @@ struct ObjectivesResponse {
     inventory: Option<CompleteInventoryUpdate>,
     #[serde(skip_serializing_if = "Option::is_none")]
     character: Option<CompleteCharacterWithIdWithoutData>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    quest: Option<QuestWithId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    game_event_quest: Option<QuestWithId>,
+}
+
+/// Which of the two response slots the updated quest goes into.
+///
+/// Retail answers an event quest under `gameEventQuest` (363 responses) and an
+/// ordinary one under `quest` (856, plus 42 that also carry a reward). The client
+/// reads the two keys differently — one drives the milestone track, the other the
+/// quest log — so a quest in the wrong slot is silently ignored.
+fn objectives_wire_slot(
+    is_event: bool,
     quest: QuestWithId,
+) -> (Option<QuestWithId>, Option<QuestWithId>) {
+    if is_event {
+        (None, Some(quest))
+    } else {
+        (Some(quest), None)
+    }
+}
+
+/// What newly completing `objective_ids` on `gld_quest_id` is worth.
+///
+/// Straight from `parsed.json`: each objective carries a `rewards[]` list with
+/// `experience` and `town_points`. 20 of the 301 shipped objectives have one, which
+/// is the population behind retail's 42 reward-bearing `/objectives` responses.
+///
+/// `items_to_reward` is deliberately NOT granted: 18 of those 20 name an item
+/// template, and turning a template id into an instanced `RewardItem` needs the item
+/// generator that the shop/craft paths own. Granting the XP and skipping the item is
+/// visible and short; inventing an item is not.
+fn objective_reward(
+    game_data: &blades_lib::game_data::GameData,
+    gld_quest_id: Uuid,
+    objective_ids: &[Uuid],
+) -> RewardGrant {
+    let mut out = RewardGrant::default();
+    let Some(info) = game_data
+        .quests
+        .get(&gld_quest_id)
+        .and_then(|q| q.dungeon_info.as_ref())
+    else {
+        return out;
+    };
+    for oid in objective_ids {
+        let Some(objective) = info.objectives.get(oid) else {
+            continue;
+        };
+        for r in &objective.rewards {
+            out.character_xp += r.experience.max(0.0) as u64;
+            out.town_xp += r.town_points;
+        }
+    }
+    out
 }
 
 #[post(
@@ -636,8 +895,10 @@ pub async fn update_quest_objectives(
                     .ok_or_else(|| BladeApiError::new(StatusCode::NOT_FOUND, 20001, 1))?
             };
 
-            // Merge each objective update in. The client sends absolute progress.
-            let mut any_newly_completed = false;
+            // Merge each objective update in. The client sends absolute progress, and
+            // reports completion as `status: "Completed"` — there is no `completed`
+            // flag on the wire.
+            let mut newly_completed: Vec<Uuid> = Vec::new();
             for (obj_id, update) in &body.objective_updates {
                 let entry_obj = quest_entry
                     .info
@@ -651,33 +912,27 @@ pub async fn update_quest_objectives(
                     });
                 entry_obj.status = update.status;
                 entry_obj.progress = update.progress;
-                if update.completed && !entry_obj.completed {
+                let done = matches!(update.status, blades_lib::user_data::QuestStatus::Completed);
+                if done && !entry_obj.completed {
                     entry_obj.completed = true;
-                    any_newly_completed = true;
+                    newly_completed.push(*obj_id);
                 }
             }
 
-            // Grant an objective-completion reward only if at least one objective became
-            // Completed for the first time. We look up by quest_id / gldQuestId.
-            // NOTE: The captures show partial rewards (stackableItems only) on a
-            // single-objective completion. For simplicity we grant the full quest reward
-            // when any objective completes; the client is lenient about over-rewarding
-            // here (the actual full reward is still gatekept at `/complete`).
-            let reward = if any_newly_completed {
-                globals
-                    .static_data
-                    .quest_rewards
-                    .get(&quest_id)
-                    .or_else(|| {
-                        globals
-                            .static_data
-                            .quest_rewards
-                            .get(&quest_entry.info.0.gld_quest_id)
-                    })
-                    .cloned()
-                    .unwrap_or_default()
-            } else {
+            let is_event = matches!(
+                quest_entry.info.0.r#type,
+                blades_lib::user_data::QuestType::GameEvent
+            );
+            // An event quest never pays here — all 363 captured `{gameEventQuest}`
+            // responses are the quest alone, and its milestones are paid at /complete.
+            let reward = if is_event || newly_completed.is_empty() {
                 RewardGrant::default()
+            } else {
+                objective_reward(
+                    &globals.game_data,
+                    quest_entry.info.0.gld_quest_id,
+                    &newly_completed,
+                )
             };
 
             let (opt_inventory, opt_character) = if !reward.is_empty() {
@@ -743,11 +998,13 @@ pub async fn update_quest_objectives(
                     .await?;
             }
 
+            let (quest, game_event_quest) = objectives_wire_slot(is_event, quest_with_id);
             Ok::<_, BladeApiError>(Json(ObjectivesResponse {
                 reward,
                 inventory: opt_inventory,
                 character: opt_character,
-                quest: quest_with_id,
+                quest,
+                game_event_quest,
             }))
         }
         .scope_boxed()
@@ -1044,6 +1301,9 @@ mod jobs_gen {
             difficulty_level: get_i64(job, "difficultyLevel", 1),
             seed: get_i64(job, "seed", 0).into(),
             gld_quest_id: JOB_SENTINEL_GLD,
+            game_event_quest_data: None,
+            rewards: None,
+            final_reward: None,
             completed: false,
         };
         Some(QuestDbEntry {
@@ -1307,102 +1567,153 @@ mod jobs_gen {
 }
 
 // ---------------------------------------------------------------------------
-// Daily featured quests (`quests_daily`)
+// Event ("Sigil") quests (`event_quests`)
 // ---------------------------------------------------------------------------
 //
-// The `/quests` response's `game_event_quests*` arrays were empty TODOs. This module
-// mirrors `jobs_gen`'s deterministic selection, but for the story/side/event QUEST board
-// (distinct from town JOBS): a set of "featured" daily quests, the SAME for every player,
-// rotating at the 05:00-UTC day boundary. Bodies come from `generate_quest_data` (so they
-// are level-scaled + accept-able), and the nil-dungeon quests are excluded.
-mod quests_daily {
+// The `/quests` response's `gameEventQuests[]` array is where a timed event quest
+// reaches the player. It is NOT a place for ordinary quests: across the retail
+// corpus every one of the 2 753 entries in that array carried `type: "GAME_EVENT"`,
+// a `gameEventQuestData.gameEventInstanceId`, five milestone `rewards` and a
+// `finalReward`. (Between this change and the previous one, we were filling it with
+// `type: "NORMAL"` quests picked by a guessed daily rotation — visible in our own
+// captured traffic by its tell-tale `seed: 1234`.)
+//
+// The model, entirely from `game_events.json` + `event_quests.json`:
+//
+//   * An event repeats every `recurrence.recurrenceInterval` days and each instance
+//     stays open `durationSecs` (39 days / 2 days for all 39 events).
+//   * While an instance is open, each character gets ONE quest row for it. The row's
+//     `questId` is a per-character INSTANCE id; its `gldQuestId` is the template.
+//     **Everything downstream must resolve through `gldQuestId`** — the objectives,
+//     the dungeon, the rewards and the version all live under the template, and the
+//     instance id resolves to nothing at all in `parsed.json`.
+//   * Completing the instance is repeatable: the Nth completion pays the Nth
+//     milestone, and the last also pays `finalReward` (see `complete_quest`).
+mod event_quests {
     use super::*;
-    use blades_lib::static_data::QuestsDailyData;
-    use blades_lib::user_data::QuestWithId;
-    use blades_lib::util::quest::generate_quest_data;
+    use blades_lib::features::game_events::{self, EventDef, WARNING_LEAD_SECS};
+    use blades_lib::game_data::GameData;
+    use blades_lib::static_data::StaticData;
+    use blades_lib::user_data::{DungeonGeneratedData, GameEventQuestData, QuestType};
 
-    const SECS_PER_DAY: u64 = 86_400;
-
-    /// The UTC day index for `now`, shifted to the config's reset boundary (default
-    /// 05:00). All players share this index, so the featured set is global + stable
-    /// within a day and changes at the reset. Deterministic — tests inject `now`.
-    pub fn day_index(daily: &QuestsDailyData, now: u64) -> u64 {
-        let hour = daily.selection.reset_hour_utc; // 0 when unset → midnight boundary
-        let minute = daily.selection.reset_minute_utc;
-        let shift = hour * 3600 + minute * 60;
-        now.saturating_sub(shift) / SECS_PER_DAY
+    /// One event-quest instance built for a character.
+    pub struct MintedEventQuest {
+        pub quest_id: Uuid,
+        pub quest: blades_lib::user_data::Quest,
+        pub dungeon: Option<DungeonGeneratedData>,
     }
 
-    /// A deterministic FNV-1a hash of `(day_index, category, slot)` → a pool index seed.
-    /// Same day → same picks; changes at the day boundary. No per-character input (the
-    /// featured set is global).
-    fn slot_hash(day: u64, category: &str, slot: u32) -> u64 {
-        let mut h: u64 = 0xCBF2_9CE4_8422_2325;
-        let mut mix = |bytes: &[u8]| {
-            for b in bytes {
-                h ^= *b as u64;
-                h = h.wrapping_mul(0x0000_0100_0000_01B3);
-            }
-        };
-        mix(&day.to_le_bytes());
-        mix(category.as_bytes());
-        mix(&slot.to_le_bytes());
-        h
-    }
-
-    /// Select the featured daily quest IDS for `now`'s day: per the `selection.perDay`
-    /// rules, `count` distinct quests per category, de-duplicated, drawn from
-    /// `dailyQuestPool` and EXCLUDING the nil-dungeon quests. Pure + deterministic — the
-    /// server generates the bodies (see [`select`]).
-    pub fn select_ids(daily: &QuestsDailyData, now: u64) -> Vec<Uuid> {
-        let day = day_index(daily, now);
-        let excluded = daily.non_dungeon_ids();
-        let mut chosen: Vec<Uuid> = Vec::new();
-
-        for rule in &daily.selection.per_day {
-            // Candidate pool for this category, excluding nil-dungeon + already-chosen.
-            let pool: Vec<Uuid> = daily
-                .daily_quest_pool
-                .iter()
-                .filter(|q| q.category == rule.category)
-                .map(|q| q.quest_id)
-                .filter(|id| !excluded.contains(id))
-                .collect();
-            if pool.is_empty() {
-                continue;
-            }
-            for slot in 0..rule.count {
-                // Probe forward from the hashed start index for the first not-yet-chosen
-                // quest (dedup within the day); bounded by the pool length.
-                let start = (slot_hash(day, &rule.category, slot) % pool.len() as u64) as usize;
-                for probe in 0..pool.len() {
-                    let id = pool[(start + probe) % pool.len()];
-                    if !chosen.contains(&id) {
-                        chosen.push(id);
-                        break;
-                    }
-                }
-            }
+    /// The per-character instance quest id for an event instance.
+    ///
+    /// Deterministic so that re-fetching `/quests` inside the window resolves the
+    /// same stored row — otherwise every poll would mint a new quest and the player's
+    /// objective progress and milestone count would reset under them. Derived from
+    /// `(character_id, gameEventInstanceId)`, which already contains the event id and
+    /// the window start, so two windows of the same event get different ids.
+    pub fn instance_quest_id(character_id: Uuid, game_event_instance_id: &str) -> Uuid {
+        let mut h: u64 = 0xCBF2_9CE4_8422_2325; // FNV-1a
+        let mut lo: u64 = 0x84222325_CBF29CE4;
+        for b in character_id
+            .as_bytes()
+            .iter()
+            .chain(game_event_instance_id.as_bytes())
+        {
+            h ^= *b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01B3);
+            lo = lo.rotate_left(7) ^ h;
         }
-        chosen
+        let mut bytes = [0u8; 16];
+        bytes[0..8].copy_from_slice(&h.to_le_bytes());
+        bytes[8..16].copy_from_slice(&lo.to_le_bytes());
+        bytes[6] = (bytes[6] & 0x0F) | 0x40; // v4 shape
+        bytes[8] = (bytes[8] & 0x3F) | 0x80;
+        Uuid::from_bytes(bytes)
     }
 
-    /// Build the featured daily quests for `now`'s day as wire `QuestWithId` entries,
-    /// level-scaled to `player_level`. A quest whose body can't be generated (unknown id
-    /// in a partial parsed.json) is skipped — never fails the whole board.
-    pub fn select(
-        daily: &QuestsDailyData,
-        game_data: &blades_lib::game_data::GameData,
-        now: u64,
+    /// Build the wire body for one event instance. `None` when the template quest is
+    /// not in `parsed.json` (then we cannot honestly produce objectives or a dungeon,
+    /// so the event is simply not advertised rather than advertised unplayable).
+    fn build(
+        def: &EventDef,
+        instance_start: i64,
+        static_data: &StaticData,
+        game_data: &GameData,
+        character_id: Uuid,
         player_level: i64,
+    ) -> Option<MintedEventQuest> {
+        let instance_id = format!("{}::{}", def.event_id, instance_start);
+        let quest_id = instance_quest_id(character_id, &instance_id);
+
+        // Resolve the body through the TEMPLATE id — `def.quest_id` is the gldQuestId.
+        let (mut quest, dungeon) = generate_quest_data(
+            game_data,
+            def.quest_id,
+            player_level,
+            &static_data.quests_daily.level_scaling,
+        )
+        .ok()?;
+
+        quest.r#type = QuestType::GameEvent;
+        quest.gld_quest_id = def.quest_id;
+        quest.game_event_quest_data = Some(GameEventQuestData {
+            game_event_instance_id: instance_id,
+        });
+        if let Some(tmpl) = static_data.event_quests.templates.get(&def.quest_id) {
+            quest.rewards = Some(tmpl.rewards.clone());
+            quest.final_reward = tmpl.final_reward.clone();
+        }
+        Some(MintedEventQuest {
+            quest_id,
+            quest,
+            dungeon,
+        })
+    }
+
+    /// The event quests whose instance window covers `now`.
+    pub fn mint(
+        static_data: &StaticData,
+        game_data: &GameData,
+        character_id: Uuid,
+        player_level: i64,
+        now: i64,
+    ) -> Vec<MintedEventQuest> {
+        static_data
+            .game_events
+            .iter()
+            .filter_map(|def| {
+                let start = def.active_instance_start(now)?;
+                build(def, start, static_data, game_data, character_id, player_level)
+            })
+            .collect()
+    }
+
+    /// The event quests whose window opens within the warning lead (24 h).
+    pub fn upcoming(
+        static_data: &StaticData,
+        game_data: &GameData,
+        character_id: Uuid,
+        player_level: i64,
+        now: i64,
     ) -> Vec<QuestWithId> {
-        select_ids(daily, now)
+        game_events::upcoming_events(&static_data.game_events, now, WARNING_LEAD_SECS)
             .into_iter()
-            .filter_map(|quest_id| {
-                let (quest, _dungeon) =
-                    generate_quest_data(game_data, quest_id, player_level, &daily.level_scaling)
-                        .ok()?;
-                Some(QuestWithId { quest_id, quest })
+            .filter_map(|e| {
+                let def = static_data
+                    .game_events
+                    .iter()
+                    .find(|d| d.quest_id == e.quest_id)?;
+                let m = build(
+                    def,
+                    e.start_time_secs,
+                    static_data,
+                    game_data,
+                    character_id,
+                    player_level,
+                )?;
+                Some(QuestWithId {
+                    quest_id: m.quest_id,
+                    quest: m.quest,
+                })
             })
             .collect()
     }
@@ -1626,97 +1937,226 @@ mod jobs_tests {
 }
 
 #[cfg(test)]
-mod quests_daily_tests {
-    use super::quests_daily;
-    use blades_lib::static_data::{
-        DailyQuestDef, DailySelection, DailySelectionRule, QuestsDailyData,
-    };
-    use uuid::Uuid;
+mod event_quest_tests {
+    use super::*;
+    use blades_lib::static_data::StaticData;
 
-    const DAY_SECS: u64 = 86_400;
-    // 2026-05-13 06:00 UTC — after the 05:00 reset.
-    const NOW: u64 = 1_778_648_400 + 3600;
-
-    fn q(cat: &str, n: u128) -> DailyQuestDef {
-        DailyQuestDef {
-            quest_id: Uuid::from_u128(n),
-            name: format!("{cat} {n}"),
-            category: cat.into(),
-            dungeon_id: Some(Uuid::from_u128(0xD000 + n)),
-            objective_count: 1,
-        }
+    /// The committed static data, loaded the way the server loads it.
+    fn static_data() -> StaticData {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy/static");
+        crate::static_loader::load(&dir)
     }
 
-    fn fixture() -> QuestsDailyData {
-        let nil = Uuid::from_u128(0);
-        QuestsDailyData {
-            daily_quest_pool: vec![
-                q("side", 1), q("side", 2), q("side", 3), q("side", 4),
-                q("bounty", 10), q("bounty", 11),
-                // A pool member that is ALSO a nil-dungeon quest → must be excluded.
-                DailyQuestDef { quest_id: nil, category: "side".into(), ..Default::default() },
-            ],
-            selection: DailySelection {
-                reset_hour_utc: 5,
-                reset_minute_utc: 0,
-                per_day: vec![
-                    DailySelectionRule { category: "side".into(), count: 2 },
-                    DailySelectionRule { category: "bounty".into(), count: 1 },
-                ],
-            },
-            non_dungeon_quests: vec![DailyQuestDef { quest_id: nil, ..Default::default() }],
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn select_ids_is_deterministic_per_day_and_rotates() {
-        let d = fixture();
-        let today = quests_daily::select_ids(&d, NOW);
-        // Same day → identical picks.
-        assert_eq!(today, quests_daily::select_ids(&d, NOW + 3600), "stable within the day");
-        // 2 side + 1 bounty = 3 picks, all distinct.
-        assert_eq!(today.len(), 3, "perDay counts honored");
-        let mut uniq = today.clone();
-        uniq.sort();
-        uniq.dedup();
-        assert_eq!(uniq.len(), 3, "picks are de-duplicated");
-        // The nil-dungeon quest is never selected.
-        assert!(!today.contains(&Uuid::from_u128(0)), "nil-dungeon quest excluded");
-        // A different day generally rotates the set (not asserting inequality of a
-        // specific slot, just that the day index advances the hash input).
-        let next = quests_daily::select_ids(&d, NOW + DAY_SECS);
-        assert_eq!(next.len(), 3);
-    }
-
-    #[test]
-    fn day_index_advances_at_reset_boundary() {
-        let d = fixture();
-        // Just before 05:00 UTC and just after belong to different day indices.
-        let midnight = (NOW / DAY_SECS) * DAY_SECS; // 00:00 UTC of NOW's day
-        let just_before_reset = midnight + 5 * 3600 - 1;
-        let just_after_reset = midnight + 5 * 3600 + 1;
-        assert_ne!(
-            quests_daily::day_index(&d, just_before_reset),
-            quests_daily::day_index(&d, just_after_reset),
-            "the day rolls over at the 05:00 reset"
-        );
-    }
-
-    /// The real committed `quests_daily.json` selects a stable, non-empty, nil-free set.
-    #[test]
-    fn real_quests_daily_file_selects_nonempty_nil_free() {
+    fn game_data() -> blades_lib::game_data::GameData {
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../deploy/static/quests_daily.json");
+            .join("../deploy/static/parsed.json");
         let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
-        let daily: QuestsDailyData = serde_json::from_str(&raw).expect("valid quests_daily.json");
+        serde_json::from_str(&raw).expect("valid parsed.json")
+    }
 
-        let ids = quests_daily::select_ids(&daily, NOW);
-        assert!(!ids.is_empty(), "real file yields a featured set");
-        let excluded = daily.non_dungeon_ids();
-        assert!(ids.iter().all(|id| !excluded.contains(id)), "no nil-dungeon quest featured");
-        // Deterministic against the real file too.
-        assert_eq!(ids, quests_daily::select_ids(&daily, NOW + 100), "stable within the day");
+    const CHAR: Uuid = Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0);
+    /// 2026-05-03 00:00 UTC — inside the corpus's own event calendar.
+    const NOW: i64 = 1_777_852_800;
+
+    /// A quest body built through serde from the exact key set production stores.
+    fn quest(gld: Uuid) -> blades_lib::user_data::Quest {
+        serde_json::from_value(json!({
+            "version": 0,
+            "type": "NORMAL",
+            "objectiveStatuses": {},
+            "difficultyLevel": 0,
+            "seed": 0,
+            "gldQuestId": gld,
+            "completed": false,
+        }))
+        .expect("fixture quest must deserialize")
+    }
+
+    fn generated() -> blades_lib::user_data::DungeonGeneratedData {
+        serde_json::from_value(json!({ "algorithmVersion": 0, "version": 0 }))
+            .expect("minimal generated data must deserialize")
+    }
+
+    /// THE gldQuestId gotcha, pinned.
+    ///
+    /// An event quest's `questId` is a per-character instance that resolves to
+    /// NOTHING in `parsed.json`; its `gldQuestId` is the template that carries the
+    /// objectives, the dungeon, the version and the rewards. Retail's corpus is
+    /// unambiguous: 1271 of the event-quest entries had `questId != gldQuestId` and
+    /// not one had them equal.
+    #[test]
+    fn an_event_quest_instance_id_is_not_its_template_id() {
+        let sd = static_data();
+        let gd = game_data();
+        let minted = event_quests::mint(&sd, &gd, CHAR, 40, NOW);
+        assert!(!minted.is_empty(), "the committed calendar opens events at NOW");
+        for m in &minted {
+            assert_ne!(
+                m.quest_id, m.quest.gld_quest_id,
+                "the instance id must differ from the template id"
+            );
+            assert!(
+                gd.quests.contains_key(&m.quest.gld_quest_id),
+                "the TEMPLATE resolves in parsed.json"
+            );
+            assert!(
+                !gd.quests.contains_key(&m.quest_id),
+                "the INSTANCE must not — that is the whole point of the two ids"
+            );
+            assert!(matches!(m.quest.r#type, blades_lib::user_data::QuestType::GameEvent));
+            let data = m.quest.game_event_quest_data.as_ref().expect("carries its instance");
+            assert!(data.game_event_instance_id.contains("::"));
+        }
+    }
+
+    /// Every open event must be *playable*: objectives and dungeon data, resolved
+    /// through the template. Advertising an event with no dungeon data is what hangs
+    /// the client's quest map (report #62), and the instance id resolves to nothing,
+    /// so a lookup on the wrong id produces exactly that.
+    #[test]
+    fn every_minted_event_quest_has_objectives_and_dungeon_data() {
+        let sd = static_data();
+        let gd = game_data();
+        for m in event_quests::mint(&sd, &gd, CHAR, 40, NOW) {
+            assert!(
+                !m.quest.objective_statuses.is_empty(),
+                "event quest {} has no objectives",
+                m.quest_id
+            );
+            assert!(
+                m.dungeon.is_some(),
+                "event quest {} has no dungeon data — the client would wait forever",
+                m.quest_id
+            );
+            assert!(m.quest.rewards.is_some(), "milestones must reach the client");
+            assert_eq!(m.quest.rewards.as_ref().unwrap().len(), 5, "five milestones");
+            assert!(m.quest.final_reward.is_some());
+        }
+    }
+
+    /// The instance id is stable for a character within a window and different across
+    /// characters and across windows. Without stability every `/quests` poll would
+    /// mint a new row and reset the player's progress.
+    #[test]
+    fn instance_ids_are_stable_per_character_and_window() {
+        let a = event_quests::instance_quest_id(CHAR, "e1::1000");
+        assert_eq!(a, event_quests::instance_quest_id(CHAR, "e1::1000"), "stable");
+        assert_ne!(a, event_quests::instance_quest_id(CHAR, "e1::2000"), "next window differs");
+        let other = Uuid::from_u128(0xdead_beef);
+        assert_ne!(a, event_quests::instance_quest_id(other, "e1::1000"), "per character");
+    }
+
+    /// A GAME_EVENT row goes to `gameEventQuests[]`, never `quests[]` — and only
+    /// while its window is open.
+    #[test]
+    fn event_rows_are_routed_to_the_event_array_and_expire_with_their_window() {
+        let open = Uuid::from_u128(0x0E1);
+        let closed = Uuid::from_u128(0x0E2);
+        let normal = Uuid::from_u128(0x0A1);
+        let mut event = quest(Uuid::from_u128(0xC0FFEE));
+        event.r#type = blades_lib::user_data::QuestType::GameEvent;
+
+        let mut live = std::collections::HashSet::new();
+        live.insert(open);
+
+        let (quests, events, generated_data) = split_quest_rows(
+            vec![
+                (open, event.clone(), Some(generated())),
+                (closed, event, Some(generated())),
+                (normal, quest(Uuid::from_u128(0xA1)), Some(generated())),
+            ]
+            .into_iter(),
+            &live,
+        );
+        assert_eq!(quests.len(), 1, "only the ordinary quest is in quests[]");
+        assert_eq!(quests[0].quest_id, normal);
+        assert_eq!(events.len(), 1, "the open event, and only it");
+        assert_eq!(events[0].quest_id, open);
+        // The client's invariant still holds across BOTH arrays.
+        let mut advertised: Vec<Uuid> = quests
+            .iter()
+            .chain(events.iter())
+            .map(|q| q.quest_id)
+            .collect();
+        let mut have: Vec<Uuid> = generated_data.iter().map(|g| g.quest_id).collect();
+        advertised.sort();
+        have.sort();
+        assert_eq!(advertised, have);
+    }
+
+    /// The milestone ladder: the Nth completion pays the Nth tier, the last one adds
+    /// the final reward, and past the end the instance pays nothing.
+    #[test]
+    fn an_event_quest_pays_its_milestones_in_order() {
+        let sd = static_data();
+        let gd = game_data();
+        let m = event_quests::mint(&sd, &gd, CHAR, 40, NOW)
+            .into_iter()
+            .next()
+            .expect("an open event");
+        let tmpl = sd
+            .event_quests
+            .templates
+            .get(&m.quest.gld_quest_id)
+            .expect("template shipped");
+        let mut state = blades_lib::server_state::ServerState::default();
+
+        let mut paid = Vec::new();
+        for _ in 0..6 {
+            paid.push(resolve_completion_reward(&sd, m.quest_id, &m.quest, &mut state));
+        }
+        for tier in 0..5 {
+            assert!(!paid[tier].is_empty(), "milestone {tier} must pay something");
+        }
+        assert!(
+            paid[5].is_empty(),
+            "a sixth completion pays nothing — the instance is exhausted"
+        );
+        // Successive milestones are distinct, i.e. it is a ladder and not the same
+        // reward five times (which is what a fixed quest_rewards lookup would give).
+        assert_ne!(
+            serde_json::to_value(&paid[0]).unwrap(),
+            serde_json::to_value(&paid[1]).unwrap(),
+            "milestone 1 and 2 must differ"
+        );
+        // The last one carries the finalReward on top of the last tier.
+        let final_reward = tmpl.final_reward.as_ref().expect("shipped");
+        let last = serde_json::to_value(&paid[4]).unwrap();
+        for (id, n) in &final_reward.stackable_items {
+            let got = last["stackableItems"][id.to_string()].as_u64().unwrap_or(0);
+            assert!(
+                got >= *n,
+                "the last milestone must include the finalReward's {n} of {id}, got {got}"
+            );
+        }
+        assert_eq!(state.event_quest_completions.get(&m.quest_id), Some(&5));
+    }
+
+    /// An ordinary quest resolves its reward through `gldQuestId`, and every quest
+    /// `quest_rewards.json` covers actually pays.
+    #[test]
+    fn an_ordinary_quest_pays_from_the_template_keyed_table() {
+        let sd = static_data();
+        let gd = game_data();
+        let mut state = blades_lib::server_state::ServerState::default();
+        let mut paid = 0;
+        for gld in gd.quests.keys() {
+            if !sd.quest_rewards.contains_key(gld) {
+                continue;
+            }
+            let mut q = quest(*gld);
+            q.r#type = blades_lib::user_data::QuestType::Normal;
+            // The ROW id is deliberately not the template id, so a lookup that keys on
+            // the row id instead of gldQuestId finds nothing and pays zero.
+            let row_id = Uuid::from_u128(0xF00D);
+            let reward = resolve_completion_reward(&sd, row_id, &q, &mut state);
+            assert!(!reward.is_empty(), "quest {gld} is covered but paid nothing");
+            paid += 1;
+        }
+        assert!(
+            paid >= 100,
+            "the committed table must cover a real share of the 171 quests, got {paid}"
+        );
     }
 }
 
@@ -1814,7 +2254,7 @@ mod report62_quest_map_tests {
         let without_data = Uuid::from_u128(2);
         let normal = Uuid::from_u128(0xAAAA);
 
-        let (quests, data) = split_quest_rows(
+        let (quests, _events, data) = split_quest_rows(
             vec![
                 (with_data, quest(normal), Some(generated())),
                 // "The Message": a real quest whose template ships no dungeon, so
@@ -1822,6 +2262,7 @@ mod report62_quest_map_tests {
                 (without_data, quest(normal), None),
             ]
             .into_iter(),
+            &Default::default(),
         );
 
         assert_eq!(quests.len(), 1, "the dataless quest must not be advertised");
@@ -1840,8 +2281,9 @@ mod report62_quest_map_tests {
     #[test]
     fn a_quest_with_data_is_still_served() {
         let id = Uuid::from_u128(7);
-        let (quests, data) = split_quest_rows(
+        let (quests, _events, data) = split_quest_rows(
             vec![(id, quest(Uuid::from_u128(0xBBBB)), Some(generated()))].into_iter(),
+            &Default::default(),
         );
         assert_eq!(quests.len(), 1, "a normal quest must still be served");
         assert_eq!(data.len(), 1, "…with its generated data");
@@ -1853,13 +2295,14 @@ mod report62_quest_map_tests {
     /// survive it.
     #[test]
     fn job_rows_are_still_excluded() {
-        let (quests, data) = split_quest_rows(
+        let (quests, _events, data) = split_quest_rows(
             vec![(
                 Uuid::from_u128(9),
                 quest(jobs_gen::JOB_SENTINEL_GLD),
                 Some(generated()),
             )]
             .into_iter(),
+            &Default::default(),
         );
         assert!(quests.is_empty(), "a job row must not appear in quests[]");
         assert!(data.is_empty());
@@ -1880,11 +2323,337 @@ mod report62_quest_map_tests {
         // "The Message"
         rows.push((Uuid::from_u128(300), quest(Uuid::from_u128(0xCCA4)), None));
 
-        let (quests, data) = split_quest_rows(rows.into_iter());
+        let (quests, _events, data) = split_quest_rows(rows.into_iter(), &Default::default());
         assert_eq!(quests.len(), 3, "three playable quests");
         assert_eq!(data.len(), 3, "each with its data");
         let a: Vec<Uuid> = quests.iter().map(|q| q.quest_id).collect();
         let b: Vec<Uuid> = data.iter().map(|g| g.quest_id).collect();
         assert_eq!(a, b);
+    }
+}
+
+#[cfg(test)]
+mod objectives_wire_tests {
+    use super::*;
+
+    /// The live 400.
+    ///
+    /// 137 of the 139 `/objectives` calls ever made against this server answered
+    /// `400 Json deserialize error: unknown variant 'Completed', expected 'Active'`
+    /// — the body below, verbatim from capture 257672. `QuestStatus` modelled only
+    /// `Active`, so the request could not be parsed and no quest could ever be
+    /// finished through the normal flow. It is the reason the audit's answer to
+    /// "how many quests are playable end to end" was zero.
+    #[test]
+    fn the_client_report_that_400ed_every_time_now_parses() {
+        let body = r#"{"objectiveUpdates":{"76b97069-67e9-4202-aa93-8bc1dc7fbc65":{"status":"Completed","progress":1.0}}}"#;
+        let parsed: ObjectivesRequest = serde_json::from_str(body)
+            .expect("the client's own completion report must deserialize");
+        let id = Uuid::parse_str("76b97069-67e9-4202-aa93-8bc1dc7fbc65").unwrap();
+        let update = parsed.objective_updates.get(&id).expect("the objective is there");
+        assert!(
+            matches!(update.status, blades_lib::user_data::QuestStatus::Completed),
+            "a completion report must arrive as Completed"
+        );
+        assert_eq!(update.progress, 1.0);
+    }
+
+    /// The control: an in-progress report still parses, so the fix is a widening and
+    /// not a swap. Without this a build that renamed `Active` to `Completed` would
+    /// pass the test above.
+    #[test]
+    fn an_in_progress_report_still_parses() {
+        let body = r#"{"objectiveUpdates":{"76b97069-67e9-4202-aa93-8bc1dc7fbc65":{"status":"Active","progress":0.5}}}"#;
+        let parsed: ObjectivesRequest = serde_json::from_str(body).expect("still valid");
+        let id = Uuid::parse_str("76b97069-67e9-4202-aa93-8bc1dc7fbc65").unwrap();
+        assert!(matches!(
+            parsed.objective_updates[&id].status,
+            blades_lib::user_data::QuestStatus::Active
+        ));
+    }
+
+    /// The three response shapes retail actually sent, and the key each quest comes
+    /// back under. An event quest answers under `gameEventQuest` with no reward; an
+    /// ordinary one under `quest`.
+    #[test]
+    fn an_event_quest_answers_under_its_own_key_and_pays_nothing_here() {
+        let q = QuestWithId {
+            quest_id: Uuid::from_u128(1),
+            quest: serde_json::from_value(json!({
+                "version": 1, "type": "GAME_EVENT", "objectiveStatuses": {},
+                "difficultyLevel": 10, "seed": 0,
+                "gldQuestId": "7f0d1508-312b-4036-970f-ff5f4c342526",
+                "completed": false,
+            }))
+            .unwrap(),
+        };
+        let (quest, game_event_quest) = objectives_wire_slot(true, q);
+        let wire = serde_json::to_value(ObjectivesResponse {
+            reward: RewardGrant::default(),
+            inventory: None,
+            character: None,
+            quest,
+            game_event_quest,
+        })
+        .unwrap();
+        assert!(wire.get("quest").is_none(), "an event quest is not under `quest`");
+        assert_eq!(wire["gameEventQuest"]["type"], "GAME_EVENT");
+        assert!(wire.get("reward").is_none(), "no reward on an event objective");
+        assert_eq!(
+            wire.as_object().unwrap().len(),
+            1,
+            "retail's 363 event responses were the quest and nothing else: {wire}"
+        );
+    }
+
+    /// ...and the ordinary case keeps its `quest` key, so the split is a routing
+    /// decision rather than a rename.
+    #[test]
+    fn an_ordinary_quest_still_answers_under_quest() {
+        let q = QuestWithId {
+            quest_id: Uuid::from_u128(2),
+            quest: serde_json::from_value(json!({
+                "version": 1, "type": "NORMAL", "objectiveStatuses": {},
+                "difficultyLevel": 10, "seed": 0,
+                "gldQuestId": "7f0d1508-312b-4036-970f-ff5f4c342526",
+                "completed": false,
+            }))
+            .unwrap(),
+        };
+        let (quest, game_event_quest) = objectives_wire_slot(false, q);
+        let wire = serde_json::to_value(ObjectivesResponse {
+            reward: RewardGrant::default(),
+            inventory: None,
+            character: None,
+            quest,
+            game_event_quest,
+        })
+        .unwrap();
+        assert_eq!(wire["quest"]["type"], "NORMAL");
+        assert!(wire.get("gameEventQuest").is_none());
+    }
+
+    /// A `GAME_EVENT` quest must survive a round-trip through the wire with its
+    /// event fields intact — they are what the client needs to show the milestone
+    /// track, and they are stored in the same JSONB the row is read back from.
+    #[test]
+    fn the_event_fields_round_trip_and_stay_off_an_ordinary_quest() {
+        let event: blades_lib::user_data::Quest = serde_json::from_value(json!({
+            "version": 1, "type": "GAME_EVENT", "objectiveStatuses": {},
+            "difficultyLevel": 10, "seed": -270074008i64,
+            "gldQuestId": "7f07d85f-f4ed-4762-b670-79e36b224902",
+            "gameEventQuestData": { "gameEventInstanceId": "ffcbe281-e953-49c9-b048-69780616c034::1777694400" },
+            "rewards": [{ "stackableItems": { "c64bcb53-41f4-41ba-892a-fe2cca423caa": 1 }, "characterXp": 700 }],
+            "finalReward": { "stackableItems": { "f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2": 25000 } },
+            "completed": false,
+        }))
+        .expect("a captured event quest must deserialize");
+        let back = serde_json::to_value(&event).unwrap();
+        assert_eq!(
+            back["gameEventQuestData"]["gameEventInstanceId"],
+            "ffcbe281-e953-49c9-b048-69780616c034::1777694400"
+        );
+        assert_eq!(back["rewards"][0]["characterXp"], 700);
+        assert_eq!(
+            back["finalReward"]["stackableItems"]["f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2"],
+            25000
+        );
+
+        // An ordinary quest must not grow the three event keys — retail never sent
+        // them on a NORMAL quest, and a `null` there is a wire change.
+        let normal: blades_lib::user_data::Quest = serde_json::from_value(json!({
+            "version": 1, "type": "NORMAL", "objectiveStatuses": {},
+            "difficultyLevel": 10, "seed": 0,
+            "gldQuestId": "7f0d1508-312b-4036-970f-ff5f4c342526", "completed": false,
+        }))
+        .unwrap();
+        let back = serde_json::to_value(&normal).unwrap();
+        for key in ["gameEventQuestData", "rewards", "finalReward"] {
+            assert!(back.get(key).is_none(), "{key} must be omitted, got {back}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod playability_sweep {
+    use super::*;
+    use blades_lib::static_data::StaticData;
+    use blades_lib::util::quest::generate_quest_data;
+
+    fn static_data() -> StaticData {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy/static");
+        crate::static_loader::load(&dir)
+    }
+
+    fn game_data() -> blades_lib::game_data::GameData {
+        let path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy/static/parsed.json");
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+        serde_json::from_str(&raw).expect("valid parsed.json")
+    }
+
+    /// The audit, as a test: walk every shipped quest through the accept path at a
+    /// spread of player levels and report what actually resolves.
+    ///
+    /// Accepting is where quest data has historically blown up — a nil dungeon uuid
+    /// used to `.ok_or(DungeonNotFound)` and 500 the six dialogue quests, and a
+    /// malformed item spawn used to panic. So this asserts three things, and the
+    /// numbers are stated rather than implied so a regression reads as a diff:
+    ///
+    ///  * every one of the 171 quests generates a body without erroring;
+    ///  * exactly the 6 nil-dungeon quests come back without dungeon data, and every
+    ///    other quest comes back WITH it;
+    ///  * every quest with a dungeon has at least one objective, because a quest with
+    ///    no objective cannot be completed by the client.
+    #[test]
+    fn every_shipped_quest_generates_at_every_level() {
+        let sd = static_data();
+        let gd = game_data();
+        let scaling = &sd.quests_daily.level_scaling;
+
+        let mut errored = Vec::new();
+        let mut no_dungeon = Vec::new();
+        let mut no_objectives: Vec<Uuid> = Vec::new();
+        let total = gd.quests.len();
+
+        for quest_id in gd.quests.keys() {
+            for level in [1i64, 15, 48, 86, 100] {
+                match generate_quest_data(&gd, *quest_id, level, scaling) {
+                    Err(e) => errored.push(format!("{quest_id} @ {level}: {e}")),
+                    Ok((quest, dungeon)) => {
+                        if level != 1 {
+                            continue; // the shape checks below do not vary with level
+                        }
+                        if dungeon.is_none() {
+                            no_dungeon.push(*quest_id);
+                        } else if quest.objective_statuses.is_empty() {
+                            no_objectives.push(*quest_id);
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(total, 171, "the shipped quest corpus is 171 quests");
+        assert!(errored.is_empty(), "{} quest(s) failed to generate:\n{}", errored.len(), errored.join("\n"));
+        assert_eq!(
+            no_dungeon.len(),
+            6,
+            "exactly the 6 nil-dungeon dialogue quests have no dungeon; got {}: {:?}",
+            no_dungeon.len(),
+            no_dungeon
+        );
+        // Every nil-dungeon quest must be one quests_daily.json already knows about,
+        // so the two never drift apart.
+        let declared = sd.quests_daily.non_dungeon_ids();
+        for id in &no_dungeon {
+            assert!(declared.contains(id), "{id} has no dungeon but is not in nonDungeonQuests");
+        }
+        // One known exception, and it is not a real quest: `MultiKitTest`
+        // (category "test", `version: 0`) is a developer fixture the client ships. It
+        // has a dungeon and zero objectives, so nothing can complete it — but nothing
+        // advertises it either, and inventing an objective for it would be exactly the
+        // kind of fabricated data this corpus is supposed to be free of. Pinned by id
+        // so a SECOND objective-less quest, which would be a real extraction bug,
+        // still fails this test.
+        let multikit_test = Uuid::parse_str("7fd324c5-cfcf-42df-8db7-07651a9a8ac2").unwrap();
+        no_objectives.retain(|id| *id != multikit_test);
+        assert!(
+            no_objectives.is_empty(),
+            "{} quest(s) have a dungeon but no objectives, so the client can never \
+             finish them: {:?}",
+            no_objectives.len(),
+            no_objectives
+        );
+    }
+
+    /// Reward coverage, stated as a number so it can only move deliberately.
+    ///
+    /// Before the capture re-extraction this was 26/171 (15 %), because the table was
+    /// keyed by the instance ids that appeared in captured `/complete` URLs rather
+    /// than by the template. Resolving those back through `gldQuestId` is what lifted
+    /// it. The remaining 29 are quests no capture ever completed; they pay nothing on
+    /// purpose rather than paying a made-up number.
+    #[test]
+    fn reward_coverage_is_what_the_captures_support() {
+        let sd = static_data();
+        let gd = game_data();
+        let flat = gd.quests.keys().filter(|q| sd.quest_rewards.contains_key(q)).count();
+        let evented = gd
+            .quests
+            .keys()
+            .filter(|q| sd.event_quests.templates.contains_key(q))
+            .count();
+        let covered: std::collections::HashSet<_> = gd
+            .quests
+            .keys()
+            .filter(|q| {
+                sd.quest_rewards.contains_key(q) || sd.event_quests.templates.contains_key(q)
+            })
+            .collect();
+
+        assert_eq!(flat, 103, "flat rewards from quest_rewards.json");
+        assert_eq!(evented, 39, "milestone ladders from event_quests.json");
+        assert_eq!(covered.len(), 142, "142 of 171 quests pay something");
+        assert!(
+            covered.len() as f64 / gd.quests.len() as f64 > 0.80,
+            "coverage must stay above 80%"
+        );
+        // …and the two tables must not overlap: a quest is EITHER flat or a ladder.
+        // Overlap would mean an event quest also has a fixed reward, and whichever
+        // branch ran first would silently win.
+        assert_eq!(
+            flat + evented,
+            covered.len(),
+            "a quest must not appear in both quest_rewards.json and event_quests.json"
+        );
+    }
+
+    /// Every event template ships a complete, usable ladder — five wire tiers, five
+    /// granting tiers and a final reward. A partially-extracted file would otherwise
+    /// pay `None` somewhere in the middle of a player's run.
+    #[test]
+    fn every_event_template_ships_a_complete_milestone_ladder() {
+        let sd = static_data();
+        assert_eq!(sd.event_quests.templates.len(), 39);
+        for (gld, tmpl) in &sd.event_quests.templates {
+            assert_eq!(tmpl.rewards.len(), 5, "{gld}: five wire milestones");
+            assert_eq!(tmpl.payable_rewards.len(), 5, "{gld}: five granting milestones");
+            assert!(tmpl.final_reward.is_some(), "{gld}: a final reward");
+            assert!(!tmpl.objective_ids.is_empty(), "{gld}: objective ids");
+            for step in 0..5 {
+                let payout = tmpl.payout(step).unwrap_or_else(|| panic!("{gld}: no tier {step}"));
+                assert!(!payout.is_empty(), "{gld}: tier {step} pays nothing");
+            }
+            assert!(tmpl.payout(5).is_none(), "{gld}: exhausted after five");
+        }
+    }
+
+    /// Every event in the calendar has a template AND a quest definition. An event
+    /// with no template would advertise a quest that pays nothing; one with no
+    /// definition would advertise a quest with no dungeon, which hangs the map.
+    #[test]
+    fn every_calendar_event_is_fully_backed() {
+        let sd = static_data();
+        let gd = game_data();
+        assert_eq!(sd.game_events.len(), 39, "the committed calendar");
+        for def in &sd.game_events {
+            assert!(
+                gd.quests.contains_key(&def.quest_id),
+                "event {} points at quest {} which is not in parsed.json",
+                def.event_id,
+                def.quest_id
+            );
+            assert!(
+                sd.event_quests.templates.contains_key(&def.quest_id),
+                "event {} has no milestone table",
+                def.event_id
+            );
+            assert_eq!(
+                def.recurrence.recurrence_interval, 39,
+                "every captured event recurs on 39 days"
+            );
+            assert_eq!(def.window_secs(), 172_800, "…and stays open for two");
+        }
     }
 }
