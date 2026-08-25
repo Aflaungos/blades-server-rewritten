@@ -307,6 +307,32 @@ pub trait DamageModel {
 }
 
 /// The RE-derived model, now running on the shipped item/ability/enchant data.
+/// Does this ability's rank actually ship a damage number?
+///
+/// `_damage` or `_damagePerSecond`. An ability with neither is a buff, and routing it
+/// through the damage model produces a hit of exactly 0.0 — which `emit_damage` then
+/// puts on the wire as an op50 over the OPPONENT, rendering a floating `0`. Reported
+/// after the first human-vs-human match: "RE shows a 0 damage effect on the opponent."
+///
+/// Two ways an ability reaches the damage arm without shipping damage:
+///   - it is a buff whose tag is `Generic` (`MagickaSurge`, `EchoWeapon` — both
+///     `kind: Spell`, `damage_type: None`, so `ability_tag_for_template` gives them
+///     `Generic`), or
+///   - the cast uuid missed the equipped-loadout lookup and fell back to `Generic`.
+///
+/// `false` for an ability gamedata does not know at all: we have no number for it, and
+/// a fabricated 0 is worse than silence.
+///
+/// This predicate was previously inlined in `every_cast_does_something`'s sweep. It is
+/// shared now so the test and the runtime cannot drift apart — the test asserting a
+/// class of abilities is exempt while the runtime happily fires at them for zero is
+/// exactly how this shipped.
+pub fn ships_damage(ability_uuid: &str, level: u8) -> bool {
+    super::gamedata::ability_rank_clamped(ability_uuid, u16::from(level.max(1)))
+        .map(|r| r.damage().is_some() || r.damage_per_second().is_some())
+        .unwrap_or(false)
+}
+
 pub struct RetailDamageModel;
 
 impl RetailDamageModel {
