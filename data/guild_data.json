@@ -1,0 +1,461 @@
+{
+  "separator": "#",
+  "min_level_to_join": 5,
+  "max_members": 20,
+  "max_applications": 10,
+  "name_validation": {
+    "min_length": 3,
+    "max_length": 40,
+    "valid_code_point_ranges": [
+      [
+        32,
+        32
+      ],
+      [
+        65,
+        90
+      ],
+      [
+        97,
+        122
+      ],
+      [
+        192,
+        214
+      ],
+      [
+        216,
+        246
+      ],
+      [
+        248,
+        591
+      ],
+      [
+        1024,
+        1153
+      ],
+      [
+        1162,
+        1327
+      ]
+    ],
+    "invalid_code_points_count": 507,
+    "profanity_languages": null
+  },
+  "short_description_validation": {
+    "min_length": 1,
+    "max_length": 200,
+    "valid_code_point_ranges": [
+      [
+        32,
+        126
+      ],
+      [
+        161,
+        172
+      ],
+      [
+        174,
+        591
+      ],
+      [
+        1024,
+        1327
+      ]
+    ],
+    "invalid_code_points_count": 507,
+    "profanity_languages": null
+  },
+  "long_description_validation": {
+    "min_length": 0,
+    "max_length": 5000,
+    "valid_code_point_ranges": [
+      [
+        10,
+        10
+      ],
+      [
+        13,
+        13
+      ],
+      [
+        32,
+        126
+      ],
+      [
+        161,
+        172
+      ],
+      [
+        174,
+        591
+      ],
+      [
+        1024,
+        1327
+      ]
+    ],
+    "invalid_code_points_count": 507,
+    "profanity_languages": null
+  },
+  "badge_icons": {
+    "count": 53,
+    "_note": "sprite uids omitted; guild mechanics only need the index range"
+  },
+  "regions": [
+    {
+      "index": 0,
+      "weight": 3,
+      "name": "Africa",
+      "title": "UI.Guild.Search.Regions.Africa"
+    },
+    {
+      "index": 1,
+      "weight": 1,
+      "name": "North America",
+      "title": "UI.Guild.Search.Regions.NorthAmerica"
+    },
+    {
+      "index": 2,
+      "weight": 2,
+      "name": "South America",
+      "title": "UI.Guild.Search.Regions.SouthAmerica"
+    },
+    {
+      "index": 3,
+      "weight": 0,
+      "name": "Asia",
+      "title": "UI.Guild.Search.Regions.Asia"
+    },
+    {
+      "index": 4,
+      "weight": 0,
+      "name": "Europe",
+      "title": "UI.Guild.Search.Regions.Europe"
+    },
+    {
+      "index": 5,
+      "weight": 0,
+      "name": "Oceania",
+      "title": "UI.Guild.Search.Regions.Oceania"
+    }
+  ],
+  "scores": [
+    {
+      "low": -1,
+      "high": -1,
+      "title": "UI.Guild.Search.Scores.AnyScore"
+    },
+    {
+      "low": 0,
+      "high": 1000,
+      "title": "UI.Guild.Search.Scores.TrophyPointsRange"
+    },
+    {
+      "low": 1000,
+      "high": 5000,
+      "title": "UI.Guild.Search.Scores.TrophyPointsRange"
+    },
+    {
+      "low": 5000,
+      "high": -1,
+      "title": "UI.Guild.Search.Scores.TrophyPointsMax"
+    }
+  ],
+  "sizes": [
+    {
+      "low": -1,
+      "high": -1,
+      "title": "UI.Guild.Search.Sizes.AnySize"
+    },
+    {
+      "low": 1,
+      "high": 5,
+      "title": "UI.Guild.Search.Sizes.SizeSmall"
+    },
+    {
+      "low": 5,
+      "high": 10,
+      "title": "UI.Guild.Search.Sizes.SizeMedium"
+    },
+    {
+      "low": 10,
+      "high": -1,
+      "title": "UI.Guild.Search.Sizes.SizeLarge"
+    }
+  ],
+  "create_costs": [
+    {
+      "item_template": {
+        "uid": "470c8f58-a8dd-4c07-8c92-843b785e1139",
+        "uid_parent": "",
+        "search_type": 0,
+        "item_type_filter": 0,
+        "equipment_slot_filter": 0
+      },
+      "quantity": 50,
+      "item_enhancement": {
+        "uid": "0",
+        "uid_parent": "0",
+        "search_type": 0
+      }
+    }
+  ],
+  "message_board": {
+    "max_messages_to_display": 30,
+    "profanity_replace_symbol": "*",
+    "client_text_validation": {
+      "min_length": 1,
+      "max_length": 500,
+      "valid_code_point_ranges": [
+        [
+          10,
+          10
+        ],
+        [
+          13,
+          13
+        ],
+        [
+          32,
+          126
+        ],
+        [
+          161,
+          172
+        ],
+        [
+          174,
+          591
+        ],
+        [
+          1024,
+          1327
+        ],
+        [
+          8364,
+          8364
+        ],
+        [
+          8216,
+          8217
+        ],
+        [
+          8220,
+          8221
+        ]
+      ],
+      "invalid_code_points_count": 507,
+      "profanity_languages": null
+    }
+  },
+  "guild_types_data": [
+    {
+      "guild_type": "OPEN",
+      "sprite_size": [
+        0.0,
+        0.0
+      ],
+      "sprite_uid": {
+        "uid": "0",
+        "uid_parent": "",
+        "search_type": 0
+      },
+      "title": "UI.Guild.Types.Open"
+    },
+    {
+      "guild_type": "APPLY_ONLY",
+      "sprite_size": [
+        30.0,
+        30.0
+      ],
+      "sprite_uid": {
+        "uid": "01abd672-03e0-410b-8220-9aa68805bad3",
+        "uid_parent": "",
+        "search_type": 0
+      },
+      "title": "UI.Guild.Types.ApplyOnly"
+    },
+    {
+      "guild_type": "CLOSED",
+      "sprite_size": [
+        50.0,
+        50.0
+      ],
+      "sprite_uid": {
+        "uid": "ad147f24-ef86-48ed-9b3e-1c345b398a03",
+        "uid_parent": "",
+        "search_type": 0
+      },
+      "title": "UI.Guild.Types.Closed"
+    }
+  ],
+  "guild_ranks_data": [
+    {
+      "guild_rank": "GRANDMASTER",
+      "sprite_uid_icon": {
+        "uid": "c490ff10-ef90-47b6-9b9b-7edeb6fc4458",
+        "uid_parent": "",
+        "search_type": 0
+      },
+      "sprite_uid_portrait_frame": {
+        "uid": "691c0352-f816-4b28-b774-12bdf42b2d7d",
+        "uid_parent": "",
+        "search_type": 0
+      },
+      "title": "UI.Guild.Ranks.GrandMaster",
+      "can_edit_guild": true,
+      "can_approve_guild_applications": true,
+      "can_ban_non_members": true,
+      "rank_permissions": [
+        {
+          "guild_rank": "GRANDMASTER",
+          "can_kick": false,
+          "can_ban": false
+        },
+        {
+          "guild_rank": "MASTER",
+          "can_kick": true,
+          "can_ban": true
+        },
+        {
+          "guild_rank": "ELDER",
+          "can_kick": true,
+          "can_ban": true
+        },
+        {
+          "guild_rank": "MEMBER",
+          "can_kick": true,
+          "can_ban": true
+        }
+      ]
+    },
+    {
+      "guild_rank": "MASTER",
+      "sprite_uid_icon": {
+        "uid": "1df0bb9c-f1ff-411a-833a-46947c25ce14",
+        "uid_parent": "",
+        "search_type": 0
+      },
+      "sprite_uid_portrait_frame": {
+        "uid": "33ec5011-485d-4221-b304-720c1978f06d",
+        "uid_parent": "",
+        "search_type": 0
+      },
+      "title": "UI.Guild.Ranks.Master",
+      "can_edit_guild": false,
+      "can_approve_guild_applications": false,
+      "can_ban_non_members": false,
+      "rank_permissions": [
+        {
+          "guild_rank": "GRANDMASTER",
+          "can_kick": false,
+          "can_ban": false
+        },
+        {
+          "guild_rank": "MASTER",
+          "can_kick": false,
+          "can_ban": false
+        },
+        {
+          "guild_rank": "ELDER",
+          "can_kick": false,
+          "can_ban": false
+        },
+        {
+          "guild_rank": "MEMBER",
+          "can_kick": false,
+          "can_ban": false
+        }
+      ]
+    },
+    {
+      "guild_rank": "ELDER",
+      "sprite_uid_icon": {
+        "uid": "64cfb127-5453-44d0-944b-6d3c2d5d5b58",
+        "uid_parent": "",
+        "search_type": 0
+      },
+      "sprite_uid_portrait_frame": {
+        "uid": "2a4284dc-94d6-4127-9c46-1ff497d2e838",
+        "uid_parent": "",
+        "search_type": 0
+      },
+      "title": "UI.Guild.Ranks.Edler",
+      "can_edit_guild": false,
+      "can_approve_guild_applications": false,
+      "can_ban_non_members": false,
+      "rank_permissions": [
+        {
+          "guild_rank": "GRANDMASTER",
+          "can_kick": false,
+          "can_ban": false
+        },
+        {
+          "guild_rank": "MASTER",
+          "can_kick": false,
+          "can_ban": false
+        },
+        {
+          "guild_rank": "ELDER",
+          "can_kick": false,
+          "can_ban": false
+        },
+        {
+          "guild_rank": "MEMBER",
+          "can_kick": false,
+          "can_ban": false
+        }
+      ]
+    },
+    {
+      "guild_rank": "MEMBER",
+      "sprite_uid_icon": {
+        "uid": "0",
+        "uid_parent": "",
+        "search_type": 0
+      },
+      "sprite_uid_portrait_frame": {
+        "uid": "0",
+        "uid_parent": "",
+        "search_type": 0
+      },
+      "title": "UI.Guild.Ranks.Member",
+      "can_edit_guild": false,
+      "can_approve_guild_applications": false,
+      "can_ban_non_members": false,
+      "rank_permissions": [
+        {
+          "guild_rank": "GRANDMASTER",
+          "can_kick": false,
+          "can_ban": false
+        },
+        {
+          "guild_rank": "MASTER",
+          "can_kick": false,
+          "can_ban": false
+        },
+        {
+          "guild_rank": "ELDER",
+          "can_kick": false,
+          "can_ban": false
+        },
+        {
+          "guild_rank": "MEMBER",
+          "can_kick": false,
+          "can_ban": false
+        }
+      ]
+    }
+  ],
+  "chat_timestamp_refresh_interval_seconds": 60.0,
+  "admission_timeout_after_removal_from_guild_in_seconds": 604800.0,
+  "_meta": {
+    "source": "reference/apk/blades.apk -> assets/Bundles/BuildPlayer-common.sharedAssets, MonoBehaviour path_id 454, m_Name 'GuildData' (class GuildData : ScriptableObject)",
+    "method": "manual raw-bytes reader driven by the field layout in reference/il2cpp/dump.cs (GuildData TypeDefIndex 11371). Verified by exact byte consumption.",
+    "bytes_total": 13420,
+    "bytes_consumed": 13420,
+    "exact": true
+  }
+}

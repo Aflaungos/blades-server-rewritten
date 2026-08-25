@@ -44,6 +44,8 @@ diesel::table! {
         region_index -> Int4,
         trophies -> Int8,
         created_at -> Int8,
+        exchange_donation_count -> Int8,
+        grandmaster_since -> Int8,
     }
 }
 
@@ -85,6 +87,25 @@ diesel::table! {
     }
 }
 
+diesel::table! {
+    guild_applications (guild_id, user_id) {
+        guild_id -> Text,
+        user_id -> Uuid,
+        character_id -> Uuid,
+        state -> Text,
+        creation_time -> Int8,
+    }
+}
+
+diesel::table! {
+    guild_removals (guild_id, user_id) {
+        guild_id -> Text,
+        user_id -> Uuid,
+        removed_at -> Int8,
+        banned -> Bool,
+    }
+}
+
 diesel::joinable!(characters -> users (user_id));
 diesel::joinable!(quests -> characters (character_id));
 
@@ -96,4 +117,6 @@ diesel::allow_tables_to_appear_in_same_query!(
     guild_members,
     guild_messages,
     guild_exchanges,
+    guild_applications,
+    guild_removals,
 );

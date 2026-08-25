@@ -42,6 +42,7 @@ mod gameevent;
 mod global_gift;
 mod global_shop;
 mod guild;
+mod guild_policy;
 mod inventory;
 mod json_db;
 pub mod models;
@@ -474,18 +475,26 @@ async fn main() -> Result<()> {
                     // captured by it. Exchange sub-paths (donate/redeem) must come
                     // before the bare `exchanges` POST.
                     .service(guild::get_current_guild)
+                    .service(guild::update_guild_post)
+                    .service(guild::update_guild_put)
                     .service(guild::search_guilds)
                     .service(guild::guild_leaderboard)
                     .service(guild::get_messages)
                     .service(guild::post_message)
+                    .service(guild::list_applications)
+                    .service(guild::approve_application)
+                    .service(guild::deny_application)
                     .service(guild::leave_guild)
                     .service(guild::kick_member)
+                    .service(guild::ban_member)
                     .service(guild::list_exchanges)
                     .service(guild::donate_exchange)
                     .service(guild::redeem_exchange)
                     .service(guild::create_exchange)
                     .service(guild::create_guild)
+                    // `{id}/join` and `{id}/apply` before the bare `{id}` GET.
                     .service(guild::join_guild)
+                    .service(guild::apply_to_guild)
                     .service(guild::get_guild)
                     .service(announcements::get_announcements)
                     .service(arena::leaderboards::get_leaderboard)
