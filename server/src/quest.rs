@@ -59,6 +59,53 @@ pub struct GetQuestsResponse {
     game_event_quests_finished: Vec<QuestWithId>,   //TODO: finished-history unmodelled
 }
 
+/// Split stored quest rows into the client's `quests[]` and `generatedData[]`.
+///
+/// Two rows are dropped rather than advertised:
+///
+/// * **JOB rows**, which are surfaced only in `jobs[]` — matching prod, where the
+///   two arrays never overlap.
+/// * **Quests with no generated data.** There is no dungeon behind such a quest, so
+///   it cannot be placed on the quest map or started. This used to push the quest
+///   into `quests[]` anyway while its `generatedData[]` entry was pushed only
+///   `if let Some(...)`, handing the client a quest it could list but never resolve:
+///   the `!` badge counted it and the map waited forever for data that was never
+///   coming. [report #62]
+///
+///   Measured across all of production: exactly TWO rows were in that state — "The
+///   Message" (`cca4a80b…`), whose template ships no `dungeon_uuid` and which is
+///   therefore excluded from the built pool, held by exactly the two characters that
+///   reported a blank quest map. All 50 other non-job quests carry their data.
+///
+///   Skipping is the honest answer: with no dungeon we can neither render it nor let
+///   anyone play it, and advertising it is what hangs the client.
+///
+/// The invariant the client relies on, and the one the tests pin: **every quest in
+/// `quests[]` has a matching entry in `generatedData[]`, keyed by the same id.**
+fn split_quest_rows(
+    rows: impl Iterator<
+        Item = (
+            Uuid,
+            blades_lib::user_data::Quest,
+            Option<blades_lib::user_data::DungeonGeneratedData>,
+        ),
+    >,
+) -> (Vec<QuestWithId>, Vec<DungeonGeneratedDataWithId>) {
+    let mut quests = Vec::new();
+    let mut generated = Vec::new();
+    for (quest_id, info, generated_data) in rows {
+        if jobs_gen::is_job_row(&info) {
+            continue;
+        }
+        let Some(inner) = generated_data else {
+            continue;
+        };
+        quests.push(QuestWithId { quest_id, quest: info });
+        generated.push(DungeonGeneratedDataWithId { quest_id, inner });
+    }
+    (quests, generated)
+}
+
 #[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/quests")]
 pub async fn get_quests(
     session: SessionLookedUpMaybe,
@@ -189,27 +236,11 @@ pub async fn get_quests(
                     .await?
             };
 
-            let mut result_quests = Vec::new();
-            let mut result_generated_data = Vec::new();
-
-            for quest in quests {
-                // Stored JOB rows are surfaced only in `jobs[]` (regenerated above),
-                // never in `quests[]` — matching prod, where the two arrays never
-                // overlap.
-                if jobs_gen::is_job_row(&quest.info.0) {
-                    continue;
-                }
-                result_quests.push(QuestWithId {
-                    quest_id: quest.id,
-                    quest: quest.info.0,
-                });
-                if let Some(generated_data) = quest.generated_data.0 {
-                    result_generated_data.push(DungeonGeneratedDataWithId {
-                        quest_id: quest.id,
-                        inner: generated_data,
-                    });
-                };
-            }
+            let (result_quests, result_generated_data) = split_quest_rows(
+                quests
+                    .into_iter()
+                    .map(|q| (q.id, q.info.0, q.generated_data.0)),
+            );
 
             // Featured daily quests: a global, deterministic day-rotating set (SAME for
             // every player), level-scaled to this character. Uses the same `now` as the
@@ -1746,5 +1777,114 @@ mod deleted_quest_ids_tests {
             serde_json::json!(["159bc1e7-454c-4e2a-90cf-e200c74b961a"]),
             "a real deletion must reach the client",
         );
+    }
+}
+
+#[cfg(test)]
+mod report62_quest_map_tests {
+    use super::*;
+    use blades_lib::user_data::Quest;
+
+    /// Built through serde from the exact key set production stores, so the fixture
+    /// tracks the wire shape rather than restating the Rust struct.
+    fn quest(gld: Uuid) -> Quest {
+        serde_json::from_value(json!({
+            "version": 0,
+            "type": "NORMAL",
+            "objectiveStatuses": {},
+            "difficultyLevel": 0,
+            "seed": 0,
+            "gldQuestId": gld,
+            "completed": false,
+        }))
+        .expect("fixture quest must deserialize")
+    }
+
+    fn generated() -> blades_lib::user_data::DungeonGeneratedData {
+        serde_json::from_value(json!({ "algorithmVersion": 0, "version": 0 }))
+            .expect("minimal generated data must deserialize")
+    }
+
+    /// THE invariant the client relies on: every quest it is told about has a
+    /// matching `generatedData` entry. Break it and the quest map waits forever for
+    /// data that never arrives — which is exactly report #62.
+    #[test]
+    fn every_advertised_quest_has_generated_data() {
+        let with_data = Uuid::from_u128(1);
+        let without_data = Uuid::from_u128(2);
+        let normal = Uuid::from_u128(0xAAAA);
+
+        let (quests, data) = split_quest_rows(
+            vec![
+                (with_data, quest(normal), Some(generated())),
+                // "The Message": a real quest whose template ships no dungeon, so
+                // `generate_quest_data` produced nothing.
+                (without_data, quest(normal), None),
+            ]
+            .into_iter(),
+        );
+
+        assert_eq!(quests.len(), 1, "the dataless quest must not be advertised");
+        assert_eq!(quests[0].quest_id, with_data);
+
+        let advertised: Vec<Uuid> = quests.iter().map(|q| q.quest_id).collect();
+        let have_data: Vec<Uuid> = data.iter().map(|g| g.quest_id).collect();
+        assert_eq!(
+            advertised, have_data,
+            "every advertised quest must have generated data, keyed by the same id"
+        );
+    }
+
+    /// The control for the test above: a quest WITH data is still served. Without
+    /// this, a `split_quest_rows` that returned two empty vecs would pass.
+    #[test]
+    fn a_quest_with_data_is_still_served() {
+        let id = Uuid::from_u128(7);
+        let (quests, data) = split_quest_rows(
+            vec![(id, quest(Uuid::from_u128(0xBBBB)), Some(generated()))].into_iter(),
+        );
+        assert_eq!(quests.len(), 1, "a normal quest must still be served");
+        assert_eq!(data.len(), 1, "…with its generated data");
+        assert_eq!(quests[0].quest_id, id);
+    }
+
+    /// Job rows stay out of `quests[]` — they are surfaced only in `jobs[]`, and the
+    /// two arrays never overlap in prod. This behaviour predates the fix and must
+    /// survive it.
+    #[test]
+    fn job_rows_are_still_excluded() {
+        let (quests, data) = split_quest_rows(
+            vec![(
+                Uuid::from_u128(9),
+                quest(jobs_gen::JOB_SENTINEL_GLD),
+                Some(generated()),
+            )]
+            .into_iter(),
+        );
+        assert!(quests.is_empty(), "a job row must not appear in quests[]");
+        assert!(data.is_empty());
+    }
+
+    /// A character holding a mix — the shape the two level-48 Adventurers actually
+    /// have in production: several playable quests, six job rows, and one dataless
+    /// quest. Only the playable ones survive, and the arrays stay aligned.
+    #[test]
+    fn the_production_shape_resolves_to_a_consistent_pair_of_arrays() {
+        let mut rows = Vec::new();
+        for i in 0..3u128 {
+            rows.push((Uuid::from_u128(100 + i), quest(Uuid::from_u128(0xC0 + i)), Some(generated())));
+        }
+        for i in 0..6u128 {
+            rows.push((Uuid::from_u128(200 + i), quest(jobs_gen::JOB_SENTINEL_GLD), None));
+        }
+        // "The Message"
+        rows.push((Uuid::from_u128(300), quest(Uuid::from_u128(0xCCA4)), None));
+
+        let (quests, data) = split_quest_rows(rows.into_iter());
+        assert_eq!(quests.len(), 3, "three playable quests");
+        assert_eq!(data.len(), 3, "each with its data");
+        let a: Vec<Uuid> = quests.iter().map(|q| q.quest_id).collect();
+        let b: Vec<Uuid> = data.iter().map(|g| g.quest_id).collect();
+        assert_eq!(a, b);
     }
 }
