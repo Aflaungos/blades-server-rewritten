@@ -42,6 +42,7 @@ mod gameevent;
 mod global_gift;
 mod global_shop;
 mod guild;
+mod guild_admin;
 mod guild_policy;
 mod inventory;
 mod json_db;
@@ -510,6 +511,15 @@ async fn main() -> Result<()> {
                     .service(admin::recent_matches)
                     .service(admin::bind_device)
                     .service(admin::recent_devices)
+                    // Guild support console (dev-token gated; the web
+                    // /admin/guilds page is its only intended caller).
+                    .service(guild_admin::list_guilds)
+                    .service(guild_admin::set_grandmaster)
+                    // Registered AFTER the /grandmaster route: `{guild_id}` is a
+                    // greedy single segment, so the more specific path must be
+                    // offered to the router first or a handover POST would be
+                    // swallowed by the detail GET's scope.
+                    .service(guild_admin::get_guild_detail)
                     .service(
                         Files::new(
                             "/bundles.blades.bgs.services/",

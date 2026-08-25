@@ -147,7 +147,7 @@ fn extract_import_token(req: &HttpRequest) -> Option<String> {
 
 /// Validate the dev token against the one captured at startup. Returns the
 /// appropriate `BladeApiError` on failure so the caller can `?` it.
-fn check_import_token(app_state: &ServerGlobal, req: &HttpRequest) -> Result<(), BladeApiError> {
+pub(crate) fn check_import_token(app_state: &ServerGlobal, req: &HttpRequest) -> Result<(), BladeApiError> {
     // No token configured -> endpoint disabled.
     let expected = match app_state.arena_import_token.as_deref() {
         Some(token) if !token.is_empty() => token,
