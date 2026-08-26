@@ -126,7 +126,9 @@ const MATCH_STATE_ROUND0_PROGRESSION: &[(MatchState, Duration, f32)] = &[
 /// 16 PostMatch             05:07:11  (5.0)   +6s
 /// 19 DisconnectingPlayers… 05:07:16  (~0)    +5s   ← terminal → match Finished
 /// ```
-/// Notable: retail **skips Victory(15)** and emits **BackendMatchEnd(17) BEFORE
+/// Notable: retail emits **Victory(15)** (an earlier note here claimed it skipped
+/// it — the captures disagree: 15 appears in s615/s616/s506/s293, and never in any
+/// of ours) and emits **BackendMatchEnd(17) BEFORE
 /// PostMatch(16)** (the enum order is not the wire order). The inter-state gaps are the
 /// observed wall-clock deltas (4/6/5 s); the timeouts are the exact captured propId6
 /// values. We send an op79 `StateTimeout` flow heartbeat between PostRound and
@@ -134,6 +136,13 @@ const MATCH_STATE_ROUND0_PROGRESSION: &[(MatchState, Duration, f32)] = &[
 /// StateTimeout heartbeat is suppressed in RoundEnd, so this is the only one).
 const MATCH_STATE_MATCHEND_PROGRESSION: &[(MatchState, Duration, f32)] = &[
     (MatchState::BackendMatchEnd, Duration::from_secs(4), 20.0),
+    // Victory(15) — the victory screen. We used to skip it on the belief that
+    // retail did too; the captures say otherwise. Measured s615/s616/s506/s293:
+    // the terminal order is PostRound(14) → BackendMatchEnd(17) → Victory(15) →
+    // PostMatch(16) → Disconnecting(19), with Victory's own
+    // CurrentMatchStateTimeout unanimously 5.0 across 33 samples. Retail's
+    // 17 → 15 gap is ~1 s (observed +1 s and +0 s in s615's two matches).
+    (MatchState::Victory, Duration::from_secs(1), 5.0),
     (MatchState::PostMatch, Duration::from_secs(6), 5.0),
     (MatchState::DisconnectingPlayersAfterMatch, Duration::from_secs(5), 0.0),
 ];
@@ -3019,7 +3028,7 @@ pub(in crate::arena::combat) mod tests {
         // Ticking through the walk reaches the exact retail terminal sequence and
         // Finished — identical to a normal win — so `take_finished_peers` will then
         // disconnect the survivor cleanly.
-        let span = Duration::from_secs(4 + 6 + 5 + 2);
+        let span = Duration::from_secs(4 + 1 + 6 + 5 + 3);
         let step = Duration::from_millis(250);
         let n = (span.as_millis() / step.as_millis()) as u32;
         let mut states_seen: Vec<u8> = Vec::new();
@@ -3042,6 +3051,7 @@ pub(in crate::arena::combat) mod tests {
             states_seen,
             vec![
                 MatchState::BackendMatchEnd as u8,
+                MatchState::Victory as u8,
                 MatchState::PostMatch as u8,
                 MatchState::DisconnectingPlayersAfterMatch as u8,
             ],
@@ -3090,7 +3100,7 @@ pub(in crate::arena::combat) mod tests {
 
         // Tick at 250 ms through the whole terminal walk (4 + 6 + 5 s of holds ≈ 15 s).
         // Record the MatchState updates the FSM emits, in order.
-        let matchend_to_finish = Duration::from_secs(4 + 6 + 5 + 2);
+        let matchend_to_finish = Duration::from_secs(4 + 1 + 6 + 5 + 3);
         let step = Duration::from_millis(250);
         let n = (matchend_to_finish.as_millis() / step.as_millis()) as u32;
         let mut states_seen: Vec<u8> = Vec::new();
@@ -3121,10 +3131,12 @@ pub(in crate::arena::combat) mod tests {
             states_seen,
             vec![
                 MatchState::BackendMatchEnd as u8,            // 17
+                MatchState::Victory as u8,                    // 15
                 MatchState::PostMatch as u8,                  // 16
                 MatchState::DisconnectingPlayersAfterMatch as u8, // 19
             ],
-            "post-match MatchState walk must be BackendMatchEnd(17)→PostMatch(16)→Disconnecting(19), s506-exact"
+            "post-match MatchState walk must be BackendMatchEnd(17)→Victory(15)→PostMatch(16)→\
+             Disconnecting(19) — the order measured in retail s615/s616/s506/s293"
         );
         assert_eq!(m.phase(), FlowState::Finished, "match Finished after the terminal state");
         assert_eq!(m.match_state_for_test(), MatchState::DisconnectingPlayersAfterMatch);
