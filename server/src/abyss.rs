@@ -199,12 +199,23 @@ pub async fn start_abyss(
 
             let wire = run_to_wire(&run, &app_state);
 
+            // Generated data for the floor the run STARTS on — which is
+            // `slices[0]`, not floor 1: a resumed run's first slice is the
+            // floor the player is returning to. Serving floor 1's data here is
+            // what hung every resumed run. Computed before `run` is moved into
+            // the persisted state.
+            // `.iter().next()` rather than `.first()`: diesel's `FirstDsl` is in
+            // scope here and shadows the slice method.
+            let gen_data = run
+                .slices
+                .iter()
+                .next()
+                .and_then(|slice| build_generated_data(&app_state, slice))
+                .unwrap_or_else(empty_generated_data);
+
             // Persist run into server_state
             entry.server_state.0.abyss = Some(run);
             save_economy(&mut conn, character_id, &entry).await?;
-
-            // Build the generated dungeon data for the current (first) floor.
-            let gen_data = build_generated_data();
 
             Ok::<_, BladeApiError>(Json(StartAbyssResponse {
                 abyss: wire,
@@ -693,50 +704,56 @@ fn build_future_rewards(app_state: &ServerGlobal) -> Vec<AbyssFutureRewardWire> 
     }).collect()
 }
 
-/// Build the per-floor generated dungeon data.
-/// Uses the same spawn-group UUIDs observed in the captured floor-1 data so the
-/// client can match enemies. Gold drops scale minimally with difficulty — lenient.
-fn build_generated_data() -> DungeonGeneratedData {
-    use std::collections::HashMap;
-    use blades_lib::user_data::{LootTableResult, DungeonEnemyResult};
-
-    let gold = Uuid::parse_str(GOLD_CURRENCY_UUID).unwrap();
-    let loot_table = Uuid::parse_str(LOOT_TABLE_UUID).unwrap();
-    let sg_a = Uuid::parse_str(SPAWN_GROUP_A).unwrap();
-    let sg_b = Uuid::parse_str(SPAWN_GROUP_B).unwrap();
-
-    let make_enemy = |gold_amount: u64| DungeonEnemyResult {
-        enemy_level: 1,
-        given_xp: 0,
-        spawn_group_loot: HashMap::new(),
-        loot_table_loot: {
-            let mut m = HashMap::new();
-            m.insert(loot_table, LootTableResult {
-                currencies: {
-                    let mut c = HashMap::new();
-                    c.insert(gold, gold_amount);
-                    c
-                },
-                ..Default::default()
-            });
-            m
-        },
-    };
-
+/// Generated dungeon data for ONE abyss floor, built from that floor's ACTUAL
+/// dungeon.
+///
+/// WHY THIS IS NOT A CONSTANT ANY MORE
+///
+/// This used to return a hard-coded stub whose two spawn groups
+/// (`c41668b3…`, `9a057ca6…`) exist only in the floor-1 dungeon
+/// `663053f0…`. The client looks each generated id up as it populates the
+/// level, so on any other floor nothing resolved: no enemies spawned, no
+/// `enemy_killed` action was ever sent, and the run could not advance.
+///
+/// That was not theoretical. Of the seven live runs in prod, the only one
+/// making progress was a fresh floor-1 run; the six that had resumed deeper
+/// (floors 30, 43, 78, 149…) all sat at `currentFloorIndex: 0` with zero
+/// floors completed — the reported "abyss just hung".
+///
+/// Enemy level comes from the slice's own `difficulty_level`, which the floor
+/// ramp already produces (1 at floor 1, 400 near the top). The stub said every
+/// enemy was level 1, which is also why a deep floor would have been trivial
+/// had it spawned at all.
+///
+/// `None` when the floor's dungeon is missing from `parsed.json`; the caller
+/// serves an empty body rather than data for the wrong dungeon, because the
+/// wrong dungeon is what caused the hang.
+/// An empty body, for a floor whose dungeon is not in `parsed.json`.
+///
+/// Deliberately empty rather than a stand-in from some other dungeon: ids from
+/// the wrong dungeon are precisely what hung the run, and an empty body at
+/// least fails visibly instead of silently pointing the client at enemies that
+/// are not there.
+fn empty_generated_data() -> DungeonGeneratedData {
     DungeonGeneratedData {
-        enemy_generated_data: {
-            let mut m = HashMap::new();
-            // spawn group A: 2 spawners × 1 enemy each (matching captured shape)
-            m.insert(sg_a, vec![vec![make_enemy(4)], vec![make_enemy(4)]]);
-            // spawn group B: 1 spawner × 1 enemy
-            m.insert(sg_b, vec![vec![make_enemy(6)]]);
-            m
-        },
-        item_generated_data: HashMap::new(),
-        chest_generated_data: HashMap::new(),
+        enemy_generated_data: Default::default(),
+        chest_generated_data: Default::default(),
+        item_generated_data: Default::default(),
         algorithm_version: 1,
         version: 0,
     }
+}
+
+fn build_generated_data(
+    app_state: &ServerGlobal,
+    slice: &AbyssSliceEntry,
+) -> Option<DungeonGeneratedData> {
+    blades_lib::util::dungeon::generate_for_dungeon(
+        &app_state.game_data,
+        &slice.dungeon_settings_id,
+        slice.difficulty_level as i64,
+        0,
+    )
 }
 
 /// Floor-scaled reward for `/end`. Assumption (prod not fully captured):
@@ -1018,16 +1035,146 @@ mod tests {
         assert_ne!(s1, 0, "non-zero seed");
     }
 
-    #[test]
-    fn build_generated_data_has_expected_spawn_groups() {
-        let gd = build_generated_data();
-        let sg_a = Uuid::parse_str(SPAWN_GROUP_A).unwrap();
-        let sg_b = Uuid::parse_str(SPAWN_GROUP_B).unwrap();
-        assert!(gd.enemy_generated_data.contains_key(&sg_a));
-        assert!(gd.enemy_generated_data.contains_key(&sg_b));
-        // sg_a: 2 spawners × 1 enemy
-        assert_eq!(gd.enemy_generated_data[&sg_a].len(), 2);
-        // sg_b: 1 spawner × 1 enemy
-        assert_eq!(gd.enemy_generated_data[&sg_b].len(), 1);
+    fn game_data() -> blades_lib::game_data::GameData {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../deploy/static/parsed.json");
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+        serde_json::from_str(&raw).expect("valid parsed.json")
     }
+
+    fn slice_for(dungeon: &str, difficulty: u32, floor: u32) -> AbyssSliceEntry {
+        AbyssSliceEntry {
+            dungeon_settings_id: Uuid::parse_str(dungeon).unwrap(),
+            difficulty_level: difficulty,
+            hardcore: false,
+            slice_index: 0,
+            floor_index: floor,
+            completed: false,
+            enemy_killed: false,
+        }
+    }
+
+    /// EVERY floor's generated data must describe THAT floor's dungeon.
+    ///
+    /// WHY THIS EXISTS
+    ///
+    /// The test that used to sit here asserted the opposite: that
+    /// `build_generated_data()` always returns the two spawn groups
+    /// `c41668b3…` / `9a057ca6…`. Those exist only in the floor-1 dungeon
+    /// `663053f0…`, so the assertion was really "the Abyss always serves
+    /// floor 1's enemies" — the bug, written down as the requirement, which is
+    /// why it stayed green while six of seven live runs sat frozen at floor 0.
+    ///
+    /// The client resolves each generated id against the dungeon it was told to
+    /// load. Ids from another dungeon resolve to nothing, so no enemy spawns, so
+    /// no `enemy_killed` is sent, so the floor never completes.
+    #[test]
+    fn generated_data_matches_the_floors_own_dungeon() {
+        let gd = game_data();
+        // Floor 1, and three dungeons taken from real resumed runs in prod
+        // (floors 30, 78 and 149) that were hung.
+        for (dungeon, difficulty, floor) in [
+            ("663053f0-3a46-4012-b004-6cb2e907f33c", 1u32, 1u32),
+            ("85bf1a3a-0006-4abf-993c-f483ec7db298", 136, 30),
+            ("65375990-e5b3-41cf-b5d3-cbe2c740cb1d", 400, 78),
+            ("ef24eeb3-8181-48e2-ae3d-320bd6f5992c", 400, 149),
+        ] {
+            let uuid = Uuid::parse_str(dungeon).unwrap();
+            let expected: std::collections::HashSet<Uuid> = gd
+                .dungeons
+                .get(&uuid)
+                .unwrap_or_else(|| panic!("floor {floor} dungeon {dungeon} in parsed.json"))
+                .spawn_info
+                .enemy_spawn_groups
+                .keys()
+                .copied()
+                .collect();
+            assert!(!expected.is_empty(), "floor {floor} dungeon has spawn groups");
+
+            let data = blades_lib::util::dungeon::generate_for_dungeon(
+                &gd,
+                &uuid,
+                difficulty as i64,
+                0,
+            )
+            .unwrap_or_else(|| panic!("floor {floor} generated data"));
+
+            let got: std::collections::HashSet<Uuid> =
+                data.enemy_generated_data.keys().copied().collect();
+            assert_eq!(
+                got, expected,
+                "floor {floor} must be given its OWN spawn groups, not another dungeon's"
+            );
+            // And the enemies must be at the floor's difficulty, not level 1 —
+            // the stub hard-coded 1, so a deep floor would have been trivial.
+            for enemies in data.enemy_generated_data.values() {
+                for e in enemies.iter().flatten() {
+                    assert_eq!(e.enemy_level, difficulty as i64, "floor {floor} enemy level");
+                }
+            }
+        }
+    }
+
+    /// The floor-1 dungeon is the ONLY one carrying the spawn groups the old
+    /// stub hard-coded. This is the measurement that explains the bug: it is
+    /// why floor 1 played and every other floor hung.
+    #[test]
+    fn the_old_stubs_spawn_groups_are_floor_one_only() {
+        let gd = game_data();
+        let a = Uuid::parse_str("c41668b3-ad8b-42b4-ba5d-a0574039a3cc").unwrap();
+        let b = Uuid::parse_str("9a057ca6-5f8d-4700-8665-6c56de0e1103").unwrap();
+        let floor1 = Uuid::parse_str("663053f0-3a46-4012-b004-6cb2e907f33c").unwrap();
+
+        let f1 = &gd.dungeons[&floor1].spawn_info.enemy_spawn_groups;
+        assert!(f1.contains_key(&a) && f1.contains_key(&b), "floor 1 has both");
+
+        for (id, d) in &gd.dungeons {
+            if *id == floor1 {
+                continue;
+            }
+            let g = &d.spawn_info.enemy_spawn_groups;
+            assert!(
+                !g.contains_key(&a) && !g.contains_key(&b),
+                "dungeon {id} also carries a stub spawn group — the explanation \
+                 for the hang would not hold"
+            );
+        }
+    }
+
+    /// A run resuming deep starts on the floor it resumed to, so `slices[0]`
+    /// is that floor — not floor 1. Serving floor 1's data to a resumed run is
+    /// what hung six of the seven live runs.
+    #[test]
+    fn a_resumed_runs_first_slice_is_the_resumed_floor() {
+        let sd = test_static_abyss();
+        let slices = build_slices_from(&sd, 12345, 150, 78);
+        assert_eq!(slices[0].floor_index, 78);
+        // The guard that matters: whatever start_abyss serves must come from
+        // slices[0], whose dungeon is NOT the floor-1 dungeon.
+        let floor1 = build_slices_from(&sd, 12345, 150, 1)[0].dungeon_settings_id;
+        assert_ne!(
+            slices[0].dungeon_settings_id, floor1,
+            "a floor-78 resume must not be handed the floor-1 dungeon"
+        );
+    }
+
+    /// A start floor past the top yields an empty run rather than a slice list
+    /// that can never advance.
+    #[test]
+    fn a_start_floor_past_the_top_is_empty_not_stuck() {
+        let sd = test_static_abyss();
+        assert!(build_slices_from(&sd, 1, 150, 151).is_empty());
+    }
+
+    #[test]
+    fn a_floor_whose_dungeon_is_unknown_serves_an_empty_body() {
+        let gd = game_data();
+        assert!(
+            blades_lib::util::dungeon::generate_for_dungeon(&gd, &Uuid::nil(), 1, 0).is_none(),
+            "an unknown dungeon must yield None, never another dungeon's ids"
+        );
+        let empty = empty_generated_data();
+        assert!(empty.enemy_generated_data.is_empty());
+    }
+
 }
