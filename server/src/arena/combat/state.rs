@@ -644,6 +644,10 @@ pub struct Loadout {
     /// from the stored character by the matchmaker; empty for the starter loadout.
     pub profile_equipped_json: String,
     pub profile_character_json: String,
+    /// The client's own `HideHelmet` avatar toggle, as reported by its c2s op61
+    /// `LoadoutClientBackendSynchronized`. Relayed to the OPPONENT in the op54
+    /// profile (propId 6) so both players see the same avatar.
+    pub hide_helmet: bool,
 
     // --- Rating-derived defence (Phase 3.3/3.4/3.5) ---
     /// Summed **Armor Rating** of every equipped armor piece

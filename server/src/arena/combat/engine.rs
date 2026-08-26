@@ -463,6 +463,21 @@ impl MatchInstance {
         // PlayerLoadoutReady. We simply ACK it into the void (no s2c) so it is never
         // mis-resolved as a combat swing. [docs/arena-journey-log.md §7]
         if messages::is_loadout_backend_synchronized(user_data) {
+            // The flag it carries is NOT inert: it is the player's own hide-helmet
+            // avatar toggle, and the opponent's client only learns it from the op54
+            // profile we build. Record it, and if it changed after that profile was
+            // already broadcast, re-broadcast so the opponent's avatar matches.
+            if let Some(hide) = messages::loadout_backend_hide_helmet(user_data) {
+                if let Some(f) = self.combat.fighters.get_mut(sender) {
+                    if f.loadout.hide_helmet != hide {
+                        f.loadout.hide_helmet = hide;
+                        debug!(
+                            "combat c2s: slot {sender} op61 HideHelmet={hide} — re-broadcasting profile"
+                        );
+                        self.broadcast_profile_of(&mut out, sender);
+                    }
+                }
+            }
             debug!("combat c2s: slot {sender} op61 LoadoutClientBackendSynchronized — handshake, no reply");
             return out;
         }
@@ -1396,6 +1411,7 @@ impl MatchInstance {
             actor.player_net_object_id,
             &actor.loadout.profile_equipped_json,
             &actor.loadout.profile_character_json,
+            actor.loadout.hide_helmet,
         );
         for viewer in 0..self.combat.fighters.len() {
             if viewer == actor_slot {
@@ -1754,6 +1770,66 @@ pub(in crate::arena::combat) mod tests {
             arena_proto::parse_netdata(&p0.1[2..]).int(0),
             Some(m.combat.fighters[1].player_net_object_id as i64),
             "viewer 0 receives the OPPONENT's (slot 1) profile, not its own"
+        );
+    }
+
+    /// A player's hide-helmet toggle must reach the OPPONENT's client.
+    ///
+    /// The flag is a client-side avatar setting (`CharacterSetting.HideHelmet`); the
+    /// only way the opponent learns it is `OpponentLoadoutMessage.HideHelmet`, which
+    /// rides the op54 profile at propId 6. The client reports its own value in a c2s
+    /// op61 (capture-proven non-constant: true in retail s506/s615/s616, and true in
+    /// our own session 994 — the match where the owner saw simi still wearing a helmet
+    /// that simi had hidden).
+    ///
+    /// Before the fix `player_profile` hardcoded `.bool(6, false)`, so every opponent
+    /// rendered with their helmet on. Reverting that hardcode turns this test RED.
+    #[test]
+    fn profile_relays_the_senders_hide_helmet() {
+        let now = Instant::now();
+        let mk = |name: &str| {
+            let mut l = crate::arena::combat::loadout::starter();
+            l.display_name = name.to_string();
+            l.profile_equipped_json = r#"{"equippedItems":{}}"#.to_string();
+            l.profile_character_json = format!(r#"{{"name":"{name}"}}"#);
+            l
+        };
+        let is_profile = |b: &[u8]| {
+            b.len() > 2 && b[1] == 0x36 && arena_proto::parse_netdata(&b[2..]).int(3) == Some(35)
+        };
+        let mut m = MatchInstance::new(2, 2, vec![mk("Alice"), mk("Bob")], now);
+        m.on_tick(2, now);
+        let setup = m.on_tick(2, now + MATCH_SETUP_STAGGER);
+
+        // Baseline: nobody has toggled, so Alice sees Bob WITH a helmet.
+        let base = setup.iter().find(|(v, b)| *v == 0 && is_profile(b)).expect("viewer 0 profile");
+        assert_eq!(
+            arena_proto::parse_netdata(&base.1[2..]).int(6),
+            Some(0),
+            "baseline: no toggle reported → p6 false"
+        );
+
+        // Bob (slot 1) reports HideHelmet=true, exactly as a retail client does.
+        let op61 = messages::loadout_client_backend_synchronized(
+            m.combat.fighters[1].player_net_object_id,
+            crate::arena::combat::state::NetRole::Autonomous,
+            true,
+        );
+        let out = m.on_c2s(1, &op61, now + MATCH_SETUP_STAGGER);
+
+        let relayed: Vec<&(usize, Vec<u8>)> =
+            out.iter().filter(|(v, b)| *v == 0 && is_profile(b)).collect();
+        assert_eq!(relayed.len(), 1, "Bob's toggle re-broadcasts his profile to Alice");
+        let nd = arena_proto::parse_netdata(&relayed[0].1[2..]);
+        assert_eq!(
+            nd.int(0),
+            Some(m.combat.fighters[1].player_net_object_id as i64),
+            "the re-broadcast profile describes BOB"
+        );
+        assert_eq!(nd.int(6), Some(1), "p6 HideHelmet=true reaches Alice's client");
+        assert!(
+            !out.iter().any(|(v, b)| *v == 1 && is_profile(b)),
+            "never echo a client its own profile"
         );
     }
 

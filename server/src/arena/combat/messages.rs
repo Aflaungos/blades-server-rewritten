@@ -157,6 +157,24 @@ pub fn is_loadout_backend_synchronized(user_data: &[u8]) -> bool {
     user_message_gmid(user_data) == Some(GameMessageId::LoadoutClientBackendSynchronized as u8)
 }
 
+/// The `HideHelmet` cosmetic flag carried at propId 4 of a c2s op61
+/// `LoadoutClientBackendSynchronized`. `None` if the frame isn't an op61 or has no
+/// propId 4.
+///
+/// This is the ONLY place the flag reaches the server: it is a client-side avatar
+/// toggle (`CharacterSetting.HideHelmet`, PlayerPref `"HideHelment"`) that the
+/// client reports for itself, and retail relays to the opponent so both players see
+/// the same avatar. Capture-confirmed non-constant: c2s `HideHelmet=true` appears in
+/// retail s506 (x10), s615 (x22) and s616 (x5), and `false` in s293 (x5).
+pub fn loadout_backend_hide_helmet(user_data: &[u8]) -> Option<bool> {
+    if !is_loadout_backend_synchronized(user_data) {
+        return None;
+    }
+    arena_proto::parse_netdata(user_data.get(2..)?)
+        .int(4)
+        .map(|v| v != 0)
+}
+
 /// True iff a carrier-`0x36` c2s frame is `SkipCurrentState` (op57) — the client's
 /// **"Ready"** press on a state it is done with (the loadout screen, the opponent
 /// showcase). `dump.cs` `SkipCurrentStateMessage`; capture-proven c2s-only (it is in
@@ -650,7 +668,12 @@ pub fn spawn_avatar(net_object_id: i32, role: NetRole, character_uuid: &str) -> 
 /// last byte after the closing `}` of the character JSON is `0x00`). The original
 /// implementation guessed `true`; retail sends `false`. [diffed 2026-06-19 against
 /// s506 player B "Blank" profile (16 fragments, 20776 B).]
-pub fn player_profile(player_net_object_id: i32, equipped_items_json: &str, character_json: &str) -> Vec<u8> {
+pub fn player_profile(
+    player_net_object_id: i32,
+    equipped_items_json: &str,
+    character_json: &str,
+    hide_helmet: bool,
+) -> Vec<u8> {
     let mut w = NetDataWriter::new();
     w.int(0, player_net_object_id)
         .byte(1, NetObjectType::Player as u8)
@@ -658,7 +681,10 @@ pub fn player_profile(player_net_object_id: i32, equipped_items_json: &str, char
         .byte(3, 35) // the profile message's GameMessageId (propId 3)
         .string(4, equipped_items_json)
         .string(5, character_json)
-        .bool(6, false);
+        // propId 6 = `OpponentLoadoutMessage.HideHelmet` (the message's only bool).
+        // Hardcoding false here made every opponent render wearing their helmet
+        // regardless of their own toggle.
+        .bool(6, hide_helmet);
     frame(MSGTYPE_USERMESSAGE, w.finish())
 }
 
@@ -1925,7 +1951,7 @@ mod tests {
         assert_eq!(retail_channel(&user_msg(35)), 4, "OpponentLoadout → ch4");
         assert_eq!(retail_channel(&user_msg(49)), 4, "MatchEndMatchMsg → ch4");
         // The real profile builder (large, fragmented) must also land on ch4.
-        assert_eq!(retail_channel(&player_profile(7, "{}", "{}")), 4);
+        assert_eq!(retail_channel(&player_profile(7, "{}", "{}", false)), 4);
 
         // ch1: the per-player stat words.
         assert_eq!(retail_channel(&user_msg(65)), 1, "PlayerStatsUpdate → ch1");
@@ -2022,7 +2048,7 @@ mod tests {
     fn player_profile_structure() {
         let eq = r#"{"equippedItems":{}}"#;
         let ch = r#"{"id":"x","name":"Taheen"}"#;
-        let got = player_profile(197, eq, ch);
+        let got = player_profile(197, eq, ch, false);
         assert_eq!(&got[0..2], &[0xBE, 0x36], "marker + UserMessage carrier");
         let nd = arena_proto::parse_netdata(&got[2..]);
         assert_eq!(nd.int(0), Some(197), "p0 player obj id");
@@ -2030,7 +2056,11 @@ mod tests {
         assert_eq!(nd.int(3), Some(35), "p3 profile gameMessageId");
         assert_eq!(nd.string(4), Some(eq), "p4 equippedItems json");
         assert_eq!(nd.string(5), Some(ch), "p5 character json");
-        // p6 == false (capture-proven vs s506; the reassembled op54 ends `}` then 0x00).
+        // p6 == false here because this fixture passes false. Retail s506's captured
+        // profile also carried false — and that is CONSISTENT with the capturing
+        // client's own op61 reporting HideHelmet=true (x10): op61 is what a client
+        // says about ITSELF, while the profile it receives describes its OPPONENT,
+        // who was not hiding. See `profile_relays_the_senders_hide_helmet`.
         assert_eq!(
             nd.props.get(&6),
             Some(&arena_proto::NetDataValue::Bool(false)),
