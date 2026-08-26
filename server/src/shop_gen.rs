@@ -259,6 +259,28 @@ mod tests {
 
     const FORGE: &str = "26fdb92f-a4df-4928-a97b-dee8699af605";
     const ENCHANTER: &str = "82108d94-ebf7-434f-8623-ca66d7504f27";
+    const ALCHEMIST: &str = "e1dd10fc-8b14-4288-9b23-99b0d58388de";
+    const WORKSHOP: &str = "b6c023e6-3b81-497f-9c2c-f532ecff3bb2";
+
+    /// Building typeId -> the merchant whose goods belong in it.
+    ///
+    /// GROUND TRUTH, not inference. Established by chaining
+    /// `shops.json.byShop` (captured shop id -> catalog template) through the
+    /// live towns in prod (that shop id is a building INSTANCE, which carries
+    /// its `typeId`) to the template's bundle names:
+    ///
+    ///   26fdb92f  49/49 Forge      e1dd10fc  16/16 Alchemist
+    ///   b6c023e6  16/16 Workshop   82108d94  the one a player found serving
+    ///                                        forge goods -> Enchanter
+    ///
+    /// It agrees with the `editorName` already on each block. Those labels were
+    /// always right; only the pools were wrong.
+    const MERCHANT_OF: [(&str, &str); 4] = [
+        (FORGE, "Forge"),
+        (ENCHANTER, "Enchanter"),
+        (ALCHEMIST, "Alchemist"),
+        (WORKSHOP, "Workshop"),
+    ];
 
     /// Load the committed `deploy/static/shop_stock.json` into the typed config.
     fn load_committed() -> ShopStockConfig {
@@ -473,5 +495,63 @@ mod tests {
         assert_eq!(window_index(3_600_000 - 1, 3600), 0);
         assert_eq!(window_index(3_600_000, 3600), 1);
         assert_eq!(window_index(7_200_000, 3600), 2);
+    }
+
+    /// EVERY shop stocks its OWN merchant's goods.
+    ///
+    /// WHY THIS EXISTS
+    ///
+    /// Severius the enchanter was selling elven longswords, hide armour and
+    /// quicksilver ingots. All four town shops held another merchant's stock in
+    /// a clean four-cycle rotation — Forge's slot had Alchemist goods,
+    /// Enchanter's had Forge, Workshop's had Enchanter, Alchemist's had
+    /// Workshop.
+    ///
+    /// It shipped because the pools were never derived. The commit that
+    /// authored them says they were "attributed to shop types by clustering the
+    /// 94 observed capture-catalog bundles on shared ids" — a heuristic over an
+    /// incomplete sample, with nothing checking the result against the merchant
+    /// each bundle actually belongs to. Every other test here checks tier gates,
+    /// determinism and counts; not one asked whether the stock was the right
+    /// SHOP's, so all of them stayed green through it.
+    ///
+    /// The fork's `shop_bundles.json` carries no names, so the merchant of each
+    /// bundle comes from a committed manifest generated from the shipped
+    /// asset's `editor_name`s.
+    #[test]
+    fn every_shop_stocks_its_own_merchants_goods() {
+        let p = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("data/static/shop_bundle_merchants.json");
+        let f = std::fs::File::open(&p).expect("shop_bundle_merchants.json present");
+        let manifest: std::collections::HashMap<String, serde_json::Value> =
+            serde_json::from_reader(std::io::BufReader::new(f)).expect("manifest parses");
+
+        let cfg = load_committed();
+        for (type_id, merchant) in MERCHANT_OF {
+            let block = cfg
+                .generation
+                .get(&ty(type_id))
+                .unwrap_or_else(|| panic!("{merchant} has no generation block"));
+            assert!(!block.item_pool.is_empty(), "{merchant} pool is empty");
+
+            let mut wrong: Vec<String> = Vec::new();
+            for entry in &block.item_pool {
+                match manifest.get(&entry.bundle_id.to_string()).and_then(|v| v.as_str()) {
+                    Some(m) if m == merchant => {}
+                    // A bundle the manifest does not know is NOT a pass: the
+                    // manifest covers every town-merchant bundle, so an unknown
+                    // id means the pool holds something that is not town stock.
+                    other => wrong.push(format!("{} is {:?}", entry.bundle_id, other)),
+                }
+            }
+            assert!(
+                wrong.is_empty(),
+                "{} ({}) stocks {} bundle(s) that are not its own: {:?}",
+                merchant,
+                type_id,
+                wrong.len(),
+                &wrong[..wrong.len().min(5)]
+            );
+        }
     }
 }
