@@ -2,6 +2,7 @@
 name = "arena_proto"
 version = "0.1.0"
 edition = "2024"
+license = "AGPL-3.0-only"
 description = "Pure byte-layer for the Blades arena UDP protocol (ENet walk, ChaCha20 stream, X25519, fragment reassembly, opcodes). Ported from scripts/arena-decrypt.py + emulator/internal/proto/*.go in the capture repo."
 
 [dependencies]

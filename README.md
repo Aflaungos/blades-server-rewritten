@@ -25,3 +25,20 @@ This is a re‑implementation of the Blades server, as documented via reverse‑
 
 ## Some SQL notes:
 Remember to use FOR NO KEY UPDATE in your select if you’re gonna write back the modified result (obviously in the same transaction). Take care of deadlock too! (the for FOR NO KEY UPDATE should handle that in most cases).
+
+## Licence
+
+AGPL-3.0-only — see [LICENSE](LICENSE).
+
+This is a fork of [marius851000/blades-server-rewritten](https://github.com/marius851000/blades-server-rewritten),
+which is MIT. Those portions remain available under MIT from their original
+author and upstream is unaffected; see [NOTICE](NOTICE).
+
+The AGPL was chosen because this is a server: under permissive terms a modified
+copy can be run as a public service without publishing the changes, and section
+13 closes that. For a preservation project that is the point.
+
+Some files carry game data this project did not author and cannot license to
+you. **Read [NOTICE](NOTICE) before redistributing** — it says exactly what
+that data is and, as importantly, what is not in this repository.
+
