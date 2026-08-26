@@ -511,8 +511,9 @@ async fn main() -> Result<()> {
                     .service(admin::recent_matches)
                     .service(admin::bind_device)
                     .service(admin::recent_devices)
-                    // Guild support console (dev-token gated; the web
-                    // /admin/guilds page is its only intended caller).
+                    .service(admin::arena_season_rollover)
+                    // Guild support console (dev-token gated; the web /guilds
+                    // page is its only intended caller).
                     .service(guild_admin::list_guilds)
                     .service(guild_admin::set_grandmaster)
                     // Registered AFTER the /grandmaster route: `{guild_id}` is a
