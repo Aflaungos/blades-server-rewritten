@@ -89,6 +89,15 @@ struct Match {
     /// When `allocate` reserved this match — `sweep_expired` reclaims abandoned
     /// matches (clients never connected) so their capacity permit can't leak.
     created_at: Instant,
+    /// Did every slot fill at least once?
+    ///
+    /// `sweep_expired`'s under-capacity rule is meant for a match nobody joined.
+    /// Without this flag it also fires on a match IN PROGRESS whose peer dropped —
+    /// deleting a live match out from under the player still in it, who is then
+    /// stranded in an arena the server no longer ticks. Once a match has filled,
+    /// "under capacity" means someone LEFT, which is not the leak the sweep exists
+    /// to plug; MATCH_MAX_AGE and the empty-match path still bound its lifetime.
+    reached_capacity: bool,
     _permit: OwnedSemaphorePermit,
     /// `playerSessionId → fighter slot` — populated at allocation so that when the
     /// client's encrypted PlayerInfo (op20) arrives, we can bind its peer address to
@@ -499,6 +508,7 @@ impl MatchRegistry {
                 players: Vec::with_capacity(capacity),
                 instance,
                 created_at: Instant::now(),
+            reached_capacity: false,
                 _permit: permit,
                 psid_to_slot,
                 peer_to_slot: HashMap::new(),
@@ -556,6 +566,9 @@ impl MatchRegistry {
             player_session_id: player_session_id.to_string(),
             crypto,
         });
+        if m.players.len() >= m.capacity {
+            m.reached_capacity = true;
+        }
         match ticket_slot {
             Some(slot) => {
                 m.bind_slot(peer, slot, "playerSessionId presented at admit");
@@ -612,6 +625,9 @@ impl MatchRegistry {
             player_session_id: String::new(), // bound later if/when the psid arrives
             crypto,
         });
+        if m.players.len() >= m.capacity {
+            m.reached_capacity = true;
+        }
         // No psid on the wire — but two cases are still decidable right here:
         //   1. a single-peer match (solo / vs-bot) has exactly ONE possible fighter
         //      slot, so admission order cannot be wrong;
@@ -828,7 +844,10 @@ impl MatchRegistry {
                 .values()
                 .filter(|m| {
                     let age = now.saturating_duration_since(m.created_at);
-                    (m.players.len() < m.capacity && age > CONNECT_DEADLINE) || age > MATCH_MAX_AGE
+                    (m.players.len() < m.capacity
+                        && !m.reached_capacity
+                        && age > CONNECT_DEADLINE)
+                        || age > MATCH_MAX_AGE
                 })
                 .map(|m| m.game_session_id)
                 .collect();
@@ -1252,6 +1271,80 @@ mod tests {
         // everyone else forever.
         reg.remove(&peer);
         assert_eq!(reg.live_human_count(), 0, "the count must fall when they leave");
+    }
+
+    /// A match that FILLED and then lost one player must not be reclaimed as if
+    /// its opponent had never connected.
+    ///
+    /// `sweep_expired` exists to reclaim matches nobody ever joined. Its rule is
+    /// `players.len() < capacity && age > CONNECT_DEADLINE`, which cannot tell that
+    /// case apart from a match in progress whose peer just dropped — so it deletes a
+    /// live match out from under the player who is still there. The server then stops
+    /// ticking it and goes silent mid-sequence, leaving the remaining client frozen in
+    /// the arena with no way out (cancel does nothing: there is no match to cancel).
+    ///
+    /// Observed 2026-08-25: after a legitimate 2-0 match end at 19:25:24 the server
+    /// owed two more state broadcasts (PostMatch, DisconnectingPlayers) and sent
+    /// nothing further to EITHER player.
+    #[test]
+    fn a_filled_match_survives_one_player_leaving() {
+        let reg = MatchRegistry::new(4);
+        let gsid = Uuid::new_v4();
+        let psid_a = "aaaaaaaa-0000-0000-0000-000000000000";
+        let psid_b = "bbbbbbbb-1111-1111-1111-111111111111";
+        assert!(reg.allocate(
+            &[psid_a.to_string(), psid_b.to_string()],
+            vec![Loadout::default(), Loadout::default()],
+            gsid,
+        ));
+
+        let a: SocketAddr = "10.99.0.47:5000".parse().unwrap();
+        let b: SocketAddr = "10.99.0.37:5000".parse().unwrap();
+        assert!(reg.admit(a, psid_a, &[7u8; 32]).is_some());
+        assert!(reg.admit(b, psid_b, &[8u8; 32]).is_some());
+        assert_eq!(reg.active_count(), 1, "the match is allocated and full");
+
+        // One peer drops at the end of the match — the other is still connected.
+        reg.remove(&b);
+
+        // A sweep runs, well past CONNECT_DEADLINE but far inside MATCH_MAX_AGE.
+        // (The real match was ~77 s old against a 45 s deadline.)
+        reg.sweep_expired(Instant::now() + CONNECT_DEADLINE + Duration::from_secs(35));
+
+        assert_eq!(
+            reg.active_count(),
+            1,
+            "a match that was FULL must survive one player leaving — reclaiming it \
+             strands the remaining player in a match the server no longer ticks"
+        );
+        assert!(
+            reg.is_active(&a),
+            "the player who stayed must still be routable to their match"
+        );
+    }
+
+    /// The behaviour the sweep is actually FOR must keep working: a match whose
+    /// opponent never turned up is still reclaimed, so its capacity permit cannot leak.
+    #[test]
+    fn a_match_that_never_filled_is_still_reclaimed() {
+        let reg = MatchRegistry::new(4);
+        let gsid = Uuid::new_v4();
+        let psid_a = "cccccccc-2222-2222-2222-222222222222";
+        let psid_b = "dddddddd-3333-3333-3333-333333333333";
+        assert!(reg.allocate(
+            &[psid_a.to_string(), psid_b.to_string()],
+            vec![Loadout::default(), Loadout::default()],
+            gsid,
+        ));
+        let a: SocketAddr = "10.99.0.50:5000".parse().unwrap();
+        assert!(reg.admit(a, psid_a, &[7u8; 32]).is_some());
+        // psid_b never connects.
+        reg.sweep_expired(Instant::now() + CONNECT_DEADLINE + Duration::from_secs(35));
+        assert_eq!(
+            reg.active_count(),
+            0,
+            "an abandoned match must still be reclaimed or its permit leaks"
+        );
     }
 
     #[test]
