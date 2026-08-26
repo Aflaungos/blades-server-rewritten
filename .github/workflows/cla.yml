@@ -1,0 +1,165 @@
+# Gate merges on a recorded CLA acceptance, and record it automatically.
+#
+# WHY THIS EXISTS
+#
+# CLA.md used to claim "the CLA assistant records your GitHub username, the
+# commit SHA and the timestamp". No such assistant existed. The wording was
+# corrected to describe a by-hand ledger — and this is that sentence made true
+# again, without handing a third party custody of the project's legal records.
+#
+# The failure it prevents is silent: a first-time contributor's pull request
+# gets merged, nobody remembers to write the row, and months later there is no
+# record that they granted anything. A missing row is not visible in a diff, so
+# a human process cannot catch it. A required check can.
+#
+# WHY NOT cla-assistant.io OR A THIRD-PARTY ACTION
+#
+# Those store signatures in someone else's gist or service. These records are
+# the evidence that the project has the right to relicense; they should live in
+# this repository, in git history, where they can be audited without asking
+# anyone's permission. Only first-party GitHub actions are used here, matching
+# the pinning convention in ci.yml.
+#
+# SECURITY: `pull_request_target` runs with a write token and the BASE
+# repository's workflow definition — that is what allows recording an
+# acceptance from a fork. It is only safe because this job NEVER checks out or
+# executes pull-request code. Do not add `actions/checkout` with the PR ref to
+# this file.
+
+name: CLA
+
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: write        # append the ledger row
+  pull-requests: write   # comment on the PR
+  issues: write          # issue_comment API surface
+
+concurrency:
+  # One run per PR. Two comments in quick succession must not race to append
+  # two rows for the same person.
+  group: cla-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: false
+
+jobs:
+  check:
+    # Ignore comments on plain issues; only pull requests carry a CLA question.
+    if: github.event_name == 'pull_request_target' || github.event.issue.pull_request
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const LEDGER = 'CLA-ACCEPTANCES.md';
+            const CLA_VERSION = '1.0';
+            const PHRASE = 'I have read the CLA and I hereby accept its terms.';
+
+            // People who are party to the agreement by writing it, not by
+            // accepting it. Keep this list short and explicit.
+            const EXEMPT = new Set(['b3rntsen']);
+
+            const prNumber = context.payload.pull_request?.number
+                           ?? context.payload.issue?.number;
+            const { owner, repo } = context.repo;
+
+            const pr = (await github.rest.pulls.get({
+              owner, repo, pull_number: prNumber,
+            })).data;
+            const author = pr.user.login;
+
+            if (pr.user.type === 'Bot' || EXEMPT.has(author)) {
+              core.info(`${author} does not need to accept — exempt or a bot.`);
+              return;
+            }
+            // A GitHub login is [A-Za-z0-9-]; refuse anything else rather than
+            // interpolate an unexpected string into a markdown table.
+            if (!/^[A-Za-z0-9-]+$/.test(author)) {
+              core.setFailed(`Unexpected login shape: ${author}`);
+              return;
+            }
+
+            // --- already recorded? ------------------------------------------
+            const file = await github.rest.repos.getContent({
+              owner, repo, path: LEDGER, ref: pr.base.ref,
+            });
+            const ledger = Buffer.from(file.data.content, 'base64').toString('utf8');
+            // Match the linked-or-plain handle in the first table column only,
+            // so a mention of someone in the prose cannot be read as a row.
+            const recorded = new RegExp(`^\\|\\s*\\[?@?${author}\\b`, 'mi').test(ledger);
+            if (recorded) {
+              core.info(`${author} already has a recorded acceptance.`);
+              return;
+            }
+
+            // --- has the acceptance been given on this PR? -------------------
+            const comments = await github.paginate(
+              github.rest.issues.listComments,
+              { owner, repo, issue_number: prNumber, per_page: 100 },
+            );
+            const accepted = comments.find(
+              c => c.user.login === author && c.body.includes(PHRASE),
+            );
+
+            if (!accepted) {
+              const already = comments.some(
+                c => c.user.type === 'Bot' && c.body.includes('accept the Contributor Licence Agreement'),
+              );
+              if (!already) {
+                await github.rest.issues.createComment({
+                  owner, repo, issue_number: prNumber,
+                  body: [
+                    `Hi @${author} — thanks for this.`,
+                    '',
+                    'Before it can be merged you need to accept the Contributor Licence',
+                    `Agreement in [CLA.md](https://github.com/${owner}/${repo}/blob/main/CLA.md).`,
+                    'It is a licence grant, not an assignment: you keep the copyright in',
+                    'your work and stay free to use it elsewhere. What it adds is the',
+                    'right for the maintainer to relicense the project without asking you',
+                    'again — which is asymmetric, and CONTRIBUTING.md explains why it is',
+                    'asked for so you can decide with that in front of you.',
+                    '',
+                    'If you agree, reply on this pull request with exactly:',
+                    '',
+                    '```',
+                    PHRASE,
+                    '```',
+                    '',
+                    'Once, not per pull request, and it covers anything you contributed',
+                    'earlier. This check re-runs on your comment.',
+                  ].join('\n'),
+                });
+              }
+              core.setFailed(`${author} has not accepted the CLA.`);
+              return;
+            }
+
+            // --- record it ---------------------------------------------------
+            const when = accepted.created_at.slice(0, 10);
+            const row = `| [@${author}](https://github.com/${author}) | ${CLA_VERSION} | ${when} | #${prNumber} |\n`;
+
+            // Drop the "none yet" placeholder the first time a real row lands.
+            let next = ledger.replace(/^\| _none yet_ \|.*\n/m, '');
+            const lines = next.split('\n');
+            let last = -1;
+            for (let i = 0; i < lines.length; i++) if (/^\|/.test(lines[i])) last = i;
+            if (last === -1) { core.setFailed(`No table found in ${LEDGER}.`); return; }
+            lines.splice(last + 1, 0, row.trimEnd());
+            next = lines.join('\n');
+
+            await github.rest.repos.createOrUpdateFileContents({
+              owner, repo, path: LEDGER,
+              message: `chore(cla): record acceptance by @${author} (#${prNumber})`,
+              content: Buffer.from(next, 'utf8').toString('base64'),
+              sha: file.data.sha,
+              branch: pr.base.ref,
+            });
+
+            await github.rest.issues.createComment({
+              owner, repo, issue_number: prNumber,
+              body: `Recorded @${author}'s acceptance of CLA v${CLA_VERSION} in \`${LEDGER}\`. Thanks — this only needs doing once.`,
+            });
+            core.info(`Recorded ${author}.`);
