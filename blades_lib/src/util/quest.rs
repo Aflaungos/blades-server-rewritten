@@ -7,8 +7,8 @@ use crate::{
     game_data::GameData,
     static_data::QuestLevelScaling,
     user_data::{
-        ChestGeneratedData, DungeonEnemyResult, DungeonGeneratedData, DungeonItemResult,
-        LootTableResult, ObjectiveStatus, Quest, QuestStatus, QuestType,
+        DungeonGeneratedData,
+        ObjectiveStatus, Quest, QuestStatus, QuestType,
     },
 };
 
@@ -84,65 +84,16 @@ pub fn generate_quest_data(
         return Ok((quest, None));
     }
 
-    let dungeon = game_data.dungeons.get(&dungeon_info.dungeon_uuid).ok_or(
-        GenerateQuestDataError::DungeonNotFound(dungeon_info.dungeon_uuid),
-    )?;
 
     let enemy_level = scaling.enemy_level(player_level);
     let given_xp = scaling.given_xp(enemy_level);
 
-    let generated_dungeon_data = DungeonGeneratedData {
-        enemy_generated_data: dungeon
-            .spawn_info
-            .enemy_spawn_groups
-            .iter()
-            .map(|(spawn_group_id, spawn_group)| {
-                let mut enemies_info = Vec::new();
-                //TODO: which one of the two level is appropriate for multiple enemy?
-                for _ in 0..spawn_group.quantity.max(1) {
-                    enemies_info.push(vec![DungeonEnemyResult {
-                        enemy_level,
-                        given_xp,
-                        spawn_group_loot: HashMap::default(),
-                        loot_table_loot: HashMap::default(),
-                    }])
-                }
-                (*spawn_group_id, enemies_info)
-            })
-            .collect(),
-        chest_generated_data: dungeon
-            .spawn_info
-            .chest
-            .iter()
-            .map(|(chest_spawn_id, _spawn_info)| {
-                (*chest_spawn_id, vec![ChestGeneratedData { tier: 1 }])
-            })
-            .collect(),
-        item_generated_data: dungeon
-            .spawn_info
-            .item
-            .iter()
-            // Skip a malformed item spawn (missing apparition setting / unknown
-            // interactable) instead of panicking — a partial parsed.json must not crash
-            // /accept; the item just doesn't spawn.
-            .filter_map(|(item_spawn_id, spawn_info)| {
-                let picked = spawn_info.apparition_settings.first()?;
-                let interactable = game_data.interactables.get(&picked.interactable_uuid)?;
-                Some((
-                    *item_spawn_id,
-                    vec![DungeonItemResult {
-                        loot_table_loot: interactable
-                            .loot_table
-                            .iter()
-                            .map(|(k, _v)| (*k, LootTableResult::default()))
-                            .collect(),
-                    }],
-                ))
-            })
-            .collect(),
-        algorithm_version: 1,
-        version: 0, //TODO: where does that come from? presumably not the same version that the quest itself.
-    };
+    // Shared with the Abyss — see `util::dungeon`. The Abyss used to have its
+    // own hard-coded copy of this shape, which served floor 1's spawn groups on
+    // every floor and hung every deeper run.
+    let generated_dungeon_data =
+        crate::util::dungeon::generate_for_dungeon(game_data, &dungeon_info.dungeon_uuid, enemy_level, given_xp)
+            .ok_or(GenerateQuestDataError::DungeonNotFound(dungeon_info.dungeon_uuid))?;
 
     Ok((quest, Some(generated_dungeon_data)))
 }
