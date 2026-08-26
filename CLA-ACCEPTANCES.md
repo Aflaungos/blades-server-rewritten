@@ -2,11 +2,15 @@
 
 Who has accepted [`CLA.md`](CLA.md), and when.
 
-Maintained by hand — there is no CLA bot. `CLA.md` says so plainly rather than
-describing automation that does not exist. The authoritative record of any
-acceptance is the contributor's own comment on their pull request, which GitHub
-attributes and timestamps; this file is the index over those comments so nobody
-has to search for them.
+Written by `.github/workflows/cla.yml`, which blocks a merge until the author
+has accepted and then appends the row itself. Rows may also be added by hand;
+the format is the same and the workflow will not duplicate one.
+
+The authoritative record of any acceptance is the contributor's own comment on
+their pull request, which GitHub attributes and timestamps. This file is the
+index over those comments so nobody has to search for them, and it is kept in
+this repository rather than with a third-party CLA service because it is the
+evidence that the project has the right to relicense.
 
 A contributor's acceptance is retroactive to everything they contributed before
 signing (CLA section 1), so each person appears once.
@@ -17,10 +21,12 @@ signing (CLA section 1), so each person appears once.
 
 ## Before merging a first-time contributor
 
-1. Check they are in the table above. If not, ask for the acceptance comment on
-   the pull request.
-2. Add the row, citing the pull request the comment is on.
-3. Then merge.
+The `CLA` check does this for you: it fails until the author has commented the
+acceptance line, then records them. Make it a required status check on `main`
+so a merge cannot go around it.
+
+If you are adding a row by hand — an acceptance given by email, say — cite
+where it was given in the last column.
 
 ## People who do not need to be here
 

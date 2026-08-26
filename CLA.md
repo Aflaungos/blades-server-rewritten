@@ -83,9 +83,10 @@ Your comment is itself the record: GitHub attributes and timestamps it, and
 the maintainer additionally logs your username, the pull request and the date
 against version 1.0 of this document in [`CLA-ACCEPTANCES.md`](CLA-ACCEPTANCES.md).
 
-There is no bot. This is done by hand, which means a merged pull request from
-someone with no logged acceptance is a mistake to be corrected rather than
-something the tooling would have prevented.
+A workflow in this repository checks it. If you have not accepted, it says so
+on your pull request and the merge is blocked; when you do, it appends your row
+and confirms. The records live here, in git history, not with a third-party CLA
+service.
 
 Acceptance is required once, not per pull request. If this document changes
 materially you will be asked to accept the new version; earlier acceptances

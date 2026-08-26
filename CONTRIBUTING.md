@@ -44,10 +44,9 @@ Accepting is one comment on your pull request:
     I have read the CLA and I hereby accept its terms.
 
 Once, not per pull request. It is retroactive to anything you contributed
-earlier, so contributing first and accepting later is fine. Acceptances are
-logged by hand in [`CLA-ACCEPTANCES.md`](CLA-ACCEPTANCES.md); there is no bot,
-so if a maintainer merges your work without asking, that is an oversight rather
-than a waiver.
+earlier, so contributing first and accepting later is fine. A workflow checks this and will
+tell you on the pull request if it is outstanding; once you accept, it records
+you in [`CLA-ACCEPTANCES.md`](CLA-ACCEPTANCES.md).
 
 Please also sign your commits off:
 
