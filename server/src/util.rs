@@ -26,7 +26,14 @@ pub async fn check_permission_for_character_and_get_it(
             .select(CharacterDbAlone::as_select())
             .load(conn)
             .await
-            .unwrap()
+            // A transient database error must not panic the request. This is
+            // the PERMISSION helper — every character-scoped handler funnels
+            // through it — so an unwrap here turns one dropped connection into
+            // a panic on whichever request happened to be checking ownership.
+            .map_err(|e| {
+                log::warn!("permission check: could not load character {character_id}: {e}");
+                BladeApiError::new(StatusCode::SERVICE_UNAVAILABLE, 1, 101)
+            })?
     };
 
     Ok(get_only_single_character_and_check_permission(
