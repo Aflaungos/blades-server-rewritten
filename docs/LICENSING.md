@@ -82,17 +82,61 @@ one that rebuilds them.
 
 ## Contributing
 
-**Contribution terms are not settled yet, and this relicence does not settle
-them.** Nothing in this document asks you to sign anything.
+Contributions are accepted under the AGPL, and a first pull request also needs
+acceptance of the Contributor Licence Agreement in [`CLA.md`](../CLA.md).
+[`CONTRIBUTING.md`](../CONTRIBUTING.md) has the mechanics; this section is the
+reasoning.
 
-Until they are, treat a pull request as offered under the same AGPL-3.0 that
-covers the rest of the project. If the terms end up needing something more
-than that, contributors will be asked before anything they have already
-written is treated differently.
+### What the CLA does, in one sentence
 
-This is a deliberate split: the licence the code is distributed under is one
-decision, and the terms contributions are accepted under is another. Doing the
-first should not quietly commit anyone to the second.
+You keep your copyright, and you grant the maintainer a perpetual, irrevocable
+licence that includes the right to relicense your contribution under any terms
+— open source or proprietary — without asking you again.
+
+### Why it is asked for
+
+This project reimplements the server for a commercial game that is still owned
+by somebody. Two situations are foreseeable enough to prepare for:
+
+- **A rights-holder objects.** Somebody needs the standing to answer, to settle,
+  or to hand the project over intact. Without a CLA that requires the agreement
+  of every contributor who touched the relevant code, and one unreachable or
+  pseudonymous account makes it impossible.
+- **The licence has to change.** Nobody can see far enough ahead to promise
+  AGPL is right forever. Linux is the cautionary case: it cannot move off GPLv2
+  even by consensus, because it never collected the rights to.
+
+The cost of collecting this at the start is one comment per contributor. The
+cost of needing it later and not having it is that the code has to be removed
+and rewritten.
+
+### The part that is a real ask
+
+It is **asymmetric**. A contributor grants a right they do not receive in
+return over anyone else's work, and the maintainer could in principle take the
+project proprietary on the strength of it. That is the same structure MongoDB
+and Elastic used, and some people decline it on principle.
+
+This document is not going to pretend otherwise. What the agreement does to
+soften it:
+
+- it is a **licence, not an assignment** — you do not lose your copyright;
+- clause 4 leaves you free to use and relicense **your own** contribution
+  anywhere else, including in a competing project;
+- the grant reaches only what you actually wrote: clause 5 has you confirm the
+  work is yours to give and that you have not folded in game-client data or
+  undisclosed third-party code, so nobody is purporting to license the
+  extracted game data — which none of us can license to anyone;
+- the patent grant terminates for any party that sues the project over it.
+
+If the trade is not one you want to make, saying so early is welcome and costs
+nothing.
+
+### Who is not covered
+
+**Marius DAVID's** contributions predate the fork and arrived under MIT, which
+already permits relicensing them under any terms. He is not covered by the CLA
+and does not need to be.
 
 ## Dependency licences
 
