@@ -256,7 +256,13 @@ fn pump(
         Act::Disconnect(addr) => {
             info!("arena-enet: peer disconnected ({addr:?})");
             if let Some(addr) = addr {
-                registry.remove(&addr);
+                // If the peer left a live match, its opponent wins by concession;
+                // send the immediate victory frames down the same encrypt+send path.
+                // The match-end walk then rides the tick loop as for a normal win.
+                let now = std::time::Instant::now();
+                for (target, channel, bytes) in registry.peer_departed(&addr, now) {
+                    send_to(host, peer_at, &target, channel, &bytes);
+                }
                 peer_at.remove(&addr);
             }
         }
