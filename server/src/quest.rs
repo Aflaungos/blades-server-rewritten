@@ -2571,9 +2571,26 @@ mod playability_sweep {
     ///
     /// Before the capture re-extraction this was 26/171 (15 %), because the table was
     /// keyed by the instance ids that appeared in captured `/complete` URLs rather
-    /// than by the template. Resolving those back through `gldQuestId` is what lifted
-    /// it. The remaining 29 are quests no capture ever completed; they pay nothing on
-    /// purpose rather than paying a made-up number.
+    /// than by the template. Resolving those back through `gldQuestId` lifted it to
+    /// 103 flat / 142 covered.
+    ///
+    /// It then moved again, to 115 / 154, and NOT by inventing anything: the 29
+    /// quests no capture ever completed were never missing a reward. The shipped
+    /// quest asset carries `reward_preview`, and it IS the reward —
+    /// `characterXp == reward_preview.experience` and
+    /// `townXp == reward_preview.town_points` held 59/59 with one distinct ratio
+    /// (exactly 1.0) across every quest where a capture and a definition both
+    /// exist. `scripts/build-quest-rewards-static.py` in the capture repo
+    /// generates the table from it.
+    ///
+    /// What is left is not a coverage gap of the same kind: 57 quests ship an
+    /// explicit `0.0`, which is retail saying "this pays nothing". Every quest in
+    /// the asset has a preview, so there is no missing-vs-zero ambiguity — and
+    /// they are deliberately absent from the table rather than present-and-empty,
+    /// because a key that pays nothing would make `contains_key` claim a coverage
+    /// the player never sees.
+    ///
+    /// Gold is still capture-only: `reward_preview` has no currency of any kind.
     #[test]
     fn reward_coverage_is_what_the_captures_support() {
         let sd = static_data();
@@ -2592,9 +2609,9 @@ mod playability_sweep {
             })
             .collect();
 
-        assert_eq!(flat, 103, "flat rewards from quest_rewards.json");
+        assert_eq!(flat, 115, "flat rewards from quest_rewards.json");
         assert_eq!(evented, 39, "milestone ladders from event_quests.json");
-        assert_eq!(covered.len(), 142, "142 of 171 quests pay something");
+        assert_eq!(covered.len(), 154, "154 of 171 quests pay something");
         assert!(
             covered.len() as f64 / gd.quests.len() as f64 > 0.80,
             "coverage must stay above 80%"
