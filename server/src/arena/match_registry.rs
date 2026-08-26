@@ -800,6 +800,61 @@ impl MatchRegistry {
         self.matches.lock().unwrap().len()
     }
 
+    /// An ENet peer disconnected. Like [`remove`](Self::remove), but first — if the
+    /// peer left a LIVE match with an opponent still present — award that opponent the
+    /// match by concession and return the immediate victory frames (already encrypted
+    /// under the surviving peer's key, ready for the ENet send path). The match-end
+    /// walk that follows rides `tick_matches` exactly as a normal win does; the
+    /// surviving match stays alive (it reached capacity, so `sweep_expired` leaves it).
+    ///
+    /// Returns an empty vec for a normal end-of-match teardown disconnect (the engine
+    /// no-ops when already ending) or a solo/bot match with no opponent to award.
+    pub fn peer_departed(&self, peer: &SocketAddr, now: Instant) -> Vec<(SocketAddr, u8, Vec<u8>)> {
+        let Some(gsid) = self.addr_index.lock().unwrap().remove(peer) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut matches = self.matches.lock().unwrap();
+        if let Some(m) = matches.get_mut(&gsid) {
+            let departed_slot = m.peer_to_slot.get(peer).copied();
+            let opponent_present = m.players.iter().any(|p| &p.addr != peer);
+            if opponent_present {
+                if let Some(slot) = departed_slot {
+                    for (target, mut user_data) in m.instance.concede_by_departure(slot, now) {
+                        let Some(target_addr) = m.peer_for_slot(target) else {
+                            continue;
+                        };
+                        if &target_addr == peer {
+                            continue; // never address the peer that just left
+                        }
+                        let Some(tp) = m.players.iter().find(|p| p.addr == target_addr) else {
+                            continue;
+                        };
+                        let channel = crate::arena::combat::messages::retail_channel(&user_data);
+                        let (key, nonce, addr) = (tp.crypto.key, tp.crypto.nonce, tp.addr);
+                        chacha20_legacy_xor(&mut user_data, &key, &nonce);
+                        out.push((addr, channel, user_data));
+                    }
+                }
+            }
+            // Drop the departed peer. The match survives on its remaining player(s);
+            // an empty match is removed (freeing its permit), same as `remove`.
+            m.players.retain(|p| &p.addr != peer);
+            m.peer_to_slot.remove(peer);
+            if m.players.is_empty() {
+                matches.remove(&gsid);
+                info!("match registry: match {gsid} empty, removed");
+            } else {
+                info!(
+                    "match registry: {peer} left match {gsid} [{}/{}] — opponent awarded the match",
+                    m.players.len(),
+                    m.capacity
+                );
+            }
+        }
+        out
+    }
+
     /// How many HUMANS are in a live match right now.
     ///
     /// Counts connected peers, because a bot never has one — a solo-vs-bot match

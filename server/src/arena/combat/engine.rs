@@ -638,6 +638,99 @@ impl MatchInstance {
         out
     }
 
+    /// A peer left mid-match (ENet disconnect). If a live match still has an
+    /// opponent, award the match to them BY CONCESSION and drive the same terminal
+    /// victory walk a normal win uses — so the survivor gets the result card and a
+    /// clean return to lobby instead of waiting out `MATCH_MAX_AGE` (10 min) in a
+    /// frozen arena.
+    ///
+    /// Returns the immediate op48 (`MatchConceded`) + op79 `RoundEnd` + PostRound(14)
+    /// frames for the surviving fighter(s); the subsequent match-end walk
+    /// (BackendMatchEnd → PostMatch → DisconnectingPlayers) rides `on_tick`'s
+    /// `RoundEnd` branch, exactly as for a 2-0. Empty (no-op) when the match is already
+    /// ending/finished — where a disconnect is the NORMAL teardown, not a rage-quit —
+    /// or when the leaver had no opponent (solo/bot).
+    pub fn concede_by_departure(
+        &mut self,
+        departed_slot: usize,
+        now: Instant,
+    ) -> Vec<(usize, Vec<u8>)> {
+        // Already ending or over → this disconnect is the DisconnectingPlayers
+        // teardown, not a forfeit. Never fire twice.
+        if matches!(self.combat.phase, FlowState::RoundEnd | FlowState::Finished) {
+            return Vec::new();
+        }
+        let Some(winner) = self.combat.opponent_of(departed_slot) else {
+            return Vec::new(); // solo / bot — nobody to award the match to
+        };
+
+        // The departure counts as the final round, won by the survivor. op48 is
+        // cumulative, so it carries every completed round plus this one.
+        self.combat.round_winners.push(winner);
+        if winner < self.combat.rounds_won.len() {
+            self.combat.rounds_won[winner] += 1;
+        }
+
+        let uuid_of = |slot: usize| -> String {
+            self.combat
+                .fighters
+                .get(slot)
+                .map(|f| f.loadout.character_uuid.clone())
+                .unwrap_or_default()
+        };
+        let round_results: Vec<(String, String)> = self
+            .combat
+            .round_winners
+            .iter()
+            .map(|&w| (uuid_of(w), uuid_of(1 - w)))
+            .collect();
+
+        let result = messages::match_post_round_info(
+            self.combat.match_net_object_id,
+            &round_results,
+            &self.combat.game_session_id,
+            true, // the departure ends the match
+            true, // MatchConceded — the opponent left
+        );
+        // Match net-object → PostRound(14); same 3.0 s timeout as a round-ending death
+        // (resolve.rs MATCH_STATE_POST_ROUND_TIMEOUT).
+        let post_round = messages::update_match(
+            self.combat.match_net_object_id,
+            self.combat.fighters.len() as u8,
+            MatchState::PostRound,
+            3.0,
+            self.combat.round,
+            &self.combat.game_session_id,
+        );
+
+        let mut out = Vec::new();
+        for slot in 0..self.combat.fighters.len() {
+            out.push((slot, result.clone()));
+            if let Some(m) = messages::flow_state(self.combat.flow_controller_id, FlowState::RoundEnd) {
+                out.push((slot, m));
+            }
+            out.push((slot, post_round.clone()));
+        }
+
+        // Enter the terminal match-end walk, anchored at NOW — on_tick's RoundEnd
+        // branch emits StateTimeout + the op49 victory card + BackendMatchEnd, then
+        // PostMatch and DisconnectingPlayers, and take_finished_peers disconnects the
+        // survivor cleanly.
+        self.combat.match_state = MatchState::PostRound;
+        self.combat.winner = Some(winner);
+        self.combat.matchend_step = 0;
+        self.combat.phase = FlowState::RoundEnd;
+        self.combat.phase_entered = now;
+
+        info!(
+            "combat: slot {departed_slot} departed mid-match → WIN BY CONCESSION to slot {winner} \
+             (score {:?}); emitting op48(conceded) + op79 RoundEnd + PostRound(14), then the engine \
+             walks BackendMatchEnd → PostMatch → DisconnectingPlayers",
+            self.combat.rounds_won,
+        );
+        out
+    }
+
     /// Server-initiated messages for this tick. `connected` is the number of
     /// peers that have completed the handshake (from the match's player list).
     ///
@@ -2894,6 +2987,92 @@ pub(in crate::arena::combat) mod tests {
     /// BackendMatchEnd(17) → PostMatch(16) → DisconnectingPlayers(19) on the s506
     /// final-round timers, then finishes — so the client shows a clean result and
     /// returns to the lobby instead of timing out at InRound. [MATCH_STATE_MATCHEND_PROGRESSION]
+    /// WIN BY CONCESSION on a mid-match departure: if a peer leaves while the round
+    /// is live, `concede_by_departure` awards the survivor the match and drives the
+    /// SAME terminal victory walk a normal 2-0 does — so the survivor gets a result
+    /// card and returns to the lobby, instead of waiting out MATCH_MAX_AGE (10 min).
+    #[test]
+    fn departure_concedes_the_match_to_the_survivor() {
+        use crate::arena::combat::state::MatchState;
+        let (mut m, t0) = live_inst(2);
+        assert_eq!(m.phase(), FlowState::StateTimeout, "round is live");
+
+        // Slot 1 (the opponent) disconnects mid-round.
+        let leave = t0 + Duration::from_secs(3);
+        let immediate = m.concede_by_departure(1, leave);
+
+        // Slot 0 wins; the FSM enters the terminal match-end walk.
+        assert_eq!(m.combat.winner, Some(0), "the survivor (slot 0) is the winner");
+        assert_eq!(m.phase(), FlowState::RoundEnd, "→ terminal match-end walk");
+        assert_eq!(m.match_state_for_test(), MatchState::PostRound);
+
+        // The immediate frames include an op48 post-round result addressed to the
+        // survivor (slot 0), and NOTHING routed only to the departed slot matters.
+        let op48_to_survivor = immediate.iter().any(|(slot, b)| {
+            *slot == 0
+                && b.len() > 2
+                && b[1] == 0x36
+                && arena_proto::parse_netdata(&b[2..]).int(3) == Some(48)
+        });
+        assert!(op48_to_survivor, "survivor gets an op48 result card immediately");
+
+        // Ticking through the walk reaches the exact retail terminal sequence and
+        // Finished — identical to a normal win — so `take_finished_peers` will then
+        // disconnect the survivor cleanly.
+        let span = Duration::from_secs(4 + 6 + 5 + 2);
+        let step = Duration::from_millis(250);
+        let n = (span.as_millis() / step.as_millis()) as u32;
+        let mut states_seen: Vec<u8> = Vec::new();
+        for i in 1..=n {
+            let out = m.on_tick(2, leave + step * i);
+            for (_, b) in &out {
+                if b.len() > 2 && b[1] == 0x35 {
+                    if let Some(sv) = arena_proto::parse_netdata(&b[2..]).int(5) {
+                        if states_seen.last() != Some(&(sv as u8)) {
+                            states_seen.push(sv as u8);
+                        }
+                    }
+                }
+            }
+            if m.phase() == FlowState::Finished {
+                break;
+            }
+        }
+        assert_eq!(
+            states_seen,
+            vec![
+                MatchState::BackendMatchEnd as u8,
+                MatchState::PostMatch as u8,
+                MatchState::DisconnectingPlayersAfterMatch as u8,
+            ],
+            "a conceded match walks the same terminal MatchState sequence as a normal win"
+        );
+        assert!(m.is_finished(), "the conceded match finishes → survivor returns to lobby");
+    }
+
+    /// A concession must NOT fire when the match is already ending — a disconnect there
+    /// is the normal DisconnectingPlayers teardown, not a forfeit — and must be a no-op
+    /// for a lone player with no opponent to award.
+    #[test]
+    fn departure_does_not_double_concede_or_award_a_solo() {
+        let (mut m, t0) = live_inst(2);
+
+        // First departure concedes; a SECOND (the survivor also dropping during the
+        // walk) must not re-award or reset the walk.
+        let _ = m.concede_by_departure(1, t0 + Duration::from_secs(1));
+        assert_eq!(m.phase(), FlowState::RoundEnd);
+        let again = m.concede_by_departure(0, t0 + Duration::from_secs(2));
+        assert!(again.is_empty(), "no second concession once the match is already ending");
+        assert_eq!(m.combat.winner, Some(0), "the winner is unchanged");
+
+        // A solo match (one fighter) has no opponent → nothing to award.
+        let now = Instant::now();
+        let mut solo = MatchInstance::new(1, 1, vec![crate::arena::combat::loadout::starter()], now);
+        solo.on_tick(1, now);
+        let out = solo.concede_by_departure(0, now + Duration::from_secs(1));
+        assert!(out.is_empty(), "a solo departure awards nobody");
+    }
+
     #[test]
     fn post_match_state_walk_reaches_terminal_then_finishes() {
         use crate::arena::combat::state::MatchState;
