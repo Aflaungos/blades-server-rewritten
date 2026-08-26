@@ -779,6 +779,101 @@ pub async fn destroy_building(
     .await
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// 5. STYLE — the reported "stuck loading, can't leave" on a town building.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Apply a cosmetic STYLE to a town building.
+///
+/// Reported as: upgrading the city wall or crafting armour hangs on the loading
+/// screen with no way out but restarting the game (tracker #75). The client was
+/// POSTing here and getting a 404 — we served every neighbouring town route
+/// (`buildings`, `/upgrade`, `/complete`, `/destroy`) but never this one, so the
+/// client sat waiting for a response that never came. It bites on the cosmetic
+/// step of a build/upgrade, which is why it looked like an upgrade bug.
+///
+/// Shape is capture-derived: 128 retail 200s exist for this route (922-5800 B).
+/// A retail response echoes the post-transaction `{wallet, inventory, town}` with
+/// the building's `styleId` set and `customized: true` — e.g. building
+/// `af0a05c7…` coming back with `"styleId":"aa133662…","customized":true`.
+///
+/// No cost is charged. Retail's captured responses return the wallet UNCHANGED
+/// across the call, so whatever a restyle costs is not settled here; inventing a
+/// price would be worse than charging nothing, and the client is authoritative
+/// for what it offers the player.
+#[post(
+    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/towns/current/buildings/{building_id}/styles/{style_id}"
+)]
+pub async fn set_building_style(
+    session: SessionLookedUpMaybe,
+    app_state: web::Data<Arc<ServerGlobal>>,
+    path: web::Path<(Uuid, Uuid, Uuid)>,
+) -> Result<Json<Value>, BladeApiError> {
+    let session = session.get_session_or_error()?;
+    let user_id = session.session.user_id;
+    let (character_id, building_id, style_id) = path.into_inner();
+    let mut conn = app_state.db_pool.get().await?;
+
+    conn.transaction(move |mut conn| {
+        async move {
+            let mut entry = load_town_economy(&mut conn, character_id, user_id).await?;
+            let mut town = take_town(&mut entry)?;
+
+            // 404 on an unknown building — same as `destroy`. Silently succeeding
+            // would tell the client a style was applied that the town does not
+            // carry, and it would snap back on the next load.
+            if !apply_building_style(&mut town, building_id, style_id) {
+                return Err(BladeApiError::new(StatusCode::NOT_FOUND, TOWN_SERVICE_ID, 1));
+            }
+
+            let tracker = InventoryChangeTracker::default();
+            let inventory = entry.inventory.0.generate_client_update(&tracker);
+            let wallet = entry.wallet.0.clone();
+
+            {
+                use crate::schema::characters;
+                let town_col = town.clone();
+                let mut changeset = entry;
+                changeset.town = Some(JsonDbWrapper(town_col.clone()));
+                diesel::update(characters::table)
+                    .filter(characters::id.eq(character_id))
+                    .set(changeset)
+                    .execute(&mut conn)
+                    .await?;
+
+                Ok::<_, BladeApiError>(Json(json!({
+                    "wallet": wallet,
+                    "inventory": inventory,
+                    "town": town_col,
+                    "validationFlags": 1,
+                })))
+            }
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
+/// Set a building's cosmetic `styleId` (and mark it `customized`). `true` if the
+/// building was found.
+///
+/// Split out of the handler for the same reason `remove_building` is: the town
+/// JSON walk is where the bugs live, and it is the only part reachable from a test
+/// without a database.
+fn apply_building_style(town: &mut Value, building_id: Uuid, style_id: Uuid) -> bool {
+    let Some(building) = find_building_mut(town, building_id) else {
+        return false;
+    };
+    let Some(obj) = building.as_object_mut() else {
+        return false;
+    };
+    obj.insert("styleId".to_string(), json!(style_id.to_string()));
+    // Retail sets this alongside the style; the client reads it to know the
+    // building is no longer showing its default appearance.
+    obj.insert("customized".to_string(), json!(true));
+    true
+}
+
 /// Remove a building by id from whichever segment holds it. `true` if removed.
 fn remove_building(town: &mut Value, building_id: Uuid) -> bool {
     let bid = building_id.to_string();
@@ -927,6 +1022,70 @@ mod tests {
         let bronze = Uuid::parse_str(BRONZE).unwrap();
         assert_eq!(cost.materials.iter().find(|(m, _)| *m == lumber).unwrap().1, 43);
         assert_eq!(cost.materials.iter().find(|(m, _)| *m == bronze).unwrap().1, 5);
+    }
+
+    /// A town with one building, in the nested districts/segments shape the real
+    /// payload uses.
+    fn sample_town(bid: &str) -> Value {
+        serde_json::json!({
+            "levelInfo": { "level": 6 },
+            "districts": [{
+                "id": "9a12c0d3-218c-4ef2-b78c-b6e3bca60719",
+                "segments": {
+                    "71c4b321-825a-4fde-bdcc-c584f1d2db83": {
+                        "id": "71c4b321-825a-4fde-bdcc-c584f1d2db83",
+                        "buildings": {
+                            bid: {
+                                "id": bid,
+                                "typeId": "52291bce-3585-49e5-85e4-afbdfa5ba422",
+                                "level": 0,
+                                "state": "NORMAL"
+                            }
+                        }
+                    }
+                }
+            }]
+        })
+    }
+
+    /// tracker #75: the client POSTed `…/buildings/{id}/styles/{id}` and got a 404,
+    /// then hung on the loading screen with no way out but restarting. The style has
+    /// to land on the building, and `customized` has to flip — retail's captured
+    /// response carries both.
+    #[test]
+    fn applying_a_style_sets_style_id_and_customized() {
+        let bid = "af0a05c7-9765-4c59-8799-6fc00f8a16c8";
+        let style = "aa133662-053d-434e-8779-3f2a41d1271e";
+        let mut town = sample_town(bid);
+
+        assert!(super::apply_building_style(
+            &mut town,
+            bid.parse().unwrap(),
+            style.parse().unwrap()
+        ));
+
+        let b = &town["districts"][0]["segments"]["71c4b321-825a-4fde-bdcc-c584f1d2db83"]
+            ["buildings"][bid];
+        assert_eq!(b["styleId"], serde_json::json!(style), "the style must be applied");
+        assert_eq!(b["customized"], serde_json::json!(true), "retail also sets customized");
+        // Untouched fields survive — this rewrites two keys, not the building.
+        assert_eq!(b["level"], serde_json::json!(0));
+        assert_eq!(b["state"], serde_json::json!("NORMAL"));
+    }
+
+    /// An unknown building must REPORT failure so the handler can 404, rather than
+    /// silently succeeding — a style the town does not carry would snap back on the
+    /// next load and look like the bug we are fixing.
+    #[test]
+    fn applying_a_style_to_an_unknown_building_fails() {
+        let mut town = sample_town("af0a05c7-9765-4c59-8799-6fc00f8a16c8");
+        let before = town.clone();
+        assert!(!super::apply_building_style(
+            &mut town,
+            "00000000-0000-0000-0000-000000000000".parse().unwrap(),
+            "aa133662-053d-434e-8779-3f2a41d1271e".parse().unwrap()
+        ));
+        assert_eq!(town, before, "a failed lookup must not modify the town");
     }
 
     #[test]
