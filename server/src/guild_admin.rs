@@ -348,13 +348,30 @@ pub async fn set_grandmaster(
                 err(StatusCode::INTERNAL_SERVER_ERROR, 14)
             })?;
 
-    let slots: Vec<MemberSlot> = rows
-        .iter()
-        .map(|r| MemberSlot {
-            character_id: r.character_id,
-            rank: GuildRank::from_wire(&r.rank).unwrap_or(GuildRank::Member),
-        })
-        .collect();
+    // An unrecognised rank string is REFUSED, not quietly read as MEMBER.
+    //
+    // Prod currently holds 4 rows at 'LEADER' — this codebase's pre-retail
+    // vocabulary — because the migration that rewrites them to 'GRANDMASTER'
+    // has not been applied there yet. Defaulting those to MEMBER would make
+    // every one of those guilds look leaderless to the console, and appointing
+    // a Grand Master would find no sitting holder to step down, leaving the
+    // guild with two. Refusing is the safe direction: the operator gets a clear
+    // failure and the database gets migrated, instead of a silent second
+    // leader.
+    let mut slots: Vec<MemberSlot> = Vec::with_capacity(rows.len());
+    for r in &rows {
+        match GuildRank::from_wire(&r.rank) {
+            Some(rank) => slots.push(MemberSlot { character_id: r.character_id, rank }),
+            None => {
+                warn!(
+                    "guild console: {} holds unknown rank {:?} in guild {} — refusing; \
+                     the guild rank migration has probably not been applied",
+                    r.character_id, r.rank, guild_id
+                );
+                return Err(err(StatusCode::CONFLICT, 21));
+            }
+        }
+    }
 
     let change = plan_grandmaster_change(&slots, body.character_id).map_err(|refusal| {
         match refusal {
@@ -569,6 +586,46 @@ mod tests {
         let armed = format!(r#"{{"characterId":"{}","apply":true}}"#, id(1));
         let r: SetGrandmasterRequest = serde_json::from_str(&armed).unwrap();
         assert!(r.apply, "an explicit `apply: true` must still work");
+    }
+
+    /// An un-migrated 'LEADER' must never read as MEMBER.
+    ///
+    /// This is the exact state prod is in: 4 rows still hold 'LEADER', the
+    /// vocabulary this codebase used before the retail ranks landed, because
+    /// the rewrite migration has not been applied there. If that parsed as
+    /// MEMBER the guild would look leaderless, and appointing a Grand Master
+    /// would find nobody to step down — leaving two.
+    #[test]
+    fn the_pre_retail_rank_is_not_silently_a_member() {
+        assert_eq!(GuildRank::from_wire("LEADER"), None, "'LEADER' is not a retail rank");
+        assert_eq!(GuildRank::from_wire("OFFICER"), None, "'OFFICER' is not a retail rank");
+        // The four that ARE retail.
+        for (wire, rank) in [
+            ("GRANDMASTER", GuildRank::Grandmaster),
+            ("MASTER", GuildRank::Master),
+            ("ELDER", GuildRank::Elder),
+            ("MEMBER", GuildRank::Member),
+        ] {
+            assert_eq!(GuildRank::from_wire(wire), Some(rank));
+        }
+    }
+
+    /// With the sitting holder's rank unreadable, planning must NOT conclude
+    /// the guild is leaderless. Guarded at the handler (which refuses), this
+    /// pins why: the plan would otherwise demote nobody and create a second
+    /// Grand Master.
+    #[test]
+    fn a_guild_read_as_leaderless_would_create_a_second_grandmaster() {
+        // What the handler would have built if 'LEADER' fell back to MEMBER.
+        let misread = [slot(1, GuildRank::Member), slot(2, GuildRank::Member)];
+        let change = plan_grandmaster_change(&misread, id(2)).unwrap();
+        assert_eq!(
+            change.demote, None,
+            "this is the hazard: nobody is demoted, so the real leader keeps the rank"
+        );
+        // Read correctly, the sitting holder is found and steps down.
+        let correct = [slot(1, GuildRank::Grandmaster), slot(2, GuildRank::Member)];
+        assert_eq!(plan_grandmaster_change(&correct, id(2)).unwrap().demote, Some(id(1)));
     }
 
     /// `characterId` has no default: omitting it must be a 400 from serde
