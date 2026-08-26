@@ -425,9 +425,12 @@ impl MatchRegistry {
 
     /// Fire-and-forget submit of an admitted peer's key+nonce (no-op when the
     /// submitter is absent). Called from both admit paths.
-    fn submit_key(&self, crypto: &CryptoCtx) {
+    fn submit_key(&self, crypto: &CryptoCtx, peer: SocketAddr) {
         if let Some(s) = &self.key_submitter {
-            s.submit(&crypto.key, &crypto.nonce);
+            // The peer's VPN address is the only per-peer identity we have here;
+            // the capture platform maps it back to the contributor whose session
+            // holds the frames this key decrypts.
+            s.submit(&crypto.key, &crypto.nonce, &peer.ip().to_string());
         }
     }
 
@@ -542,7 +545,7 @@ impl MatchRegistry {
         let crypto = CryptoCtx { key, nonce };
         // Submit this peer's key to the capture platform (fire-and-forget; no-op
         // when disabled) so the match's captured frames become decryptable.
-        self.submit_key(&crypto);
+        self.submit_key(&crypto, peer);
         // The ticket order is the ONLY authority on who is which fighter, and on this
         // path the client just presented the psid that names it. Bind NOW — not lazily
         // from a later PlayerInfo — so nothing (least of all the round-start identity
@@ -603,7 +606,7 @@ impl MatchRegistry {
         let crypto = CryptoCtx { key, nonce };
         // Submit this peer's key to the capture platform (fire-and-forget; no-op
         // when disabled) so the match's captured frames become decryptable.
-        self.submit_key(&crypto);
+        self.submit_key(&crypto, peer);
         m.players.push(PlayerConn {
             addr: peer,
             player_session_id: String::new(), // bound later if/when the psid arrives

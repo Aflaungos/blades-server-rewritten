@@ -149,7 +149,12 @@ impl KeySubmitter {
     /// Fire-and-forget: POST this peer's (key, nonce) to the capture endpoint.
     /// Returns immediately; the actual network I/O runs as a detached task.
     /// Never blocks, never panics — a failure only logs.
-    pub fn submit(&self, key: &[u8; 32], nonce: &[u8; 8]) {
+    /// `peer_ip` is the admitted client's VPN address. It is the ONLY per-peer
+    /// identity available at admit time, and without it every peer's key is
+    /// submitted under the single server-wide token and filed against that one
+    /// account's capture session — which is how a two-player match ended up with
+    /// both keys on one session and the other session undecryptable.
+    pub fn submit(&self, key: &[u8; 32], nonce: &[u8; 8], peer_ip: &str) {
         let Some(token) = self.config.token.clone() else {
             return;
         };
@@ -159,6 +164,7 @@ impl KeySubmitter {
             &self.config.gamelift_ip,
             self.config.gamelift_port,
             now_epoch_ms(),
+            peer_ip,
         );
         let url = self.config.url.clone();
         self.handle.spawn(async move {
@@ -192,14 +198,16 @@ pub(crate) fn build_submit_body(
     gamelift_ip: &str,
     gamelift_port: u16,
     ts_ms: u128,
+    peer_ip: &str,
 ) -> String {
     format!(
-        "{{\"key_b64\":\"{}\",\"nonce_b64\":\"{}\",\"ts\":{},\"gamelift_ip\":\"{}\",\"gamelift_port\":{}}}",
+        "{{\"key_b64\":\"{}\",\"nonce_b64\":\"{}\",\"ts\":{},\"gamelift_ip\":\"{}\",\"gamelift_port\":{},\"peer_ip\":\"{}\"}}",
         b64_encode(key),
         b64_encode(nonce),
         ts_ms,
         gamelift_ip,
         gamelift_port,
+        peer_ip,
     )
 }
 
@@ -350,13 +358,15 @@ mod tests {
     fn submit_body_is_the_expected_json_shape() {
         let key = [1u8; 32];
         let nonce = [2u8; 8];
-        let body = build_submit_body(&key, &nonce, "10.99.0.1", 7777, 1_700_000_000_123);
+        let body = build_submit_body(&key, &nonce, "10.99.0.1", 7777, 1_700_000_000_123, "10.99.0.47");
         // Exact shape the route parses: key_b64, nonce_b64, ts (number),
-        // gamelift_ip (string), gamelift_port (number).
+        // gamelift_ip (string), gamelift_port (number), peer_ip (string).
+        // peer_ip is what lets the route attribute the key to the peer that
+        // actually owns it rather than to the server-wide token's account.
         assert_eq!(
             body,
             format!(
-                "{{\"key_b64\":\"{}\",\"nonce_b64\":\"{}\",\"ts\":1700000000123,\"gamelift_ip\":\"10.99.0.1\",\"gamelift_port\":7777}}",
+                "{{\"key_b64\":\"{}\",\"nonce_b64\":\"{}\",\"ts\":1700000000123,\"gamelift_ip\":\"10.99.0.1\",\"gamelift_port\":7777,\"peer_ip\":\"10.99.0.47\"}}",
                 b64_encode(&key),
                 b64_encode(&nonce),
             )
@@ -397,7 +407,7 @@ mod tests {
 
     #[test]
     fn http_request_has_required_headers() {
-        let body = build_submit_body(&[7u8; 32], &[9u8; 8], "10.99.0.1", 7777, 42);
+        let body = build_submit_body(&[7u8; 32], &[9u8; 8], "10.99.0.1", 7777, 42, "10.99.0.37");
         let req = build_http_request("newblades-web", "/api/arena/submit-key", "tok-123", &body);
         assert!(req.starts_with("POST /api/arena/submit-key HTTP/1.1\r\n"));
         assert!(req.contains("\r\nHost: newblades-web\r\n"));
