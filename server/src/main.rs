@@ -21,6 +21,11 @@ use clap::{Parser, Subcommand};
 use diesel_async::{AsyncPgConnection, pooled_connection::AsyncDieselConnectionManager};
 use log::debug;
 
+/// Connections in the Postgres pool. See the comment at the pool builder: the
+/// database is configured with `max_connections = 20`, so this must stay well
+/// under it.
+const DB_POOL_MAX: u32 = 10;
+
 mod abyss;
 mod admin;
 mod analytics;
@@ -168,7 +173,20 @@ async fn main() -> Result<()> {
             port,
             static_data,
         } => {
+            // Pool size is stated, not defaulted.
+            //
+            // Postgres on this box runs with `max_connections = 20` (measured,
+            // not the 100 default). bb8's own default max_size is 10, so the
+            // pool happened to fit — by coincidence, not design. Writing it
+            // down means a bb8 upgrade cannot silently raise it past what the
+            // database will accept, and it leaves headroom for the migration
+            // one-shot and a psql session.
+            //
+            // Handlers acquire one connection and pass `&mut conn` down, so a
+            // request never holds two; 10 is concurrency, not a per-request
+            // cost.
             let db_pool = Pool::builder()
+                .max_size(DB_POOL_MAX)
                 .build(AsyncDieselConnectionManager::<AsyncPgConnection>::new(
                     connection_string,
                 ))
@@ -333,6 +351,19 @@ async fn main() -> Result<()> {
 
             HttpServer::new(move || {
                 App::new()
+                    // Per-request timing. There was NO request logging at all,
+                    // which is why "the first shop took very long" could only be
+                    // guessed at: nothing recorded how long anything took.
+                    //
+                    // `%D` is the handler's own time in milliseconds, so a slow
+                    // response can be separated from a slow client or a slow
+                    // link. Quiet by default — set `RUST_LOG=actix_web=info` to
+                    // turn it on — because this logs one line per request and
+                    // the game polls hard (one player's session was 624
+                    // manifest fetches).
+                    .wrap(actix_web::middleware::Logger::new(
+                        "%s %r %Dms",
+                    ))
                     .app_data(Data::new(server_global.clone()))
                     // A character transfer POSTs the whole CompleteCharacter, and
                     // actix's default JSON limit is 2 MiB — which is smaller than a
