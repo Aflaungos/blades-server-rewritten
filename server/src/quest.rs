@@ -2674,3 +2674,26 @@ mod playability_sweep {
         }
     }
 }
+
+#[cfg(test)]
+mod assert_reachability {
+    /// Is `assert!(request.is_none())` in `get_quests` / `accept_quest`
+    /// reachable from the wire?
+    ///
+    /// `Json<Option<()>>` only ever yields `None`: `null` deserializes to
+    /// `None` (Option wins over the unit type) and every other body is a serde
+    /// error, which actix turns into a 400 before the handler runs. So the
+    /// assert cannot fire and is dead — worth knowing, because a panicking
+    /// assert in a request handler WOULD be a denial-of-service if it were
+    /// reachable.
+    #[test]
+    fn option_unit_can_never_be_some() {
+        assert_eq!(serde_json::from_str::<Option<()>>("null").unwrap(), None);
+        for body in ["{}", "[]", "\"x\"", "1", "true", "{\"a\":1}"] {
+            assert!(
+                serde_json::from_str::<Option<()>>(body).is_err(),
+                "{body} must be a 400 from serde, not a body the handler sees"
+            );
+        }
+    }
+}
