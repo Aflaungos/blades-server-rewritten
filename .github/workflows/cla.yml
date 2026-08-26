@@ -47,6 +47,12 @@ concurrency:
 
 jobs:
   check:
+    # This string is the status-check name a branch ruleset must require.
+    # Without it the job reports as its id, "check", which is meaningless in a
+    # required-checks list and collides with any other job called the same.
+    # Renaming it later silently disables the rule, because the ruleset goes on
+    # matching the old name and nothing reports it.
+    name: CLA accepted
     # Ignore comments on plain issues; only pull requests carry a CLA question.
     if: github.event_name == 'pull_request_target' || github.event.issue.pull_request
     runs-on: ubuntu-latest
