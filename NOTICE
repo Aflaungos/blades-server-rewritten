@@ -1,0 +1,123 @@
+blades-server-rewritten
+=======================
+
+This project is a fork of https://github.com/marius851000/blades-server-rewritten
+and contains code from that project.
+
+------------------------------------------------------------------------
+Portions Copyright 2026 Marius DAVID
+Originally licensed under the MIT License.
+------------------------------------------------------------------------
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+
+------------------------------------------------------------------------
+Portions Copyright 2026 Nikolaj Berntsen and contributors
+Licensed under the GNU Affero General Public License v3.0 (see LICENSE).
+------------------------------------------------------------------------
+
+The MIT-licensed portions above remain available under the MIT License from
+their original author. The combined work in this repository is distributed
+under the AGPL-3.0.
+
+========================================================================
+NOT COVERED BY EITHER LICENSE — third-party game data
+========================================================================
+
+The files listed below carry data this project did not author. To the extent
+any of it is taken from the client of The Elder Scrolls: Blades, it is NOT our
+copyright and is NOT licensed to you by us; all rights in it remain with its
+owner (ZeniMax Media Inc. / Bethesda Softworks LLC). It is here for the sole
+purpose of interoperating with that client, so that a game whose servers were
+shut down can still be played and studied.
+
+These files are not uniform in origin, and the distinction matters to anyone
+redistributing them. Three kinds of content are mixed together:
+
+  1. FROM THE CLIENT — read out of the shipped game data. This is the part
+     the disclaimer above is about.
+  2. FROM NETWORK OBSERVATION — recorded from the retail service while it
+     was running. These are measurements of how a system behaved.
+  3. AUTHORED BY THIS PROJECT — models built where retail's own values were
+     never observable because they existed only on the server. The per-level
+     shop generation in `shop_stock.json` is the clearest example; its own
+     metadata marks that part "NOT AVAILABLE (server-only, uncaptured)".
+     Category 3 is our work, is our copyright, and is covered by the AGPL
+     like any other file here.
+
+We have not tried to split the files along these lines, because a single file
+routinely contains all three. Treat the whole set with the caution that
+category 1 warrants.
+
+  deploy/static/*.json                     33 files
+  server/data/static/*.json                 5 files
+  server/src/arena/combat/gamedata.rs      generated tuning tables
+
+  Together ~5.3 MB: about 154,000 lines of JSON and 40,000 lines of
+  generated Rust.
+
+WHAT THESE FILES CONTAIN
+
+Overwhelmingly identifiers and measurements, not authored content:
+
+  * UUIDs naming items, dungeons, quests, spawn groups and shops;
+  * numeric tuning tables — durability, sell prices, repair and upgrade
+    costs, damage and resistance values, drop weights;
+  * structural relationships — which spawn group belongs to which dungeon,
+    which recipe yields which item, which shop stocks which bundle;
+  * localisation KEYS such as "Items.Name.ChaurusArmor". These are lookup
+    identifiers. The strings a player actually reads are NOT here: no
+    localisation table has ever been committed to this repository.
+
+One category is different, and we would rather name it than bury it:
+`gamedata.rs` embeds roughly 850 item names — "Maul of the Aureal",
+"Gauntlets of the Companions" and the like. Individually these are short
+identifiers the wire protocol requires, but taken together they are a
+curated set of the publisher's naming, and that is a stronger claim than
+anything else in this list.
+
+Prose appearing in these files under `_meta` keys is documentation written
+by this project's contributors describing how the data was derived. That
+text is ours and is covered by the AGPL, not by this section.
+
+WHAT IS NOT IN THIS REPOSITORY
+
+Stated because it materially narrows what you are handling:
+
+  * no game assets of any kind — no textures, models, audio, video or fonts;
+  * no client binaries, no APK or IPA, no decompiled client source;
+  * no localised game text, dialogue, quest writing or item descriptions;
+  * nothing that has ever been committed here in binary form.
+
+The entire history of this repository has been checked for the above.
+
+IF YOU REDISTRIBUTE THIS
+
+You are responsible for your own assessment of these files; nothing here is
+legal advice, and the characterisation above is our honest description of
+the contents rather than a warranty about their status.
+
+If you would prefer to distribute without the category 1 material, much of it
+can be regenerated from a client installation you supply yourself, using the
+extraction tooling this project publishes. Be aware that this is NOT true of
+the whole set: the category 2 and 3 content cannot be regenerated from a
+client at all — the retail service it was observed from no longer exists, and
+the authored models were never in the client to begin with. Removing the
+game-derived data therefore leaves a server that is missing values rather than
+one that rebuilds them. See docs/LICENSING.md.
