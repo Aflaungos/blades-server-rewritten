@@ -6,7 +6,9 @@ use actix_web::{
     post,
     web::{self, Json},
 };
-use blades_lib::user_data::{B64EncodedData, DungeonState, DungeonStatus};
+use blades_lib::user_data::{
+    B64EncodedData, CompleteCharacterWithIdWithoutData, DungeonState, DungeonStatus,
+};
 use diesel::{
     BoolExpressionMethods, ExpressionMethods, QueryDsl, SelectableHelper, associations::HasTable,
 };
@@ -88,6 +90,100 @@ struct EnterDungeonRequest {
 #[serde(rename_all = "camelCase")]
 struct EnterDungeonResponse {
     dungeon_status: DungeonStatus,
+}
+
+/// `{"character": …}` — the exact envelope retail's exit returns.
+///
+/// NOT `CompleteCharacterWithIdAndData`: retail's body carries the character's own
+/// fields and `id`, and NO `data` key. Verified against the smallest captured
+/// response (982 B), which ends `…"nameValidated":true}}` with nothing after the
+/// character object.
+#[derive(Serialize)]
+struct ExitDungeonResponse {
+    character: CompleteCharacterWithIdWithoutData,
+}
+
+/// Leave the current quest dungeon.
+///
+/// Reported as tracker #83. We served `dungeons/current/enter` and
+/// `dungeons/current/update` but not `exit`, so the client got a 404 where retail
+/// answered — 592 retail 200s exist for this route in the capture DB (982 B to
+/// 60 KB) against our own 404s.
+///
+/// Retail's response is the character with **`currentQuestDungeon: null`** — exit
+/// clears the active dungeon and hands the updated character back, which is what
+/// lets the client leave the dungeon UI. So both halves of the state have to go in
+/// one transaction: the character's `current_quest_dungeon`, and the quest row's
+/// `dungeon_state`. Clearing one without the other strands the player — the client
+/// would think it had left while the server still held a live dungeon, or the
+/// reverse.
+///
+/// Idempotent on purpose: exiting a dungeon that is already gone returns the
+/// character rather than erroring. The client retries this on a dropped connection,
+/// and a second 4xx would strand the very player the retry is meant to rescue.
+#[post(
+    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/quests/{quest_id}/dungeons/current/exit"
+)]
+pub async fn exit_quest_dungeon(
+    path: web::Path<(Uuid, Uuid)>,
+    session: SessionLookedUpMaybe,
+    app_state: web::Data<Arc<ServerGlobal>>,
+) -> Result<Json<ExitDungeonResponse>, BladeApiError> {
+    let session = session.get_session_or_error()?;
+    let (character_id, quest_id) = path.into_inner();
+    let mut conn = app_state.db_pool.get().await?;
+
+    check_permission_for_character_and_get_it(&mut conn, &session.session, character_id).await?;
+
+    conn.transaction(move |mut conn| {
+        async move {
+            // 1. Clear the quest's dungeon state, if it still holds one.
+            {
+                use crate::schema::quests::dsl::*;
+                diesel::update(quests.filter(id.eq(&quest_id)))
+                    .set(dungeon_state.eq(None::<serde_json::Value>))
+                    .execute(&mut conn)
+                    .await?;
+            }
+
+            // 2. Clear the character's pointer to it and read the row back, so the
+            //    response is the state we just committed rather than a copy made
+            //    before the write.
+            let updated = {
+                use crate::schema::characters::dsl::*;
+                // Only the `character` column: this handler touches one field of
+                // it, and selecting a wider model would pull the whole save for no
+                // reason. `for_update` so a concurrent write cannot interleave
+                // between the read and the clear.
+                let mut current: JsonDbWrapper<blades_lib::user_data::CompleteCharacter> =
+                    characters
+                        .filter(id.eq(character_id))
+                        .select(character)
+                        .for_update()
+                        .load(&mut conn)
+                        .await?
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| BladeApiError::new(StatusCode::NOT_FOUND, 20000, 3))?;
+
+                current.0.current_quest_dungeon = serde_json::Value::Null;
+                diesel::update(characters.filter(id.eq(character_id)))
+                    .set(character.eq(&current))
+                    .execute(&mut conn)
+                    .await?;
+                current
+            };
+
+            Ok::<_, BladeApiError>(Json(ExitDungeonResponse {
+                character: CompleteCharacterWithIdWithoutData {
+                    id: character_id,
+                    character: updated.0,
+                },
+            }))
+        }
+        .scope_boxed()
+    })
+    .await
 }
 
 #[post(
