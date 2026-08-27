@@ -448,6 +448,7 @@ async fn main() -> Result<()> {
                     .service(analytics_events::list_events)
                     .service(dungeon::get_dungeons)
                     .service(dungeon::enter_quest_dungeon)
+                    .service(dungeon::exit_quest_dungeon)
                     .service(dungeon_update::dungeon_update)
                     // Abyss: specific sub-paths (start/update/end) BEFORE the bare /current.
                     .service(abyss::start_abyss)
