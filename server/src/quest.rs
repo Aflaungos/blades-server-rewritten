@@ -77,7 +77,10 @@ pub struct GetQuestsResponse {
 /// Two rows are dropped rather than advertised:
 ///
 /// * **JOB rows**, which are surfaced only in `jobs[]` — matching prod, where the
-///   two arrays never overlap.
+///   two arrays never overlap. Their `generatedData[]` entries are NOT dropped: retail
+///   sends one per job, and the caller adds them from the freshly rolled board via
+///   [`jobs_gen::job_generated_data_list`] (see that function for why the board rather
+///   than the row is the source).
 /// * **Quests with no generated data.** There is no dungeon behind such a quest, so
 ///   it cannot be placed on the quest map or started. This used to push the quest
 ///   into `quests[]` anyway while its `generatedData[]` entry was pushed only
@@ -140,6 +143,25 @@ fn split_quest_rows(
         generated.push(DungeonGeneratedDataWithId { quest_id, inner });
     }
     (quests, event_quests, generated)
+}
+
+/// The response's `dungeonGeneratedDataList`: the stored rows' entries (quests + open
+/// events, from [`split_quest_rows`]) plus one for every job on the board.
+///
+/// Retail's list spans all three — the captured body's 10 entries are 6 jobs + 2 quests
+/// + 2 events. Ours omitted the jobs entirely, so the client put them on the map and
+/// waited forever for data that never came (report #85, the same failure mode as #62).
+///
+/// This is a function rather than two lines in the handler so the invariant is testable:
+/// the handler itself needs a DB and a session, and the shape-only job tests that let
+/// #85 ship are exactly what happens when the assembly step has no test of its own.
+fn assemble_generated_data_list(
+    mut from_rows: Vec<DungeonGeneratedDataWithId>,
+    game_data: &blades_lib::game_data::GameData,
+    jobs: &[Value],
+) -> Vec<DungeonGeneratedDataWithId> {
+    from_rows.extend(jobs_gen::job_generated_data_list(game_data, jobs));
+    from_rows
 }
 
 #[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/quests")]
@@ -237,7 +259,9 @@ pub async fn get_quests(
                 }
                 // Upsert the current window's job rows (idempotent within the window).
                 for job in &jobs {
-                    if let Some(entry) = jobs_gen::job_quest_db_entry(job, character_id_var) {
+                    if let Some(entry) =
+                        jobs_gen::job_quest_db_entry(job, character_id_var, &globals.game_data)
+                    {
                         use crate::schema::quests;
                         insert_into(quests::table)
                             .values(&entry)
@@ -338,12 +362,14 @@ pub async fn get_quests(
                     .await?
             };
 
-            let (result_quests, game_event_quests, result_generated_data) = split_quest_rows(
+            let (result_quests, game_event_quests, row_generated_data) = split_quest_rows(
                 quests
                     .into_iter()
                     .map(|q| (q.id, q.info.0, q.generated_data.0)),
                 &open_event_instances,
             );
+            let result_generated_data =
+                assemble_generated_data_list(row_generated_data, &globals.game_data, &jobs);
 
             // Events opening within the next 24h, announced but not yet playable.
             let game_event_quests_in_warning = event_quests::upcoming(
@@ -425,7 +451,9 @@ async fn accept_quest(
         if let Some(job) = jobs.iter().find(|j| {
             j.get("questId").and_then(|v| v.as_str()) == Some(&quest_id.to_string())
         }) {
-            if let Some(entry) = jobs_gen::job_quest_db_entry(job, character_id) {
+            if let Some(entry) =
+                jobs_gen::job_quest_db_entry(job, character_id, &app_state.game_data)
+            {
                 use crate::schema::quests;
                 insert_into(quests::table)
                     .values(&entry)
@@ -438,7 +466,11 @@ async fn accept_quest(
                         quest_id,
                         quest: entry.info.0,
                     },
-                    dungeon_generated_data: None,
+                    // Was hard-coded `None`: accepting a job handed the client a quest
+                    // with no dungeon data, the accept-path half of report #85.
+                    dungeon_generated_data: entry.generated_data.0.map(|inner| {
+                        DungeonGeneratedDataWithId { quest_id, inner }
+                    }),
                 }));
             }
         }
@@ -1038,9 +1070,32 @@ pub async fn update_quest_objectives(
 //     empty jobs list and empty timers rather than a 500.
 mod jobs_gen {
     use super::*;
-    use blades_lib::user_data::{ObjectiveStatus, Quest, QuestStatus, QuestType};
+    use blades_lib::game_data::GameData;
+    use blades_lib::static_data::QuestLevelScaling;
+    use blades_lib::user_data::{
+        DungeonGeneratedData, ObjectiveStatus, Quest, QuestStatus, QuestType,
+    };
     use std::collections::HashMap;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    /// The dungeon whose spawn groups EVERY town job's generated data is keyed to.
+    ///
+    /// `parsed.json` calls it `JobSpawnGroupsReference` (6 enemy spawn groups, 7 item
+    /// spawns, 2 chests). It is not a playable layout — it is the shared id space the
+    /// job generator draws from, and the client resolves a job's spawn ids against it
+    /// whatever `jobSetup.dungeonTemplateId` says.
+    ///
+    /// MEASURED, not guessed. In the one committed full `/quests` body
+    /// (`blades-capture reference/capture-599.jsonl`: 6 jobs, 2 quests, 10 generated-data
+    /// entries) all six job entries' enemy/item/chest ids are subsets of this dungeon's,
+    /// and the two story quests in the same body — the control — are subsets of neither.
+    ///
+    /// The `JobCaveVariant_03`-style ids in [`DUNGEON_TEMPLATES`] are NOT usable here:
+    /// all 17 of them exist in `parsed.json` with a completely EMPTY `spawn_info`, so
+    /// generating from the template id yields an entry with no enemies, no items and no
+    /// chests. That is what made this look like missing data rather than a wrong key.
+    pub const JOB_SPAWN_GROUPS_REFERENCE: Uuid =
+        Uuid::from_u128(0x93202b6a_f74e_49d4_ab70_bd46cc2f9892_u128);
 
     /// Stored JOB `quests` rows are tagged with this sentinel `gldQuestId` so the
     /// /quests handler can (a) keep them out of the `quests[]` array and (b)
@@ -1277,11 +1332,80 @@ mod jobs_gen {
         q.gld_quest_id == JOB_SENTINEL_GLD
     }
 
+    /// The `DungeonGeneratedData` for one rolled job.
+    ///
+    /// Every job draws from the SAME dungeon ([`JOB_SPAWN_GROUPS_REFERENCE`]) — that is
+    /// how retail does it — with the enemies scaled to the job's own `difficultyLevel`.
+    /// A job's `difficultyLevel` IS its enemy level (retail: a level-48 character's board
+    /// carried jobs at 42 and 46), so it goes straight in; the XP per enemy comes from the
+    /// shared `givenXpFormula` rather than a second copy of `100 * level` here.
+    ///
+    /// Returns `None` only when `parsed.json` is missing the reference dungeon, which the
+    /// caller treats as "no entry" rather than an error — same policy as the quest path.
+    pub fn generated_data_for_job(
+        game_data: &GameData,
+        job: &Value,
+    ) -> Option<DungeonGeneratedData> {
+        let enemy_level = get_i64(job, "difficultyLevel", 1).max(1);
+        let given_xp = QuestLevelScaling::default().given_xp(enemy_level);
+        let mut data = blades_lib::util::dungeon::generate_for_dungeon(
+            game_data,
+            &JOB_SPAWN_GROUPS_REFERENCE,
+            enemy_level,
+            given_xp,
+        )?;
+        // Retail stamps `version: 1` on all ten generated-data entries in the captured
+        // body. `generate_for_dungeon` hard-codes 0 because that is what our story quests
+        // have always shipped and they work; bumping it there would change their wire
+        // output for no measured reason, so the job path — which has a measured value —
+        // sets its own.
+        data.version = 1;
+        Some(data)
+    }
+
+    /// The `dungeonGeneratedDataList` entries for a whole board.
+    ///
+    /// Retail's list covers jobs as well as quests: in the captured body all 6 job ids and
+    /// both story-quest ids were present (10 entries = 6 jobs + 2 quests + 2 events). We
+    /// used to send none for jobs, so the client listed a job on the map and then waited
+    /// forever for data that was never coming — the same failure as report #62, and the
+    /// reason deleting `job_pools.json` "fixed" the hang: no jobs, no unresolvable ids.
+    ///
+    /// Derived from the freshly rolled board rather than from the stored rows on purpose.
+    /// The board is the set the client is actually told about, so this cannot drift out of
+    /// step with `jobs[]`, and it heals characters whose rows were written by the old code
+    /// with a NULL `generated_data` (their rows are only rewritten at the next daily
+    /// rotation). The row is still populated by [`job_quest_db_entry`] for /accept and the
+    /// dungeon-enter path — and because both sides derive from the same reference dungeon
+    /// and the same `difficultyLevel`, the two agree by construction.
+    pub fn job_generated_data_list(
+        game_data: &GameData,
+        jobs: &[Value],
+    ) -> Vec<DungeonGeneratedDataWithId> {
+        jobs.iter()
+            .filter_map(|job| {
+                let quest_id = Uuid::parse_str(get_str(job, "questId")?).ok()?;
+                Some(DungeonGeneratedDataWithId {
+                    quest_id,
+                    inner: generated_data_for_job(game_data, job)?,
+                })
+            })
+            .collect()
+    }
+
     /// Build the storable `QuestDbEntry` for a generated job Value. The row is a
     /// plain `Quest` (type Normal, sentinel gldQuestId) carrying the job's
     /// objective statuses + difficulty + seed, so /objectives + /complete resolve
     /// it. The rich `jobSetup` lives only in the regenerated board.
-    pub fn job_quest_db_entry(job: &Value, character_id: Uuid) -> Option<QuestDbEntry> {
+    ///
+    /// The row also carries the job's generated data. It used to store `None`, which left
+    /// /accept handing the client a job with no dungeon data — the accept-path half of the
+    /// same hang.
+    pub fn job_quest_db_entry(
+        job: &Value,
+        character_id: Uuid,
+        game_data: &GameData,
+    ) -> Option<QuestDbEntry> {
         let quest_id = Uuid::parse_str(get_str(job, "questId")?).ok()?;
         let mut objective_statuses = HashMap::new();
         if let Some(obj) = job.get("objectiveStatuses").and_then(|v| v.as_object()) {
@@ -1310,7 +1434,7 @@ mod jobs_gen {
             id: quest_id,
             character_id,
             info: JsonDbWrapper(quest),
-            generated_data: JsonDbWrapper(None),
+            generated_data: JsonDbWrapper(generated_data_for_job(game_data, job)),
             dungeon_state: None,
         })
     }
@@ -1927,12 +2051,325 @@ mod jobs_tests {
         assert!(boss["jobSetup"]["duelBossId"].as_str().is_some());
 
         // Every generated job round-trips into a storable Quest row (accept path).
+        let gd = super::report85_job_generated_data_tests::game_data();
         for j in &jobs {
             assert!(
-                jobs_gen::job_quest_db_entry(j, CHAR).is_some(),
+                jobs_gen::job_quest_db_entry(j, CHAR, &gd).is_some(),
                 "job must build a persistable quest row"
             );
         }
+    }
+}
+
+/// Report #85: the quest map loads forever, and deleting `job_pools.json` "fixes" it.
+///
+/// Retail sends a `dungeonGeneratedDataList` entry for EVERY job. We sent none, so the
+/// client listed the jobs on the map and then waited for spawn data that never came —
+/// and with no jobs at all there were no unresolvable ids, which is why removing the
+/// pool file made the hang go away while producing an empty board.
+///
+/// Ground truth is the one committed full `/quests` body,
+/// `blades-capture reference/capture-599.jsonl`: 6 jobs, 2 quests, 10 generated-data
+/// entries; 6/6 job ids present and — the control — 2/2 quest ids present.
+///
+/// The tests that shipped this bug (`jobs_tests`) were shape-only: they checked that a
+/// job had a `jobSetup` and a UUID, never that anything could resolve it. These pin the
+/// invariant instead, and every one of them is paired with a story-quest control so a
+/// red run means the job path broke rather than the fixture failing to load.
+#[cfg(test)]
+mod report85_job_generated_data_tests {
+    use super::*;
+    use blades_lib::game_data::GameData;
+    use blades_lib::static_data::QuestLevelScaling;
+    use std::collections::HashSet;
+
+    pub fn game_data() -> GameData {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../deploy/static/parsed.json");
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+        serde_json::from_str(&raw).expect("valid parsed.json")
+    }
+
+    fn job_pools() -> Value {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../deploy/static/job_pools.json");
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+        serde_json::from_str(&raw).expect("valid job_pools.json")
+    }
+
+    const CHAR: Uuid = Uuid::from_u128(0x1234_5678_9abc_def0_1234_5678_9abc_def0);
+    /// 2026-05-13 Wed 06:00 UTC — the weekday whose board prod capture id=1105 shows.
+    const NOW_WED: u64 = 1_778_648_400 + 3600;
+
+    /// The real board, rolled from the committed job pools.
+    fn board() -> Vec<Value> {
+        let pools = job_pools();
+        let boundary = jobs_gen::current_reset_boundary(&pools, NOW_WED);
+        let (jobs, _t) = jobs_gen::generate(&pools, CHAR, 48, 0, boundary, NOW_WED);
+        assert!(!jobs.is_empty(), "the committed pools must roll a board at all");
+        jobs
+    }
+
+    /// A story quest that really has a dungeon, used as the control everywhere below.
+    /// Picked from `parsed.json` at run time rather than hard-coded so the control cannot
+    /// rot into a quest that no longer exists.
+    fn story_quest_with_dungeon(gd: &GameData) -> Uuid {
+        let mut ids: Vec<Uuid> = gd
+            .quests
+            .iter()
+            .filter(|(_, q)| {
+                q.dungeon_info
+                    .as_ref()
+                    .is_some_and(|d| !d.dungeon_uuid.is_nil() && gd.dungeons.contains_key(&d.dungeon_uuid))
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        ids.sort();
+        assert!(!ids.is_empty(), "parsed.json has at least one dungeon-backed quest");
+        ids[0]
+    }
+
+    fn story_generated(gd: &GameData) -> blades_lib::user_data::DungeonGeneratedData {
+        let (_q, data) =
+            generate_quest_data(gd, story_quest_with_dungeon(gd), 48, &QuestLevelScaling::default())
+                .expect("a dungeon-backed quest generates");
+        data.expect("…with dungeon data")
+    }
+
+    /// THE bug. Every job the client is told about must have a generated-data entry
+    /// keyed by the same id — retail: 6/6.
+    ///
+    /// Asserted against [`assemble_generated_data_list`], the function the route actually
+    /// builds the array with, not against the job helper in isolation: a helper that works
+    /// while nothing calls it is precisely the state this repo was in.
+    #[test]
+    fn every_job_on_the_board_has_generated_data() {
+        let gd = game_data();
+        let jobs = board();
+        let list = assemble_generated_data_list(Vec::new(), &gd, &jobs);
+
+        let job_ids: Vec<Uuid> = jobs
+            .iter()
+            .map(|j| Uuid::parse_str(j["questId"].as_str().expect("questId")).expect("uuid"))
+            .collect();
+        let with_data: HashSet<Uuid> = list.iter().map(|g| g.quest_id).collect();
+
+        let missing: Vec<Uuid> = job_ids.iter().copied().filter(|id| !with_data.contains(id)).collect();
+        assert!(
+            missing.is_empty(),
+            "{} of {} jobs have no generatedData entry — the quest map waits forever for \
+             them (report #85). Missing: {missing:?}",
+            missing.len(),
+            job_ids.len(),
+        );
+        assert_eq!(list.len(), job_ids.len(), "exactly one entry per job, no extras");
+    }
+
+    /// The control for the test above. If `parsed.json` failed to load, or
+    /// `generate_for_dungeon` broke outright, this goes red too — so a lone failure up
+    /// there means the JOB path regressed, not the harness.
+    #[test]
+    fn story_quests_still_have_generated_data() {
+        let gd = game_data();
+        let data = story_generated(&gd);
+        assert!(
+            !data.enemy_generated_data.is_empty(),
+            "the control quest must still generate enemies"
+        );
+    }
+
+    /// An entry the client cannot populate a level from is no better than a missing one:
+    /// the 17 `JobCaveVariant_*` ids our roller puts in `jobSetup.dungeonTemplateId` all
+    /// exist in `parsed.json` with an EMPTY `spawn_info`, so generating from the template
+    /// id yields an entry with no enemies at all. This test is what catches that mistake.
+    #[test]
+    fn a_jobs_generated_data_is_not_empty() {
+        let gd = game_data();
+        for job in board() {
+            let data = jobs_gen::generated_data_for_job(&gd, &job)
+                .expect("the reference dungeon resolves");
+            assert!(
+                !data.enemy_generated_data.is_empty(),
+                "job {} generated no enemies — nothing to kill, nothing to complete",
+                job["questId"]
+            );
+            assert!(!data.chest_generated_data.is_empty(), "…and no chests");
+        }
+        // The control that makes the above discriminating: generating from the
+        // dungeonTemplateId instead — the plausible wrong answer — really is empty.
+        let template: Uuid = Uuid::parse_str(
+            board()[0]["jobSetup"]["dungeonTemplateId"].as_str().expect("template id"),
+        )
+        .expect("uuid");
+        let from_template = blades_lib::util::dungeon::generate_for_dungeon(&gd, &template, 40, 4000)
+            .expect("the template dungeon exists in parsed.json");
+        assert!(
+            from_template.enemy_generated_data.is_empty(),
+            "if the template id ever gains spawn info, revisit JOB_SPAWN_GROUPS_REFERENCE"
+        );
+    }
+
+    /// The measured identity of the reference dungeon, pinned.
+    ///
+    /// In capture-599 all six job entries' spawn ids are subsets of
+    /// `JobSpawnGroupsReference`, and the two story quests in the same body are subsets of
+    /// neither — that discriminating pair is what identified it. Same assertion here
+    /// against our own output, so swapping in a different dungeon fails.
+    #[test]
+    fn job_spawn_ids_come_from_the_reference_dungeon_and_story_quests_do_not() {
+        let gd = game_data();
+        let reference = gd
+            .dungeons
+            .get(&jobs_gen::JOB_SPAWN_GROUPS_REFERENCE)
+            .expect("JobSpawnGroupsReference is in parsed.json");
+        assert_eq!(reference.handle, "JobSpawnGroupsReference", "the id still names it");
+        let enemies: HashSet<Uuid> = reference.spawn_info.enemy_spawn_groups.keys().copied().collect();
+
+        for job in board() {
+            let data = jobs_gen::generated_data_for_job(&gd, &job).expect("generated");
+            for id in data.enemy_generated_data.keys() {
+                assert!(enemies.contains(id), "job spawn id {id} is not in the reference dungeon");
+            }
+        }
+
+        // Control: a story quest's ids are NOT the reference dungeon's. Without this a
+        // reference containing *every* spawn id in the game would pass the loop above.
+        let story = story_generated(&gd);
+        assert!(
+            story.enemy_generated_data.keys().all(|id| !enemies.contains(id)),
+            "the control quest must draw from its OWN dungeon, not the job reference"
+        );
+    }
+
+    /// The stored row carries the data too, so /accept and the dungeon-enter path can
+    /// resolve a job. It used to persist `None` unconditionally.
+    #[test]
+    fn a_stored_job_row_carries_its_generated_data() {
+        let gd = game_data();
+        for job in board() {
+            let entry = jobs_gen::job_quest_db_entry(&job, CHAR, &gd).expect("row builds");
+            let data = entry
+                .generated_data
+                .0
+                .unwrap_or_else(|| panic!("job row {} persisted no generated data", entry.id));
+            assert!(!data.enemy_generated_data.is_empty());
+        }
+    }
+
+    /// Retail stamps `version: 1` on every generated-data entry in the captured body.
+    /// Our story quests have always shipped 0 and work, so this is cosmetic and scoped to
+    /// the job path — the control pins that the quest path is untouched.
+    #[test]
+    fn job_entries_carry_the_captured_version_and_story_quests_are_unchanged() {
+        let gd = game_data();
+        for job in board() {
+            let data = jobs_gen::generated_data_for_job(&gd, &job).expect("generated");
+            assert_eq!(data.version, 1, "retail sends version 1 on job entries");
+            assert_eq!(data.algorithm_version, 1);
+        }
+        assert_eq!(story_generated(&gd).version, 0, "the story-quest path must not shift");
+    }
+
+    /// The key set retail puts on a job's generated-data entry, pinned.
+    ///
+    /// From capture-599: every one of the six job entries carried exactly
+    /// `algorithmVersion, chestGeneratedData, enemyGeneratedData, itemGeneratedData,
+    /// questId, version` — zero missing, zero extra against ours. Note what is NOT there:
+    /// no `gldQuestId`. The two story quests in the same body DO carry one on their
+    /// `quests[]` entry, which is how we know the missing link was the generated data and
+    /// not a missing gldQuestId on the jobs.
+    #[test]
+    fn a_job_entry_serializes_to_retails_key_set() {
+        let gd = game_data();
+        let jobs = board();
+        let list = assemble_generated_data_list(Vec::new(), &gd, &jobs);
+        let entry = serde_json::to_value(&list[0]).expect("entry serializes");
+        let mut keys: Vec<&str> = entry
+            .as_object()
+            .expect("object")
+            .keys()
+            .map(|k| k.as_str())
+            .collect();
+        keys.sort();
+        assert_eq!(
+            keys,
+            [
+                "algorithmVersion",
+                "chestGeneratedData",
+                "enemyGeneratedData",
+                "itemGeneratedData",
+                "questId",
+                "version",
+            ],
+            "job generated-data key set must match capture-599's six job entries",
+        );
+    }
+
+    /// The invariant as the client sees it, on the serialized response: every id in
+    /// `jobs[]` appears in `dungeonGeneratedDataList[]`, and so does every id in
+    /// `quests[]`.
+    #[test]
+    fn the_serialized_response_resolves_every_job_and_every_quest() {
+        let gd = game_data();
+        let jobs = board();
+
+        // A story quest advertised alongside the jobs, exactly as a real board is.
+        let story_id = Uuid::from_u128(0x570F);
+        let (story_quest, story_data) =
+            generate_quest_data(&gd, story_quest_with_dungeon(&gd), 48, &QuestLevelScaling::default())
+                .expect("control quest generates");
+        // Assembled exactly the way the handler assembles it: the story quest arrives via
+        // `split_quest_rows` (stored row), the jobs are added by the same call the route
+        // makes. Going through `assemble_generated_data_list` rather than reaching past it
+        // is the point — the route needs a DB, so this function is the closest testable
+        // seam to the wire.
+        let (quests_out, _events, from_rows) = split_quest_rows(
+            vec![(story_id, story_quest.clone(), story_data.clone())].into_iter(),
+            &Default::default(),
+        );
+        let generated = assemble_generated_data_list(from_rows, &gd, &jobs);
+
+        assert_eq!(quests_out.len(), 1, "the control quest is advertised");
+
+        let body = serde_json::to_value(GetQuestsResponse {
+            quests: quests_out,
+            dungeon_generated_data_list: generated,
+            jobs: jobs.clone(),
+            character: blades_lib::user_data::CompleteCharacterWithIdWithoutData {
+                id: Uuid::nil(),
+                character: Default::default(),
+            },
+            job_pools: json!([]),
+            deleted_quest_ids: vec![],
+            game_event_quests: vec![],
+            game_event_quests_in_warning: vec![],
+            game_event_quests_finished: vec![],
+        })
+        .expect("response serializes");
+
+        let resolvable: HashSet<&str> = body["dungeonGeneratedDataList"]
+            .as_array()
+            .expect("list present")
+            .iter()
+            .map(|e| e["questId"].as_str().expect("entry has a questId"))
+            .collect();
+
+        for job in body["jobs"].as_array().expect("jobs") {
+            let id = job["questId"].as_str().unwrap();
+            assert!(resolvable.contains(id), "job {id} is on the board but unresolvable");
+        }
+        // The control, in the same assertion style: quests must resolve too. A change
+        // that emptied the whole list would pass the loop above only if `jobs` were also
+        // empty, and this catches the case where it is not.
+        for quest in body["quests"].as_array().expect("quests") {
+            let id = quest["questId"].as_str().unwrap();
+            assert!(resolvable.contains(id), "quest {id} is advertised but unresolvable");
+        }
+        assert_eq!(
+            body["jobs"].as_array().unwrap().len() + body["quests"].as_array().unwrap().len(),
+            resolvable.len(),
+            "one entry per advertised thing, as in capture-599 (6 jobs + 2 quests + 2 events = 10)"
+        );
     }
 }
 
