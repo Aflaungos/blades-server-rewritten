@@ -7,13 +7,14 @@
         "difficultyCurve floors 1-24: the captured fixedSlices difficultyLevel ladder (1,2,3,4,5,6,7,8,9,10,12,14,16,20,24,28,34,42,50,60,70,82,94,100).",
         "dungeonPool: every *AbyssDungeonSetting from the APK Unity bundles (deploy/static/parsed.json 'dungeons'); handle/environment/monsters/enemyCount are read directly from DungeonSettingsScriptableObject.",
         "monsterTiers authoritativeFloor: the floor each family first appears on the captured fixed ladder.",
-        "scaling model FIELD NAMES: read from il2cpp dump.cs AbyssScaling / AbyssScaling_Backend / AbyssSlice / AbyssScaling.PerFloorData / AbyssScaling.AbyssScalingCurveEntry ScriptableObjects."
+        "scaling model FIELD NAMES: read from il2cpp dump.cs AbyssScaling / AbyssScaling_Backend / AbyssSlice / AbyssScaling.PerFloorData / AbyssScaling.AbyssScalingCurveEntry ScriptableObjects.",
+        "scalingCurve + perFloorRewards + killScores + scalingBackend.slicesCountAbovePlayerLevel: AbyssScaling ScriptableObject (APK Unity bundles). The curve is cross-checked byte-identical against an independent extraction (blades-capture/reference/game-defs/abyss.json scaling_curve); the per-floor rows and the negative-offset multiplier of 1.0 are confirmed exact against 18 retail /end captures."
       ],
       "GUESSED": [
         "difficultyCurve floors 25-150: smooth continuation (+6/floor from 100, cap 400). Prod only pinned difficulty 100 for the random pool.",
         "depthBands boundaries + tierWeights: a smooth shallow->deep shift (weak tiers early, tough tiers deep). Band SHAPE is designed; the tier->floor anchors are authoritative.",
         "monsterTiers.tier for families NOT on the captured ladder (skeletons, wight, warlord, liches, lichesoutcastnether, dragon*): placed by lore/power tier (tierGuessed:true).",
-        "scalingBackend + scalingCurve + perFloorRewards VALUES: the ScriptableObject float values were not extracted (TypeTree tool install was declined); values are plausible from captured rewards (~195 gold / 64 XP per floor). Field names/meaning are authoritative."
+        "scalingBackend.maxDifficulty / .hardcoreSliceDifficultyOffset / .minimumSuccessRating: these live in AbyssScaling_Backend, a server-only asset absent from the APK. Still unknown."
       ]
     },
     "_fields": {
@@ -26,11 +27,12 @@
       "monsterTiers": "{familyKey: {tier(1..9), authoritativeFloor|null, tierGuessed}}. Groups every monster family to a power tier. Higher tier = tougher/deeper. familyKey is the lowercased monster token from the dungeon handle (e.g. 'goblin','dremora','dragon').",
       "depthBands": "[{floorMin, floorMax, tierWeights:{tier:weight}}]. For a given floor, the eligible monster TIERS and their relative spawn weight. Deeper bands weight higher tiers. Back-office: adjust weights to bias which monsters appear at depth; add/split bands freely.",
       "dungeonPool": "{dungeonSettingsId: {handle, environment(Stone|Cave|Ayleid|Forest), monsters:[family...], isBoss, enemyCount(1-4)}}. AUTHORITATIVE index of every abyss dungeon-setting the client can render. The server picks a dungeon for a floor by (a) its difficulty band, (b) the depthBands tierWeights over each dungeon's monster tier, weighted-random by seed. isBoss dungeons are candidates for milestone floors.",
-      "scalingBackend": "Mirrors AbyssScaling_Backend: slicesCount(150, authoritative), maxDifficulty, slicesCountAbovePlayerLevel (how far above the player's level enemies scale), hardcoreSliceDifficultyOffset, minimumSuccessRating. See _guessed/_authoritative sub-lists.",
-      "scalingCurve": "Mirrors AbyssScaling._abyssScalingCurve: difficultyOffset (floorDifficulty - initialPlayerLevel) -> gold/xp bonus multipliers (fight harder-than-your-level enemies -> more reward). Values guessed.",
-      "perFloorRewards": "Mirrors AbyssScaling._perFloorData: baseGoldReward/baseXPReward granted per floor cleared (before scalingCurve multiplier). Values guessed."
+      "scalingBackend": "MIXED. slicesCount + slicesCountAbovePlayerLevel authoritative; maxDifficulty, hardcoreSliceDifficultyOffset and minimumSuccessRating still guessed (server-only asset).",
+      "scalingCurve": "AUTHORITATIVE. {entries:[{difficultyOffset, goldBonusMultiplier, xpBonusMultiplier}]} - step function on (sliceDifficultyLevel - initialPlayerLevel); below offset 0 the multiplier is 1.0 (no entry applies).",
+      "perFloorRewards": "AUTHORITATIVE. {entries:[{floor, baseGoldReward, baseXPReward}]} - 150 rows keyed by wire floorIndex; the base reward for clearing a floor before the scalingCurve multiplier.",
+      "killScores": "AUTHORITATIVE. {sameLevelKillScore, underLeveledKillScore[100], overLeveledKillScore[60]} - in-run score per kill by enemyLevel - initialPlayerLevel."
     },
-    "_wiring": "server/src/abyss.rs build_slices_from currently: floors < fixedSlices.len() use fixedSlices verbatim; floors beyond use randomPool cycled by (seed+floor) and HARD-CODE difficultyLevel=100. To honor this file: (1) set each slice's difficultyLevel from difficultyCurve[floor]; (2) for floors past the fixed ladder, pick the dungeonSettingsId by seeded weighted-random over dungeonPool filtered/weighted by depthBands.tierWeights (map each dungeon's monster family -> monsterTiers.tier -> band weight); (3) build_generated_data can size spawn groups from the chosen dungeon's enemyCount and scale per-enemy gold/xp by perFloorRewards * scalingCurve[floorDifficulty-initialPlayerLevel]."
+    "_wiring": "server/src/abyss.rs reads fixedSlices/randomPool/futureRewards/algorithmVersion/difficultyCurve/depthBands/dungeonPool/monsterTiers for run generation, and perFloorRewards + scalingCurve + killScores for /update scoring and /end rewards. blades_lib::static_data::AbyssStaticData is the deserializer."
   },
   "fixedSlices": [
     {
@@ -2644,53 +2646,980 @@
   "scalingBackend": {
     "slicesCount": 150,
     "maxDifficulty": 400,
-    "slicesCountAbovePlayerLevel": 2,
+    "slicesCountAbovePlayerLevel": 20,
     "hardcoreSliceDifficultyOffset": 10,
     "minimumSuccessRating": 0.0,
+    "_authoritative": [
+      "slicesCount",
+      "slicesCountAbovePlayerLevel"
+    ],
     "_guessed": [
       "maxDifficulty",
-      "slicesCountAbovePlayerLevel",
       "hardcoreSliceDifficultyOffset",
       "minimumSuccessRating"
     ],
-    "_authoritative": [
-      "slicesCount"
-    ]
+    "_note": "slicesCountAbovePlayerLevel is AbyssScaling._slicesCountAbovePlayerLevel = 20, read from the AbyssScaling ScriptableObject in the APK bundles. This file used to ship 2 - wrong by 10x. The other three live in AbyssScaling_Backend, a SERVER-ONLY asset that is provably absent from the APK, so they remain genuinely unknown and stay flagged guessed."
   },
   "scalingCurve": {
-    "_note": "AbyssScaling._abyssScalingCurve: difficultyOffset (floor - initialPlayerLevel) -> gold/xp bonus multipliers. Values GUESSED.",
+    "_source": "AbyssScaling._abyssScalingCurve - AbyssScaling ScriptableObject, APK bundle extraction. Cross-checked byte-identical against blades-capture/reference/game-defs/abyss.json `scaling_curve`, an independent extraction of the same asset.",
+    "_note": "difficultyOffset = (that slice's generated difficultyLevel) minus the run's initialPlayerLevel. NOT floorIndex minus initialPlayerLevel: the two diverge as soon as a run starts below the player's level (a captured run at initialPlayerLevel 4 carried difficulty levels 1,2,3,4,6,8,10,14,18 on floors 1-9). STEP function: take the highest breakpoint whose difficultyOffset <= the actual offset. There is NO negative-offset row and NO clamp up to 1.25: below offset 0 the multiplier is 1.0, i.e. the unmultiplied base reward. Measured - a single-floor run on floor 49 at initialPlayerLevel 59 (offset -10) paid exactly 402 gold / 108 XP, the bare base. The curve plateaus at x6 from offset 14 upward (the source asset repeats x6 for every further breakpoint out to offset 99; the flat tail is not stored). Gold and XP multipliers are always equal in the source data. The summed float is rounded HALF-UP.",
     "entries": [
       {
-        "difficultyOffset": -5,
-        "goldBonusMultiplier": 0.5,
-        "xpBonusMultiplier": 0.5
-      },
-      {
         "difficultyOffset": 0,
-        "goldBonusMultiplier": 1.0,
-        "xpBonusMultiplier": 1.0
+        "goldBonusMultiplier": 1.25,
+        "xpBonusMultiplier": 1.25
       },
       {
-        "difficultyOffset": 3,
-        "goldBonusMultiplier": 1.5,
-        "xpBonusMultiplier": 1.5
-      },
-      {
-        "difficultyOffset": 6,
+        "difficultyOffset": 2,
         "goldBonusMultiplier": 2.0,
         "xpBonusMultiplier": 2.0
       },
       {
-        "difficultyOffset": 10,
+        "difficultyOffset": 4,
         "goldBonusMultiplier": 3.0,
         "xpBonusMultiplier": 3.0
+      },
+      {
+        "difficultyOffset": 6,
+        "goldBonusMultiplier": 4.0,
+        "xpBonusMultiplier": 4.0
+      },
+      {
+        "difficultyOffset": 10,
+        "goldBonusMultiplier": 5.0,
+        "xpBonusMultiplier": 5.0
+      },
+      {
+        "difficultyOffset": 14,
+        "goldBonusMultiplier": 6.0,
+        "xpBonusMultiplier": 6.0
       }
     ]
   },
   "perFloorRewards": {
-    "_note": "AbyssScaling._perFloorData: baseGold/baseXP per floor (before scalingCurve multiplier). Values GUESSED from the captured ~2923 gold / 958 XP over ~15 floors (=~195 gold / 64 XP per floor average).",
-    "baseGoldReward": 195,
-    "baseXPReward": 64,
-    "_guessed": true
-  }
+    "_source": "AbyssScaling._perFloorData - AbyssScaling ScriptableObject, APK bundle extraction, CONFIRMED against 18 retail /end captures. 150 rows; the array index is the wire floorIndex directly.",
+    "_note": "Base gold/XP granted for clearing a floor, BEFORE the scalingCurve multiplier. baseGoldReward = 10 + 8*floorIndex, baseXPReward = 10 + 2*floorIndex, exactly linear across all 150 rows. Pinned by five independent SINGLE-floor /end captures, exact to the unit: floorIndex 49 at multiplier 1.0 paid 402/108; floorIndex 90 at x6 paid 4380/1140; floorIndex 118 at x6 paid 5724/1476 (3 runs); floorIndex 147 at x6 paid 7116/1824; floorIndex 149 at x6 paid 7212/1848 (3 runs). Stored as explicit rows because the rows are the game data and the formula is only an observation about them. Replaces the previous single pair (195 gold / 64 XP per floor), which was one guess obtained by dividing a captured ~2923 gold / 958 XP total by an assumed 15 floors - fitted with zero degrees of freedom, so its apparent agreement with that total was arithmetic, not evidence. Past floorIndex 149 the last row repeats.",
+    "entries": [
+      {
+        "floor": 0,
+        "baseGoldReward": 10,
+        "baseXPReward": 10
+      },
+      {
+        "floor": 1,
+        "baseGoldReward": 18,
+        "baseXPReward": 12
+      },
+      {
+        "floor": 2,
+        "baseGoldReward": 26,
+        "baseXPReward": 14
+      },
+      {
+        "floor": 3,
+        "baseGoldReward": 34,
+        "baseXPReward": 16
+      },
+      {
+        "floor": 4,
+        "baseGoldReward": 42,
+        "baseXPReward": 18
+      },
+      {
+        "floor": 5,
+        "baseGoldReward": 50,
+        "baseXPReward": 20
+      },
+      {
+        "floor": 6,
+        "baseGoldReward": 58,
+        "baseXPReward": 22
+      },
+      {
+        "floor": 7,
+        "baseGoldReward": 66,
+        "baseXPReward": 24
+      },
+      {
+        "floor": 8,
+        "baseGoldReward": 74,
+        "baseXPReward": 26
+      },
+      {
+        "floor": 9,
+        "baseGoldReward": 82,
+        "baseXPReward": 28
+      },
+      {
+        "floor": 10,
+        "baseGoldReward": 90,
+        "baseXPReward": 30
+      },
+      {
+        "floor": 11,
+        "baseGoldReward": 98,
+        "baseXPReward": 32
+      },
+      {
+        "floor": 12,
+        "baseGoldReward": 106,
+        "baseXPReward": 34
+      },
+      {
+        "floor": 13,
+        "baseGoldReward": 114,
+        "baseXPReward": 36
+      },
+      {
+        "floor": 14,
+        "baseGoldReward": 122,
+        "baseXPReward": 38
+      },
+      {
+        "floor": 15,
+        "baseGoldReward": 130,
+        "baseXPReward": 40
+      },
+      {
+        "floor": 16,
+        "baseGoldReward": 138,
+        "baseXPReward": 42
+      },
+      {
+        "floor": 17,
+        "baseGoldReward": 146,
+        "baseXPReward": 44
+      },
+      {
+        "floor": 18,
+        "baseGoldReward": 154,
+        "baseXPReward": 46
+      },
+      {
+        "floor": 19,
+        "baseGoldReward": 162,
+        "baseXPReward": 48
+      },
+      {
+        "floor": 20,
+        "baseGoldReward": 170,
+        "baseXPReward": 50
+      },
+      {
+        "floor": 21,
+        "baseGoldReward": 178,
+        "baseXPReward": 52
+      },
+      {
+        "floor": 22,
+        "baseGoldReward": 186,
+        "baseXPReward": 54
+      },
+      {
+        "floor": 23,
+        "baseGoldReward": 194,
+        "baseXPReward": 56
+      },
+      {
+        "floor": 24,
+        "baseGoldReward": 202,
+        "baseXPReward": 58
+      },
+      {
+        "floor": 25,
+        "baseGoldReward": 210,
+        "baseXPReward": 60
+      },
+      {
+        "floor": 26,
+        "baseGoldReward": 218,
+        "baseXPReward": 62
+      },
+      {
+        "floor": 27,
+        "baseGoldReward": 226,
+        "baseXPReward": 64
+      },
+      {
+        "floor": 28,
+        "baseGoldReward": 234,
+        "baseXPReward": 66
+      },
+      {
+        "floor": 29,
+        "baseGoldReward": 242,
+        "baseXPReward": 68
+      },
+      {
+        "floor": 30,
+        "baseGoldReward": 250,
+        "baseXPReward": 70
+      },
+      {
+        "floor": 31,
+        "baseGoldReward": 258,
+        "baseXPReward": 72
+      },
+      {
+        "floor": 32,
+        "baseGoldReward": 266,
+        "baseXPReward": 74
+      },
+      {
+        "floor": 33,
+        "baseGoldReward": 274,
+        "baseXPReward": 76
+      },
+      {
+        "floor": 34,
+        "baseGoldReward": 282,
+        "baseXPReward": 78
+      },
+      {
+        "floor": 35,
+        "baseGoldReward": 290,
+        "baseXPReward": 80
+      },
+      {
+        "floor": 36,
+        "baseGoldReward": 298,
+        "baseXPReward": 82
+      },
+      {
+        "floor": 37,
+        "baseGoldReward": 306,
+        "baseXPReward": 84
+      },
+      {
+        "floor": 38,
+        "baseGoldReward": 314,
+        "baseXPReward": 86
+      },
+      {
+        "floor": 39,
+        "baseGoldReward": 322,
+        "baseXPReward": 88
+      },
+      {
+        "floor": 40,
+        "baseGoldReward": 330,
+        "baseXPReward": 90
+      },
+      {
+        "floor": 41,
+        "baseGoldReward": 338,
+        "baseXPReward": 92
+      },
+      {
+        "floor": 42,
+        "baseGoldReward": 346,
+        "baseXPReward": 94
+      },
+      {
+        "floor": 43,
+        "baseGoldReward": 354,
+        "baseXPReward": 96
+      },
+      {
+        "floor": 44,
+        "baseGoldReward": 362,
+        "baseXPReward": 98
+      },
+      {
+        "floor": 45,
+        "baseGoldReward": 370,
+        "baseXPReward": 100
+      },
+      {
+        "floor": 46,
+        "baseGoldReward": 378,
+        "baseXPReward": 102
+      },
+      {
+        "floor": 47,
+        "baseGoldReward": 386,
+        "baseXPReward": 104
+      },
+      {
+        "floor": 48,
+        "baseGoldReward": 394,
+        "baseXPReward": 106
+      },
+      {
+        "floor": 49,
+        "baseGoldReward": 402,
+        "baseXPReward": 108
+      },
+      {
+        "floor": 50,
+        "baseGoldReward": 410,
+        "baseXPReward": 110
+      },
+      {
+        "floor": 51,
+        "baseGoldReward": 418,
+        "baseXPReward": 112
+      },
+      {
+        "floor": 52,
+        "baseGoldReward": 426,
+        "baseXPReward": 114
+      },
+      {
+        "floor": 53,
+        "baseGoldReward": 434,
+        "baseXPReward": 116
+      },
+      {
+        "floor": 54,
+        "baseGoldReward": 442,
+        "baseXPReward": 118
+      },
+      {
+        "floor": 55,
+        "baseGoldReward": 450,
+        "baseXPReward": 120
+      },
+      {
+        "floor": 56,
+        "baseGoldReward": 458,
+        "baseXPReward": 122
+      },
+      {
+        "floor": 57,
+        "baseGoldReward": 466,
+        "baseXPReward": 124
+      },
+      {
+        "floor": 58,
+        "baseGoldReward": 474,
+        "baseXPReward": 126
+      },
+      {
+        "floor": 59,
+        "baseGoldReward": 482,
+        "baseXPReward": 128
+      },
+      {
+        "floor": 60,
+        "baseGoldReward": 490,
+        "baseXPReward": 130
+      },
+      {
+        "floor": 61,
+        "baseGoldReward": 498,
+        "baseXPReward": 132
+      },
+      {
+        "floor": 62,
+        "baseGoldReward": 506,
+        "baseXPReward": 134
+      },
+      {
+        "floor": 63,
+        "baseGoldReward": 514,
+        "baseXPReward": 136
+      },
+      {
+        "floor": 64,
+        "baseGoldReward": 522,
+        "baseXPReward": 138
+      },
+      {
+        "floor": 65,
+        "baseGoldReward": 530,
+        "baseXPReward": 140
+      },
+      {
+        "floor": 66,
+        "baseGoldReward": 538,
+        "baseXPReward": 142
+      },
+      {
+        "floor": 67,
+        "baseGoldReward": 546,
+        "baseXPReward": 144
+      },
+      {
+        "floor": 68,
+        "baseGoldReward": 554,
+        "baseXPReward": 146
+      },
+      {
+        "floor": 69,
+        "baseGoldReward": 562,
+        "baseXPReward": 148
+      },
+      {
+        "floor": 70,
+        "baseGoldReward": 570,
+        "baseXPReward": 150
+      },
+      {
+        "floor": 71,
+        "baseGoldReward": 578,
+        "baseXPReward": 152
+      },
+      {
+        "floor": 72,
+        "baseGoldReward": 586,
+        "baseXPReward": 154
+      },
+      {
+        "floor": 73,
+        "baseGoldReward": 594,
+        "baseXPReward": 156
+      },
+      {
+        "floor": 74,
+        "baseGoldReward": 602,
+        "baseXPReward": 158
+      },
+      {
+        "floor": 75,
+        "baseGoldReward": 610,
+        "baseXPReward": 160
+      },
+      {
+        "floor": 76,
+        "baseGoldReward": 618,
+        "baseXPReward": 162
+      },
+      {
+        "floor": 77,
+        "baseGoldReward": 626,
+        "baseXPReward": 164
+      },
+      {
+        "floor": 78,
+        "baseGoldReward": 634,
+        "baseXPReward": 166
+      },
+      {
+        "floor": 79,
+        "baseGoldReward": 642,
+        "baseXPReward": 168
+      },
+      {
+        "floor": 80,
+        "baseGoldReward": 650,
+        "baseXPReward": 170
+      },
+      {
+        "floor": 81,
+        "baseGoldReward": 658,
+        "baseXPReward": 172
+      },
+      {
+        "floor": 82,
+        "baseGoldReward": 666,
+        "baseXPReward": 174
+      },
+      {
+        "floor": 83,
+        "baseGoldReward": 674,
+        "baseXPReward": 176
+      },
+      {
+        "floor": 84,
+        "baseGoldReward": 682,
+        "baseXPReward": 178
+      },
+      {
+        "floor": 85,
+        "baseGoldReward": 690,
+        "baseXPReward": 180
+      },
+      {
+        "floor": 86,
+        "baseGoldReward": 698,
+        "baseXPReward": 182
+      },
+      {
+        "floor": 87,
+        "baseGoldReward": 706,
+        "baseXPReward": 184
+      },
+      {
+        "floor": 88,
+        "baseGoldReward": 714,
+        "baseXPReward": 186
+      },
+      {
+        "floor": 89,
+        "baseGoldReward": 722,
+        "baseXPReward": 188
+      },
+      {
+        "floor": 90,
+        "baseGoldReward": 730,
+        "baseXPReward": 190
+      },
+      {
+        "floor": 91,
+        "baseGoldReward": 738,
+        "baseXPReward": 192
+      },
+      {
+        "floor": 92,
+        "baseGoldReward": 746,
+        "baseXPReward": 194
+      },
+      {
+        "floor": 93,
+        "baseGoldReward": 754,
+        "baseXPReward": 196
+      },
+      {
+        "floor": 94,
+        "baseGoldReward": 762,
+        "baseXPReward": 198
+      },
+      {
+        "floor": 95,
+        "baseGoldReward": 770,
+        "baseXPReward": 200
+      },
+      {
+        "floor": 96,
+        "baseGoldReward": 778,
+        "baseXPReward": 202
+      },
+      {
+        "floor": 97,
+        "baseGoldReward": 786,
+        "baseXPReward": 204
+      },
+      {
+        "floor": 98,
+        "baseGoldReward": 794,
+        "baseXPReward": 206
+      },
+      {
+        "floor": 99,
+        "baseGoldReward": 802,
+        "baseXPReward": 208
+      },
+      {
+        "floor": 100,
+        "baseGoldReward": 810,
+        "baseXPReward": 210
+      },
+      {
+        "floor": 101,
+        "baseGoldReward": 818,
+        "baseXPReward": 212
+      },
+      {
+        "floor": 102,
+        "baseGoldReward": 826,
+        "baseXPReward": 214
+      },
+      {
+        "floor": 103,
+        "baseGoldReward": 834,
+        "baseXPReward": 216
+      },
+      {
+        "floor": 104,
+        "baseGoldReward": 842,
+        "baseXPReward": 218
+      },
+      {
+        "floor": 105,
+        "baseGoldReward": 850,
+        "baseXPReward": 220
+      },
+      {
+        "floor": 106,
+        "baseGoldReward": 858,
+        "baseXPReward": 222
+      },
+      {
+        "floor": 107,
+        "baseGoldReward": 866,
+        "baseXPReward": 224
+      },
+      {
+        "floor": 108,
+        "baseGoldReward": 874,
+        "baseXPReward": 226
+      },
+      {
+        "floor": 109,
+        "baseGoldReward": 882,
+        "baseXPReward": 228
+      },
+      {
+        "floor": 110,
+        "baseGoldReward": 890,
+        "baseXPReward": 230
+      },
+      {
+        "floor": 111,
+        "baseGoldReward": 898,
+        "baseXPReward": 232
+      },
+      {
+        "floor": 112,
+        "baseGoldReward": 906,
+        "baseXPReward": 234
+      },
+      {
+        "floor": 113,
+        "baseGoldReward": 914,
+        "baseXPReward": 236
+      },
+      {
+        "floor": 114,
+        "baseGoldReward": 922,
+        "baseXPReward": 238
+      },
+      {
+        "floor": 115,
+        "baseGoldReward": 930,
+        "baseXPReward": 240
+      },
+      {
+        "floor": 116,
+        "baseGoldReward": 938,
+        "baseXPReward": 242
+      },
+      {
+        "floor": 117,
+        "baseGoldReward": 946,
+        "baseXPReward": 244
+      },
+      {
+        "floor": 118,
+        "baseGoldReward": 954,
+        "baseXPReward": 246
+      },
+      {
+        "floor": 119,
+        "baseGoldReward": 962,
+        "baseXPReward": 248
+      },
+      {
+        "floor": 120,
+        "baseGoldReward": 970,
+        "baseXPReward": 250
+      },
+      {
+        "floor": 121,
+        "baseGoldReward": 978,
+        "baseXPReward": 252
+      },
+      {
+        "floor": 122,
+        "baseGoldReward": 986,
+        "baseXPReward": 254
+      },
+      {
+        "floor": 123,
+        "baseGoldReward": 994,
+        "baseXPReward": 256
+      },
+      {
+        "floor": 124,
+        "baseGoldReward": 1002,
+        "baseXPReward": 258
+      },
+      {
+        "floor": 125,
+        "baseGoldReward": 1010,
+        "baseXPReward": 260
+      },
+      {
+        "floor": 126,
+        "baseGoldReward": 1018,
+        "baseXPReward": 262
+      },
+      {
+        "floor": 127,
+        "baseGoldReward": 1026,
+        "baseXPReward": 264
+      },
+      {
+        "floor": 128,
+        "baseGoldReward": 1034,
+        "baseXPReward": 266
+      },
+      {
+        "floor": 129,
+        "baseGoldReward": 1042,
+        "baseXPReward": 268
+      },
+      {
+        "floor": 130,
+        "baseGoldReward": 1050,
+        "baseXPReward": 270
+      },
+      {
+        "floor": 131,
+        "baseGoldReward": 1058,
+        "baseXPReward": 272
+      },
+      {
+        "floor": 132,
+        "baseGoldReward": 1066,
+        "baseXPReward": 274
+      },
+      {
+        "floor": 133,
+        "baseGoldReward": 1074,
+        "baseXPReward": 276
+      },
+      {
+        "floor": 134,
+        "baseGoldReward": 1082,
+        "baseXPReward": 278
+      },
+      {
+        "floor": 135,
+        "baseGoldReward": 1090,
+        "baseXPReward": 280
+      },
+      {
+        "floor": 136,
+        "baseGoldReward": 1098,
+        "baseXPReward": 282
+      },
+      {
+        "floor": 137,
+        "baseGoldReward": 1106,
+        "baseXPReward": 284
+      },
+      {
+        "floor": 138,
+        "baseGoldReward": 1114,
+        "baseXPReward": 286
+      },
+      {
+        "floor": 139,
+        "baseGoldReward": 1122,
+        "baseXPReward": 288
+      },
+      {
+        "floor": 140,
+        "baseGoldReward": 1130,
+        "baseXPReward": 290
+      },
+      {
+        "floor": 141,
+        "baseGoldReward": 1138,
+        "baseXPReward": 292
+      },
+      {
+        "floor": 142,
+        "baseGoldReward": 1146,
+        "baseXPReward": 294
+      },
+      {
+        "floor": 143,
+        "baseGoldReward": 1154,
+        "baseXPReward": 296
+      },
+      {
+        "floor": 144,
+        "baseGoldReward": 1162,
+        "baseXPReward": 298
+      },
+      {
+        "floor": 145,
+        "baseGoldReward": 1170,
+        "baseXPReward": 300
+      },
+      {
+        "floor": 146,
+        "baseGoldReward": 1178,
+        "baseXPReward": 302
+      },
+      {
+        "floor": 147,
+        "baseGoldReward": 1186,
+        "baseXPReward": 304
+      },
+      {
+        "floor": 148,
+        "baseGoldReward": 1194,
+        "baseXPReward": 306
+      },
+      {
+        "floor": 149,
+        "baseGoldReward": 1202,
+        "baseXPReward": 308
+      }
+    ]
+  },
+  "killScores": {
+    "_source": "AbyssScaling._sameLevelKillScore / _underLeveledKillScore / _overLeveledKillScore - AbyssScaling ScriptableObject, APK bundle extraction. Values and list lengths (100 / 60) measured.",
+    "_note": "In-run score for one kill, by levelDelta = enemyLevel - initialPlayerLevel. levelDelta == 0 -> sameLevelKillScore. levelDelta > 0 -> underLeveledKillScore[levelDelta-1]. levelDelta < 0 -> overLeveledKillScore[-levelDelta-1]. Past the end of either list, the last entry repeats. The index alignment is EVIDENCE-BACKED, not merely inferred: a captured floor-43 run at initialPlayerLevel 45 (levelDelta -2) scored 16.0, which overLeveledKillScore[1] = 8 reaches as 8 x 2 (a boss killScoreMultiplier) while overLeveledKillScore[2] = 5 cannot reach under any of the 0.33 / 1.0 / 2.0 multipliers; a 9-rung milestone walk corroborates. Each enemy also carries a killScoreMultiplier (0.33 critters / 1.0 normal / 2.0 boss) which the server cannot currently resolve - see server/src/abyss.rs. Note: score reaches the client only via GET /abysses/current; /update never echoes it.",
+    "sameLevelKillScore": 10,
+    "underLeveledKillScore": [
+      12,
+      15,
+      19,
+      24,
+      30,
+      40,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30,
+      30
+    ],
+    "overLeveledKillScore": [
+      10,
+      8,
+      5,
+      4,
+      3,
+      2,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1,
+      1
+    ]
+  },
+  "_futureRewardLadderNote": "MEASURED but NOT WIRED - follow-up. The real future-reward ladder has TEN score rungs: 35, 50, 70, 95, 135, 190, 260, 360, 490, 650, and the wire carries exactly ONE element, the NEXT unreached rung (752/752 captured observations). Slot type is fixed per rung (50 -> chest tier 1, 260 -> real gear items, 360 -> chest tier 3, the rest stackableItems), and a chest's level is the character's CURRENT level, not initialPlayerLevel (6 runs). `futureRewards` below still holds only rung 1, so production advertises rung 1 of 10 forever. Advancing the ladder is deliberately NOT done in this change: WHICH stackable item each rung grants is a server-side loot table nobody has (18 distinct items at rung 35 alone), so shipping rungs 2-10 would mean advertising rewards with invented or empty contents to live players."
 }
