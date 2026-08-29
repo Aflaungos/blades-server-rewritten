@@ -8,10 +8,37 @@
 //! `POST /abysses/current/end`        → `{reward, character, wallet, inventory}`
 //!
 //! State is persisted in `characters.server_state` JSONB (`server_state.abyss`).
-//! Rewards on `/end` scale with the highest floor reached:
-//!   - Gold: `50 * floors_completed`
-//!   - XP:   `10 * floors_completed`
-//!   (plausible proxy; prod used item drops + currency packs scaled by difficulty)
+//!
+//! ## Scoring and rewards
+//!
+//! Both come from `AbyssScaling`, the game's own ScriptableObject, extracted from the
+//! APK bundles and shipped in `deploy/static/abyss.json`:
+//!
+//! * `/update` score — `killScoreMultiplier * GetKillScore(enemyLevel - initialPlayerLevel)`
+//!   per kill, reading `sameLevelKillScore` / `underLeveledKillScore` /
+//!   `overLeveledKillScore`. This used to be a flat `1` per kill; a same-level kill is
+//!   worth `10`.
+//! * `/end` reward — `Σ over rewarded floors of baseReward(floorIndex) * multiplier(offset)`
+//!   with `offset = thatSlice'sDifficultyLevel - initialPlayerLevel`. So the payout scales
+//!   with BOTH depth and how far above your level you fought. It used to be
+//!   `floors * 195` gold / `floors * 64` XP — one guess produced by dividing a single
+//!   captured total (~2923 gold / 958 XP) by an assumed floor count, i.e. fitted with zero
+//!   degrees of freedom, so its apparent agreement with that total meant nothing.
+//! * A floor cleared with NO kill grants no per-floor reward
+//!   (`DATA_HAS_GOTTEN_KILL_SINCE_FLOOR_CHANGE` / `_floorsWithNoRewards` in `dump.cs`).
+//!
+//! Every number is confirmed against 18 retail `/end` captures, five of them
+//! single-floor, exact to the unit — see the tests at the bottom of this file.
+//!
+//! ## `initialPlayerLevel` is an open question
+//!
+//! It drives BOTH formulas and we do not know how retail derives it. It is NOT the
+//! character level and not a fixed offset from it: captured (charLevel → ipl) pairs run
+//! 7→10, 3→4, 38→40, 34→38, 66→67, 79→75, 81→76, 93→81, 100→84 — it tracks power and
+//! diverges DOWNWARD at high level. `start_abyss` still writes the character's level,
+//! which is therefore wrong for high-level characters; everything downstream reads the
+//! value persisted on the run rather than recomputing it, so fixing the derivation later
+//! is a one-line change confined to `start_abyss`.
 
 use std::sync::Arc;
 
@@ -139,15 +166,8 @@ struct StartAbyssResponse {
 /// Sentinel UUID used for abyss generated-data questId (captured from prod).
 const ABYSS_QUEST_ID: &str = "ab133000-0000-0000-0000-000000000000";
 
-/// Known spawn-group UUIDs seen in the captured abyss floor 1 generated data.
-/// We use these same IDs so the client can resolve them. The gold drops here are
-/// plausible proxies; prod values varied by difficulty/floor.
-const SPAWN_GROUP_A: &str = "c41668b3-ad8b-42b4-ba5d-a0574039a3cc";
-const SPAWN_GROUP_B: &str = "9a057ca6-5f8d-4700-8665-6c56de0e1103";
 /// Gold currency UUID (captured from both abyss and quest loot responses).
 const GOLD_CURRENCY_UUID: &str = "f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2";
-/// Generic loot-table UUID observed in the floor-1 captured generated data.
-const LOOT_TABLE_UUID: &str = "2d366ee0-8087-4d1d-8161-64a7b3e14f93";
 
 #[post(
     "/blades.bgs.services/api/game/v1/public/characters/{character_id}/abysses/current/start"
@@ -234,6 +254,13 @@ pub async fn start_abyss(
 // POST /abysses/current/update
 // ────────────────────────────────────────────────────────────────────────────
 
+/// One `enemy_killed` action from the client.
+///
+/// NOTHING on this action is trusted for scoring. `xp_reward` in particular is a
+/// client-supplied number and using it would be a straight score/XP exploit; it is
+/// parsed only so an unexpected shape does not reject the whole body. The enemy's level
+/// comes from the server's own slice (`difficulty_level`) — the same value the server
+/// put into that floor's generated data — and the score comes from the static tables.
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct EnemyKilledAction {
@@ -243,16 +270,54 @@ struct EnemyKilledAction {
     spawner_index: usize,
     #[allow(dead_code)]
     enemy_index: usize,
+    /// Client-reported XP. NEVER used — see the type doc.
     #[allow(dead_code)]
     xp_reward: f64,
     #[allow(dead_code)]
     time: u64,
 }
 
+/// `abyss_slice_completed` — the action that ends a floor. Carries only `time`.
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct SliceCompletedAction {
+    #[allow(dead_code)]
+    #[serde(default)]
+    time: u64,
+}
+
+/// `revive` — the player spent gems to continue after dying.
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct ReviveAction {
+    #[allow(dead_code)]
+    #[serde(default)]
+    gems_payment: u64,
+    #[allow(dead_code)]
+    #[serde(default)]
+    time: u64,
+}
+
+/// The six `/update` action types the client actually sends.
+///
+/// Only one arm used to exist (`EnemyKilled`); the other five fell into `Unknown` and
+/// were dropped, `abyss_slice_completed` — the floor-advance signal — among them. The
+/// three arms not acted on yet (`combat_completed` gear durability,
+/// `enemy_loot_collected`, `item_consumed`) are named rather than swallowed so the next
+/// change can see them, and so a body carrying them is not silently reduced to "unknown".
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum AbyssUpdateAction {
     EnemyKilled(EnemyKilledAction),
+    AbyssSliceCompleted(SliceCompletedAction),
+    Revive(ReviveAction),
+    /// Gear durability after a fight. Not applied yet.
+    CombatCompleted(Value),
+    /// Loot the player picked up off a corpse. Not applied yet — the server does not
+    /// generate abyss enemy loot at all (see the follow-ups in the PR).
+    EnemyLootCollected(Value),
+    /// A potion/food used mid-run. Not applied yet.
+    ItemConsumed(Value),
     #[serde(other)]
     Unknown,
 }
@@ -260,6 +325,7 @@ enum AbyssUpdateAction {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct UpdateAbyssRequest {
+    /// `{"b64": ""}` in 711 of 711 captured bodies — nothing to read.
     #[allow(dead_code)]
     current_state: Option<Value>,
     #[serde(default)]
@@ -303,28 +369,8 @@ pub async fn update_abyss(
 
             let tracker = InventoryChangeTracker::default();
 
-            // Advance floor: mark current floor completed, move to next.
             if let Some(run) = entry.server_state.0.abyss.as_mut() {
-                // Count enemy_killed actions that advance the floor.
-                let enemy_killed_count = body.actions.iter().filter(|a| {
-                    matches!(a, AbyssUpdateAction::EnemyKilled(_))
-                }).count();
-
-                // Mark the current floor completed when any enemy-killed action arrives
-                // (the client sends one action per enemy; the floor completes when all die).
-                // Lenient: we advance on ANY enemy_killed — avoids stalling on sparse captures.
-                if enemy_killed_count > 0 {
-                    if let Some(slice) = run.slices.get_mut(run.current_floor_index) {
-                        slice.enemy_killed = true;
-                        slice.completed = true;
-                    }
-                    // Score: 1 point per enemy killed
-                    run.score += enemy_killed_count as f64;
-                    // Advance floor pointer
-                    if run.current_floor_index + 1 < run.slices.len() {
-                        run.current_floor_index += 1;
-                    }
-                }
+                apply_actions(&app_state.static_data.abyss, run, &body.actions);
 
                 let revive_count = run.revive_count;
                 let future_rewards = build_future_rewards(&app_state);
@@ -397,14 +443,10 @@ pub async fn end_abyss(
     let mut conn = app_state.db_pool.get().await.unwrap();
 
     conn.transaction(|mut conn| {
+        let app_state = app_state.clone();
         async move {
             let mut entry =
                 load_economy_for_update(&mut conn, &session.session, character_id).await?;
-
-            // Determine floors completed. Lenient: if no active run, grant nothing.
-            let floors_completed = entry.server_state.0.abyss.as_ref()
-                .map(|r| r.slices.iter().filter(|s| s.completed).count())
-                .unwrap_or(0);
 
             // Update maximumAbyssLevelReached (the floorIndex = slice_index+1 of the last
             // completed slice; prod captures show it equals the highest floorIndex reached).
@@ -418,8 +460,13 @@ pub async fn end_abyss(
             }
             entry.character.0.version += 1;
 
-            // Scale rewards: gold + XP proportional to floors reached.
-            let reward = scale_reward(floors_completed as u32);
+            // Sum the per-floor base rewards, each scaled by how far that floor's
+            // difficulty sat above the level the run started at. Lenient: no active run
+            // → no reward.
+            let reward = match entry.server_state.0.abyss.as_ref() {
+                Some(run) => end_run_reward(&app_state.static_data.abyss, run),
+                None => RewardGrant::default(),
+            };
 
             let mut tracker = InventoryChangeTracker::default();
             apply_reward(
@@ -756,26 +803,131 @@ fn build_generated_data(
     )
 }
 
-/// Floor-scaled reward for `/end`. Assumption (prod not fully captured):
-///   gold = 50 * floors_completed
-///   xp   = 10 * floors_completed
-/// Both are plausible lower bounds; the captured first-end response showed
-/// 2923 gold / 958 XP for ~15 floors.
-fn scale_reward(floors_completed: u32) -> RewardGrant {
+/// Apply one `/update` body's actions to the run, in the order the client sent them.
+///
+/// Order matters: a body can carry the last kill of a floor AND that floor's
+/// `abyss_slice_completed`, and the kill has to be credited to the floor the player was
+/// still standing on when it happened.
+fn apply_actions(
+    static_abyss: &blades_lib::static_data::AbyssStaticData,
+    run: &mut AbyssRun,
+    actions: &[AbyssUpdateAction],
+) {
+    for action in actions {
+        match action {
+            AbyssUpdateAction::EnemyKilled(_) => {
+                let slice = run.slices.get(run.current_floor_index);
+                run.score += kills_score(static_abyss, slice, run.initial_player_level, 1);
+                // The kill gate for the end-of-run reward.
+                if let Some(slice) = run.slices.get_mut(run.current_floor_index) {
+                    slice.enemy_killed = true;
+                }
+            }
+            AbyssUpdateAction::AbyssSliceCompleted(_) => {
+                // THE floor-advance signal — retail advances on this action, full stop.
+                // This handler used to advance on any `enemy_killed` instead, because
+                // `abyss_slice_completed` was one of the five action types that fell into
+                // the enum's `Unknown` arm and were dropped. That approximation completed
+                // a floor on its FIRST kill, so a floor the player abandoned halfway
+                // still counted as cleared and still paid out.
+                if let Some(slice) = run.slices.get_mut(run.current_floor_index) {
+                    slice.completed = true;
+                }
+                if run.current_floor_index + 1 < run.slices.len() {
+                    run.current_floor_index += 1;
+                }
+            }
+            AbyssUpdateAction::Revive(_) => {
+                run.revive_count += 1;
+            }
+            // Parsed, named, and deliberately not acted on yet — see the enum's doc.
+            AbyssUpdateAction::CombatCompleted(_)
+            | AbyssUpdateAction::EnemyLootCollected(_)
+            | AbyssUpdateAction::ItemConsumed(_)
+            | AbyssUpdateAction::Unknown => {}
+        }
+    }
+}
+
+/// The `killScoreMultiplier` used when the server cannot identify the enemy variant.
+///
+/// Every enemy carries one in the game data (`enemies.json` `variants[*].stats
+/// .killScoreMultiplier`: 0.33 on 22 critter variants, 1.0 on 559, 2.0 on 50 bosses).
+/// The server cannot read it: `deploy/static/parsed.json` keeps only `{"quantity": N}`
+/// for all 1,956 enemy spawn groups — the extractor was narrowed on the enemy path
+/// specifically (item spawn groups in the same file keep their full structure). With no
+/// variant id anywhere in the request or in the generated data, there is nothing to look
+/// the multiplier up by, so every kill scores as a normal enemy. Restoring the variant
+/// to `parsed.json` is a separate extraction job; when it lands, multiply here.
+const FALLBACK_KILL_SCORE_MULTIPLIER: f64 = 1.0;
+
+/// Score for `count` kills on `slice`, for a run started at `initial_player_level`.
+///
+/// The enemy level is the slice's own `difficulty_level` — the value the server itself
+/// wrote into that floor's generated data, so it is authoritative and not client input.
+/// With no slice (a run whose floor pointer is past the end) nothing scores.
+fn kills_score(
+    static_abyss: &blades_lib::static_data::AbyssStaticData,
+    slice: Option<&AbyssSliceEntry>,
+    initial_player_level: u32,
+    count: usize,
+) -> f64 {
+    let Some(slice) = slice else { return 0.0 };
+    let level_delta = slice.difficulty_level as i32 - initial_player_level as i32;
+    let per_kill = static_abyss.kill_score(level_delta) as f64;
+    FALLBACK_KILL_SCORE_MULTIPLIER * per_kill * count as f64
+}
+
+/// Which floors of a finished run pay out.
+///
+/// A floor must be completed AND have had a kill on it: `dump.cs` tracks
+/// `DATA_HAS_GOTTEN_KILL_SINCE_FLOOR_CHANGE` and collects `_floorsWithNoRewards`. The
+/// gate is load-bearing, not defensive — it turns four apparently anomalous captured
+/// `/end` payouts into exact fits. One run completed five floors but spent 79 seconds on
+/// floor 147 with zero actions; dropping that floor reproduces the observed reward
+/// exactly. Another, whose only completed floor had no kill, paid no gold and no XP.
+fn rewarded_floors(run: &AbyssRun) -> impl Iterator<Item = &AbyssSliceEntry> {
+    run.slices.iter().filter(|s| s.completed && s.enemy_killed)
+}
+
+/// The `/end` reward: `Σ over rewarded floors of baseReward(floorIndex) * multiplier(offset)`,
+/// `offset = thatSlice'sDifficultyLevel - initialPlayerLevel`.
+///
+/// Both halves come from `AbyssScaling` (see `deploy/static/abyss.json`). The offset uses
+/// the slice's own generated difficulty, NOT its floor index: the two diverge as soon as
+/// a run starts below the player's level (a captured run at `initialPlayerLevel` 4
+/// carried difficulties 1,2,3,4,6,8,10,14,18 on floors 1–9). The summed float is rounded
+/// half-up — several captured runs land exactly on `.5`, so the rounding mode is
+/// observable and this is the observed one.
+fn end_run_reward(
+    static_abyss: &blades_lib::static_data::AbyssStaticData,
+    run: &AbyssRun,
+) -> RewardGrant {
     use std::collections::HashMap;
 
-    if floors_completed == 0 {
+    let mut gold = 0.0f64;
+    let mut xp = 0.0f64;
+    for slice in rewarded_floors(run) {
+        let (base_gold, base_xp) = static_abyss.base_rewards_for_floor(slice.floor_index);
+        let offset = slice.difficulty_level as i32 - run.initial_player_level as i32;
+        let (gold_mult, xp_mult) = static_abyss.multiplier_for_offset(offset);
+        gold += base_gold as f64 * gold_mult;
+        xp += base_xp as f64 * xp_mult;
+    }
+
+    let gold = gold.round().max(0.0) as u64;
+    let xp = xp.round().max(0.0) as u64;
+    if gold == 0 && xp == 0 {
         return RewardGrant::default();
     }
 
     let gold_uuid = Uuid::parse_str(GOLD_CURRENCY_UUID).unwrap();
-    let gold = (floors_completed as u64) * 195; // ~2923 / 15
-    let xp = (floors_completed as u64) * 64;    // ~958 / 15
-
     RewardGrant {
         currencies: {
             let mut m = HashMap::new();
-            m.insert(gold_uuid, gold);
+            if gold > 0 {
+                m.insert(gold_uuid, gold);
+            }
             m
         },
         character_xp: xp,
@@ -998,32 +1150,567 @@ mod tests {
         assert_eq!(top[0].slice_index, 149);
     }
 
-    #[test]
-    fn scale_reward_zero_floors() {
-        let r = scale_reward(0);
-        assert!(r.is_empty(), "zero floors → no reward");
+    // ────────────────────────────────────────────────────────────────────────
+    // Scoring + reward scaling — against the REAL shipped tables
+    //
+    // Every test below reads `deploy/static/abyss.json`, the same file the server
+    // loads, so it pins the DATA as well as the code. Fixtures that restate the
+    // implementation's own assumption have shipped green against broken code in this
+    // repo three times; the anchors here are captured `/end` totals, which neither half
+    // of the model was fitted to.
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// The real `deploy/static/abyss.json`, deserialized exactly as the server does.
+    fn real_static_abyss() -> AbyssStaticData {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../deploy/static/abyss.json");
+        let raw = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+        serde_json::from_str(&raw).expect("valid abyss.json")
     }
 
-    #[test]
-    fn scale_reward_15_floors() {
-        let r = scale_reward(15);
-        let gold = Uuid::parse_str(GOLD_CURRENCY_UUID).unwrap();
-        assert!(r.currencies.contains_key(&gold), "gold reward present");
-        assert!(*r.currencies.get(&gold).unwrap() > 0);
-        assert!(r.character_xp > 0);
+    fn gold_uuid() -> Uuid {
+        Uuid::parse_str(GOLD_CURRENCY_UUID).unwrap()
     }
 
+    /// Build a run from explicit `(floor_index, difficulty_level)` pairs, every floor
+    /// completed with a kill. The difficulties come from the captures, not from our own
+    /// generator — a fixture that fed its own slice-picking back in would prove nothing
+    /// about the reward model.
+    fn run_from(floors: &[(u32, u32)], initial_player_level: u32) -> AbyssRun {
+        let slices = floors
+            .iter()
+            .map(|&(floor_index, difficulty_level)| AbyssSliceEntry {
+                dungeon_settings_id: Uuid::nil(),
+                difficulty_level,
+                hardcore: false,
+                slice_index: floor_index.saturating_sub(1),
+                floor_index,
+                completed: true,
+                enemy_killed: true,
+            })
+            .collect::<Vec<_>>();
+        let n = slices.len();
+        AbyssRun {
+            slices,
+            revive_count: 0,
+            initial_player_level,
+            seed: 1,
+            score: 0.0,
+            algorithm_version: 1,
+            version: 1,
+            current_floor_index: n,
+        }
+    }
+
+    /// The per-floor base-reward table is the extracted one, not the old flat guess.
+    ///
+    /// `perFloorData[i] = (10 + 8i, 10 + 2i)` where `i` is the wire `floorIndex`. Five
+    /// SINGLE-floor captured `/end` responses pin five separate rows exactly — a
+    /// single-floor run has no summation to hide an error in, so each is a direct read
+    /// of one row (the ×6 ones divided by the plateau multiplier).
     #[test]
-    fn scale_reward_scales_linearly() {
-        let r10 = scale_reward(10);
-        let r20 = scale_reward(20);
-        let gold = Uuid::parse_str(GOLD_CURRENCY_UUID).unwrap();
-        assert_eq!(
-            r20.currencies[&gold],
-            r10.currencies[&gold] * 2,
-            "gold scales linearly"
+    fn per_floor_base_rewards_are_the_extracted_table() {
+        let sd = real_static_abyss();
+        assert_eq!(sd.per_floor_rewards.entries.len(), 150, "150 rows, indices 0–149");
+
+        // The five single-floor captures, as base rewards (observed payout / multiplier).
+        for (floor_index, gold, xp) in [
+            (49u32, 402u64, 108u64),   // observed 402 / 108 at ×1
+            (90, 730, 190),            // observed 4380 / 1140 at ×6
+            (118, 954, 246),           // observed 5724 / 1476 at ×6, 3 runs
+            (147, 1186, 304),          // observed 7116 / 1824 at ×6
+            (149, 1202, 308),          // observed 7212 / 1848 at ×6, 3 runs
+        ] {
+            assert_eq!(
+                sd.base_rewards_for_floor(floor_index),
+                (gold, xp),
+                "floorIndex {floor_index}"
+            );
+        }
+
+        // The whole table is linear, and it is NOT the off-by-one variant (8i+2 / 2i+8)
+        // that an earlier reading of the asset produced: that gives 394 for floorIndex
+        // 49 where the capture says 402.
+        for i in 0..150u32 {
+            assert_eq!(
+                sd.base_rewards_for_floor(i),
+                (10 + 8 * i as u64, 10 + 2 * i as u64),
+                "row {i}"
+            );
+        }
+        assert_ne!(sd.base_rewards_for_floor(49), (394, 106), "not the off-by-one ramp");
+
+        // The old model claimed a flat 195 gold / 64 XP on EVERY floor.
+        assert_ne!(sd.base_rewards_for_floor(1), (195, 64));
+        // Past the last row the last row repeats rather than falling off to zero.
+        assert_eq!(sd.base_rewards_for_floor(150), (1202, 308));
+        assert_eq!(sd.base_rewards_for_floor(9_999), (1202, 308));
+    }
+
+    /// The scaling curve is the 6 measured breakpoints. Below offset 0 the multiplier is
+    /// 1.0 — the bare base reward — and above offset 14 it plateaus at ×6.
+    #[test]
+    fn scaling_curve_breakpoints_floor_at_one_and_plateau() {
+        let sd = real_static_abyss();
+        for (offset, expected) in [
+            (0, 1.25),
+            (1, 1.25),
+            (2, 2.0),
+            (3, 2.0),
+            (4, 3.0),
+            (5, 3.0),
+            (6, 4.0),
+            (9, 4.0),
+            (10, 5.0),
+            (13, 5.0),
+            (14, 6.0),
+        ] {
+            let (g, x) = sd.multiplier_for_offset(offset);
+            assert_eq!(g, expected, "offset {offset} gold multiplier");
+            assert_eq!(x, expected, "offset {offset} xp multiplier — gold and xp are equal");
+        }
+        // Below offset 0: 1.0. Not a 0.5 penalty (the invented `{-5, 0.5, 0.5}` row this
+        // file used to carry) and not a clamp up to the offset-0 row's ×1.25.
+        for offset in [-1, -5, -10, -24, -99] {
+            assert_eq!(
+                sd.multiplier_for_offset(offset),
+                (1.0, 1.0),
+                "offset {offset} gets the unmultiplied base"
+            );
+        }
+        // Above the last breakpoint: plateau, not extrapolation.
+        for offset in [15, 18, 40, 99, 400] {
+            assert_eq!(sd.multiplier_for_offset(offset), (6.0, 6.0), "offset {offset} plateaus");
+        }
+    }
+
+    /// THE IDENTITY CHECKS. These are the tests that prove the reward MODEL rather than
+    /// restating the implementation, so they are spelled out.
+    ///
+    /// Each case is a real retail `/end` capture: the run's floor indices, the slices'
+    /// generated difficulty levels and the run's `initialPlayerLevel` are the observed
+    /// inputs, and the assertion is the observed payout. Nothing in the model was fitted
+    /// to any of them — the per-floor rows and the curve were read out of `AbyssScaling`,
+    /// and the fits are exact to the unit, not approximate.
+    ///
+    /// Contrast the model this replaces: `floors * 195` gold was obtained by dividing
+    /// case A's own total by an assumed floor count, so it had zero degrees of freedom
+    /// and its agreement with case A was arithmetic, not evidence. It also has no term
+    /// for `initialPlayerLevel` or slice difficulty at all, so it cannot fit cases A and
+    /// B simultaneously.
+    ///
+    /// Case A, floor by floor (base = 10+8i / 10+2i, offset = difficulty - 10):
+    ///   floors 1-9   offsets -9..-1 → ×1.00 · gold 450 = 450.0,  xp 180 = 180.0
+    ///   floor 10     offset  0      → ×1.25 · gold  90 = 112.5,  xp  30 =  37.5
+    ///   floor 11     offset  2      → ×2.00 · gold  98 = 196.0,  xp  32 =  64.0
+    ///   floor 12     offset  4      → ×3.00 · gold 106 = 318.0,  xp  34 = 102.0
+    ///   floor 13     offset  6      → ×4.00 · gold 114 = 456.0,  xp  36 = 144.0
+    ///   floor 14     offset 10      → ×5.00 · gold 122 = 610.0,  xp  38 = 190.0
+    ///   floor 15     offset 14      → ×6.00 · gold 130 = 780.0,  xp  40 = 240.0
+    ///                                          total  = 2922.5 → 2923,      957.5 → 958
+    #[test]
+    fn end_reward_reproduces_the_captured_runs_exactly() {
+        let sd = real_static_abyss();
+
+        // Case A — 15 floors, initialPlayerLevel 10, character level 7→8.
+        let a = run_from(
+            &[
+                (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8),
+                (9, 9), (10, 10), (11, 12), (12, 14), (13, 16), (14, 20), (15, 24),
+            ],
+            10,
         );
-        assert_eq!(r20.character_xp, r10.character_xp * 2, "xp scales linearly");
+        let ra = end_run_reward(&sd, &a);
+        assert_eq!(ra.currencies[&gold_uuid()], 2923, "case A gold");
+        assert_eq!(ra.character_xp, 958, "case A XP");
+
+        // Case B — 8 floors, initialPlayerLevel 4. The slice difficulties (1,2,3,4,6,8,
+        // 10,14) are NOT the floor indices, so this case fails for any model that keys
+        // the multiplier on depth alone.
+        let b = run_from(
+            &[(1, 1), (2, 2), (3, 3), (4, 4), (5, 6), (6, 8), (7, 10), (8, 14)],
+            4,
+        );
+        let rb = end_run_reward(&sd, &b);
+        assert_eq!(rb.currencies[&gold_uuid()], 1039, "case B gold");
+        assert_eq!(rb.character_xp, 397, "case B XP");
+
+        // Case C — one floor, index 49, at initialPlayerLevel 59. Offset -10, so the
+        // bare base reward. This is the case that rules out a 1.25 floor on the curve:
+        // 402 × 1.25 = 502.5, which is not what retail paid.
+        let c = run_from(&[(49, 49)], 59);
+        let rc = end_run_reward(&sd, &c);
+        assert_eq!(rc.currencies[&gold_uuid()], 402, "case C gold — unmultiplied");
+        assert_eq!(rc.character_xp, 108, "case C XP — unmultiplied");
+
+        // Case D — one floor, index 149, deep enough to plateau at ×6.
+        let d = run_from(&[(149, 200)], 1);
+        let rd = end_run_reward(&sd, &d);
+        assert_eq!(rd.currencies[&gold_uuid()], 7212, "case D gold");
+        assert_eq!(rd.character_xp, 1848, "case D XP");
+    }
+
+    /// Both identity cases land on exactly `.5` before rounding, so the rounding mode is
+    /// observable: retail rounds HALF-UP. Pinned separately from the totals so a change
+    /// of rounding mode names itself instead of showing up as a one-gold mystery.
+    #[test]
+    fn fractional_totals_round_half_up() {
+        let sd = real_static_abyss();
+        // A single floor at ×1.25 on an even base gives a .5 total: 10+8·1 = 18 → 22.5.
+        let run = run_from(&[(1, 10)], 10);
+        assert_eq!(sd.multiplier_for_offset(0), (1.25, 1.25));
+        assert_eq!(sd.base_rewards_for_floor(1), (18, 12));
+        let r = end_run_reward(&sd, &run);
+        assert_eq!(r.currencies[&gold_uuid()], 23, "22.5 rounds up to 23, not down to 22");
+        assert_eq!(r.character_xp, 15, "15.0 exactly");
+    }
+
+    /// The reward depends on how far the slices sat above the level you started at, not
+    /// only on how deep you went. The model this replaces was a function of floor count
+    /// alone, so it cannot express this at all.
+    #[test]
+    fn end_reward_depends_on_initial_player_level_not_just_depth() {
+        let sd = real_static_abyss();
+        let floors: Vec<(u32, u32)> = (1..=15).map(|f| (f, f)).collect();
+        let low = end_run_reward(&sd, &run_from(&floors, 1));
+        let high = end_run_reward(&sd, &run_from(&floors, 60));
+        assert!(
+            low.currencies[&gold_uuid()] > high.currencies[&gold_uuid()],
+            "the same 15 floors pay MORE to a run started at level 1 than at level 60: \
+             {} vs {}",
+            low.currencies[&gold_uuid()],
+            high.currencies[&gold_uuid()]
+        );
+        // The level-60 run is entirely below offset 0 → every floor pays its bare base.
+        let base_gold: u64 = floors.iter().map(|&(f, _)| sd.base_rewards_for_floor(f).0).sum();
+        assert_eq!(high.currencies[&gold_uuid()], base_gold);
+    }
+
+    /// A floor cleared with NO kill pays nothing (`_floorsWithNoRewards`). Measured: a
+    /// captured run whose only completed floor had no kill returned no gold and no XP.
+    #[test]
+    fn a_floor_cleared_without_a_kill_pays_nothing() {
+        let sd = real_static_abyss();
+        let floors: Vec<(u32, u32)> = vec![
+            (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8),
+            (9, 9), (10, 10), (11, 12), (12, 14), (13, 16), (14, 20), (15, 24),
+        ];
+        let full_reward = end_run_reward(&sd, &run_from(&floors, 10));
+
+        // Same run, but the deepest floor was walked through without a kill. Floor 15
+        // was worth 130 × 6 = 780 gold and 40 × 6 = 240 XP.
+        let mut no_kill = run_from(&floors, 10);
+        no_kill.slices[14].enemy_killed = false;
+        let no_kill_reward = end_run_reward(&sd, &no_kill);
+        assert_eq!(
+            full_reward.currencies[&gold_uuid()] - no_kill_reward.currencies[&gold_uuid()],
+            780,
+            "the kill-less floor's 780 gold is withheld"
+        );
+        assert_eq!(full_reward.character_xp - no_kill_reward.character_xp, 240);
+
+        // A run whose only completed floor had no kill pays nothing at all.
+        let mut only_floor = run_from(&[(49, 49)], 59);
+        only_floor.slices[0].enemy_killed = false;
+        assert!(end_run_reward(&sd, &only_floor).is_empty(), "no kill → no reward");
+
+        // Neither does a floor that had a kill but was never completed.
+        let mut incomplete = run_from(&[(49, 49)], 59);
+        incomplete.slices[0].completed = false;
+        assert!(end_run_reward(&sd, &incomplete).is_empty(), "not completed → no reward");
+    }
+
+    /// An empty run pays nothing (unchanged behaviour, kept pinned).
+    #[test]
+    fn end_reward_zero_floors() {
+        let sd = real_static_abyss();
+        assert!(end_run_reward(&sd, &run_from(&[], 25)).is_empty(), "no floors → no reward");
+    }
+
+    /// A same-level kill scores 10, not 1. The handler used to add a flat
+    /// `enemy_killed_count as f64`, so this is 10x its old value.
+    #[test]
+    fn a_same_level_kill_scores_ten_not_one() {
+        let sd = real_static_abyss();
+        assert_eq!(sd.kill_score(0), 10, "sameLevelKillScore");
+
+        let slice = AbyssSliceEntry {
+            dungeon_settings_id: Uuid::nil(),
+            difficulty_level: 40,
+            hardcore: false,
+            slice_index: 0,
+            floor_index: 1,
+            completed: false,
+            enemy_killed: false,
+        };
+        // One kill on a floor whose difficulty equals the run's starting level.
+        assert_eq!(kills_score(&sd, Some(&slice), 40, 1), 10.0);
+        // Three kills → 30, where the old code gave 3.
+        assert_eq!(kills_score(&sd, Some(&slice), 40, 3), 30.0);
+        assert_eq!(kills_score(&sd, None, 40, 3), 0.0, "no slice → no score");
+    }
+
+    /// The kill-score tables are level-scaled in both directions and flat-tailed.
+    /// The index alignment asserted here is backed by wire evidence — see
+    /// `kill_score_alignment_matches_the_captured_score` below.
+    #[test]
+    fn kill_score_scales_with_level_delta() {
+        let sd = real_static_abyss();
+        assert_eq!(sd.kill_scores.under_leveled_kill_score.len(), 100);
+        assert_eq!(sd.kill_scores.over_leveled_kill_score.len(), 60);
+
+        // Under-levelled player (enemy above you): the ramp above 10.
+        assert_eq!(sd.kill_score(1), 12);
+        assert_eq!(sd.kill_score(2), 15);
+        assert_eq!(sd.kill_score(3), 19);
+        assert_eq!(sd.kill_score(4), 24);
+        assert_eq!(sd.kill_score(5), 30);
+        assert_eq!(sd.kill_score(6), 40);
+        // Over-levelled player (enemy below you): the ramp below 10.
+        assert_eq!(sd.kill_score(-1), 10);
+        assert_eq!(sd.kill_score(-2), 8);
+        assert_eq!(sd.kill_score(-3), 5);
+        assert_eq!(sd.kill_score(-6), 2);
+        // Past either table, the last entry repeats — never 0, never a panic.
+        assert_eq!(sd.kill_score(400), *sd.kill_scores.under_leveled_kill_score.last().unwrap());
+        assert_eq!(sd.kill_score(-400), *sd.kill_scores.over_leveled_kill_score.last().unwrap());
+        assert_eq!(sd.kill_score(-400), 1);
+    }
+
+    /// The evidence for the index alignment, written down as an assertion.
+    ///
+    /// A captured floor-43 run at `initialPlayerLevel` 45 (`levelDelta` -2) reported a
+    /// score of 16.0. Under this alignment `over[1] = 8`, and 16 = 8 × 2 with a boss's
+    /// `killScoreMultiplier`. The obvious alternative alignment — `over[-delta]`, i.e.
+    /// `over[2] = 5` — cannot reach 16 under ANY of the three multipliers the game data
+    /// uses (0.33 / 1.0 / 2.0), which is what makes the observation discriminating rather
+    /// than merely consistent.
+    #[test]
+    fn kill_score_alignment_matches_the_captured_score() {
+        let sd = real_static_abyss();
+        let chosen = sd.kill_score(-2);
+        assert_eq!(chosen, 8, "over[-delta-1] = over[1]");
+        assert!(
+            [0.33f64, 1.0, 2.0].iter().any(|m| (chosen as f64 * m - 16.0).abs() < 1e-9),
+            "the chosen alignment reaches the observed 16.0"
+        );
+        let alternative = sd.kill_scores.over_leveled_kill_score[2];
+        assert_eq!(alternative, 5, "the alternative alignment would read over[2]");
+        assert!(
+            ![0.33f64, 1.0, 2.0].iter().any(|m| (alternative as f64 * m - 16.0).abs() < 1e-9),
+            "and the alternative cannot reach 16.0 under any killScoreMultiplier — \
+             which is why the capture discriminates between them"
+        );
+    }
+
+    /// `_slicesCountAbovePlayerLevel` is 20. The file shipped 2 — wrong by 10x — and the
+    /// Rust default is 20 too, so a stale data file cannot quietly restore the old value.
+    #[test]
+    fn slices_count_above_player_level_is_twenty() {
+        assert_eq!(real_static_abyss().scaling_backend.slices_count_above_player_level, 20);
+        assert_eq!(
+            AbyssStaticData::default().scaling_backend.slices_count_above_player_level,
+            20,
+            "the built-in default must not be the old 2 either"
+        );
+    }
+
+    /// `deploy/static/` is a bind-mounted data directory: merging this repo ships CODE
+    /// but not DATA, so between the merge and `deploy/arena.sh static` the server runs
+    /// new code against the OLD `abyss.json`. Prove that window pays the same rewards
+    /// rather than zero, by running the model against static data with no tables at all.
+    #[test]
+    fn the_built_in_fallback_matches_the_shipped_tables() {
+        let real = real_static_abyss();
+        let mut bare = real.clone();
+        bare.per_floor_rewards = Default::default();
+        bare.scaling_curve = Default::default();
+        bare.kill_scores = Default::default();
+
+        for floor in 0..=150u32 {
+            assert_eq!(
+                bare.base_rewards_for_floor(floor),
+                real.base_rewards_for_floor(floor),
+                "floor {floor} base reward"
+            );
+        }
+        for offset in -30..=40 {
+            assert_eq!(
+                bare.multiplier_for_offset(offset),
+                real.multiplier_for_offset(offset),
+                "offset {offset} multiplier"
+            );
+        }
+        for delta in -120..=120 {
+            assert_eq!(bare.kill_score(delta), real.kill_score(delta), "delta {delta}");
+        }
+
+        // And the identity case still lands on the captured total with no data at all.
+        let run = run_from(
+            &[
+                (1, 1), (2, 2), (3, 3), (4, 4), (5, 5), (6, 6), (7, 7), (8, 8),
+                (9, 9), (10, 10), (11, 12), (12, 14), (13, 16), (14, 20), (15, 24),
+            ],
+            10,
+        );
+        assert_eq!(
+            end_run_reward(&bare, &run).currencies[&gold_uuid()],
+            2923,
+            "an un-deployed abyss.json must not zero out the reward"
+        );
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // /update action handling
+    // ────────────────────────────────────────────────────────────────────────
+
+    /// All six real action types parse into their own arm. Five of them used to fall
+    /// into `Unknown` and be dropped — `abyss_slice_completed`, the floor-advance
+    /// signal, among them.
+    #[test]
+    fn all_six_client_actions_parse_into_their_own_arm() {
+        let body = serde_json::json!({
+            "currentState": {"b64": ""},
+            "actions": [
+                {"type": "enemy_killed", "spawnGroupId": Uuid::nil(), "spawnerIndex": 0,
+                 "enemyIndex": 0, "xpReward": 12.0, "time": 1},
+                {"type": "combat_completed", "items": [{"id": Uuid::nil(), "durability": 90}],
+                 "time": 2},
+                {"type": "enemy_loot_collected", "spawnGroupId": Uuid::nil(),
+                 "spawnerIndex": 0, "enemyIndex": 0, "loot": {"currencies": {}}, "time": 3},
+                {"type": "item_consumed", "itemTemplateId": Uuid::nil(), "time": 4},
+                {"type": "abyss_slice_completed", "time": 5},
+                {"type": "revive", "gemsPayment": 20, "time": 6},
+            ]
+        });
+        let req: UpdateAbyssRequest = serde_json::from_value(body).expect("parses");
+        assert_eq!(req.actions.len(), 6);
+        assert!(matches!(req.actions[0], AbyssUpdateAction::EnemyKilled(_)));
+        assert!(matches!(req.actions[1], AbyssUpdateAction::CombatCompleted(_)));
+        assert!(matches!(req.actions[2], AbyssUpdateAction::EnemyLootCollected(_)));
+        assert!(matches!(req.actions[3], AbyssUpdateAction::ItemConsumed(_)));
+        assert!(matches!(req.actions[4], AbyssUpdateAction::AbyssSliceCompleted(_)));
+        assert!(matches!(req.actions[5], AbyssUpdateAction::Revive(_)));
+        assert!(
+            !req.actions.iter().any(|a| matches!(a, AbyssUpdateAction::Unknown)),
+            "no real action may land in Unknown"
+        );
+        // An action type we have never seen still parses rather than 400-ing the body.
+        let odd: UpdateAbyssRequest =
+            serde_json::from_value(serde_json::json!({"actions": [{"type": "who_knows"}]}))
+                .expect("unknown types stay lenient");
+        assert!(matches!(odd.actions[0], AbyssUpdateAction::Unknown));
+    }
+
+    fn parse_actions(v: serde_json::Value) -> Vec<AbyssUpdateAction> {
+        serde_json::from_value::<UpdateAbyssRequest>(serde_json::json!({"actions": v}))
+            .expect("parses")
+            .actions
+    }
+
+    fn kill(time: u64) -> serde_json::Value {
+        serde_json::json!({"type": "enemy_killed", "spawnGroupId": Uuid::nil(),
+                           "spawnerIndex": 0, "enemyIndex": 0, "xpReward": 0.0, "time": time})
+    }
+
+    /// A kill alone must NOT complete or advance a floor; only
+    /// `abyss_slice_completed` does. The old handler completed and advanced on the first
+    /// kill, so a player who killed one enemy and quit banked the whole floor.
+    #[test]
+    fn only_abyss_slice_completed_advances_the_floor() {
+        let sd = real_static_abyss();
+        let mut run = run_from(&[(1, 10), (2, 12), (3, 14)], 10);
+        for s in run.slices.iter_mut() {
+            s.completed = false;
+            s.enemy_killed = false;
+        }
+        run.current_floor_index = 0;
+
+        apply_actions(&sd, &mut run, &parse_actions(serde_json::json!([kill(1), kill(2)])));
+        assert!(run.slices[0].enemy_killed, "the kills are recorded");
+        assert!(!run.slices[0].completed, "but two kills do not clear the floor");
+        assert_eq!(run.current_floor_index, 0, "and do not advance it");
+        assert!(
+            end_run_reward(&sd, &run).is_empty(),
+            "an un-completed floor pays nothing"
+        );
+
+        apply_actions(
+            &sd,
+            &mut run,
+            &parse_actions(serde_json::json!([{"type": "abyss_slice_completed", "time": 3}])),
+        );
+        assert!(run.slices[0].completed, "the slice-completed action clears it");
+        assert_eq!(run.current_floor_index, 1, "and advances to the next floor");
+        assert_eq!(
+            end_run_reward(&sd, &run).currencies[&gold_uuid()],
+            23,
+            "floor 1 at offset 0: 18 × 1.25 = 22.5 → 23"
+        );
+    }
+
+    /// A body carrying a floor's last kill AND its `abyss_slice_completed` credits the
+    /// kill to the floor the player was on, not to the next one.
+    #[test]
+    fn a_kill_in_the_same_body_as_the_completion_credits_the_old_floor() {
+        let sd = real_static_abyss();
+        // Floor 1 difficulty 10 (delta 0 → 10 points), floor 2 difficulty 16 (delta 6 →
+        // 40 points). Crediting the kill to the wrong floor would score 40, not 10.
+        let mut run = run_from(&[(1, 10), (2, 16)], 10);
+        for s in run.slices.iter_mut() {
+            s.completed = false;
+            s.enemy_killed = false;
+        }
+        run.current_floor_index = 0;
+
+        apply_actions(
+            &sd,
+            &mut run,
+            &parse_actions(
+                serde_json::json!([kill(1), {"type": "abyss_slice_completed", "time": 2}]),
+            ),
+        );
+        assert_eq!(run.score, 10.0, "scored on floor 1's difficulty, not floor 2's");
+        assert!(run.slices[0].enemy_killed && run.slices[0].completed);
+        assert!(!run.slices[1].enemy_killed, "floor 2 got nothing");
+        assert_eq!(run.current_floor_index, 1);
+    }
+
+    /// `revive` increments the revive count. It used to be dropped, so `reviveCount` was
+    /// always 0 on the wire no matter how many gems the player spent.
+    #[test]
+    fn revive_actions_are_counted() {
+        let sd = real_static_abyss();
+        let mut run = run_from(&[(1, 10)], 10);
+        assert_eq!(run.revive_count, 0);
+        apply_actions(
+            &sd,
+            &mut run,
+            &parse_actions(serde_json::json!([
+                {"type": "revive", "gemsPayment": 20, "time": 1},
+                {"type": "revive", "gemsPayment": 40, "time": 2},
+            ])),
+        );
+        assert_eq!(run.revive_count, 2);
+    }
+
+    /// Score accrues at the table rate per kill, and it is the SERVER's slice difficulty
+    /// that sets the rate — not the client's `xpReward`, which is ignored.
+    #[test]
+    fn score_uses_server_side_difficulty_not_client_input() {
+        let sd = real_static_abyss();
+        let mut run = run_from(&[(1, 10)], 10);
+        run.slices[0].completed = false;
+        run.slices[0].enemy_killed = false;
+        run.current_floor_index = 0;
+
+        // A client claiming an enormous xpReward earns exactly the same 10 points.
+        let actions = parse_actions(serde_json::json!([
+            {"type": "enemy_killed", "spawnGroupId": Uuid::nil(), "spawnerIndex": 0,
+             "enemyIndex": 0, "xpReward": 999999.0, "time": 1},
+        ]));
+        apply_actions(&sd, &mut run, &actions);
+        assert_eq!(run.score, 10.0, "client-supplied xpReward must not reach the score");
     }
 
     #[test]

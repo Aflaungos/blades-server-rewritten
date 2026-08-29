@@ -266,14 +266,192 @@ pub struct AbyssStaticData {
     /// Every abyss dungeon-setting the client can render, keyed by its UUID.
     #[serde(default)]
     pub dungeon_pool: HashMap<Uuid, AbyssDungeonDef>,
-    /// Optional scaling tables (values authored/guessed). Carried verbatim so a
-    /// future reward-scaling pass can read them; unused by the current handler.
+    /// `AbyssScaling_Backend` scalars. Only `slices_count` and
+    /// `slices_count_above_player_level` are measured; the rest are still guessed.
     #[serde(default)]
-    pub scaling_backend: Value,
+    pub scaling_backend: AbyssScalingBackend,
+    /// `AbyssScaling._abyssScalingCurve` — the gold/XP bonus step curve.
     #[serde(default)]
-    pub scaling_curve: Value,
+    pub scaling_curve: AbyssScalingCurve,
+    /// `AbyssScaling._perFloorData` — the 150 per-floor base gold/XP rows.
     #[serde(default)]
-    pub per_floor_rewards: Value,
+    pub per_floor_rewards: AbyssPerFloorRewards,
+    /// `AbyssScaling._sameLevelKillScore` / `_underLeveledKillScore` /
+    /// `_overLeveledKillScore` — in-run score per kill.
+    #[serde(default)]
+    pub kill_scores: AbyssKillScores,
+}
+
+/// `AbyssScaling_Backend` scalars from `abyss.json`'s `scalingBackend`.
+///
+/// `slices_count_above_player_level` is `AbyssScaling._slicesCountAbovePlayerLevel`,
+/// measured from the APK at **20**. The file shipped `2` for months. The other three
+/// live in `AbyssScaling_Backend`, a server-only asset absent from the APK, and are
+/// still guesses — nothing in this crate reads them yet.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AbyssScalingBackend {
+    #[serde(default = "default_slices_count")]
+    pub slices_count: u32,
+    #[serde(default)]
+    pub max_difficulty: u32,
+    #[serde(default = "default_slices_above_player_level")]
+    pub slices_count_above_player_level: u32,
+    #[serde(default)]
+    pub hardcore_slice_difficulty_offset: i32,
+    #[serde(default)]
+    pub minimum_success_rating: f64,
+}
+
+fn default_slices_count() -> u32 {
+    150
+}
+
+/// The measured `_slicesCountAbovePlayerLevel`. Also the `Default`, so a stale
+/// `abyss.json` cannot silently reinstate the old `2`.
+fn default_slices_above_player_level() -> u32 {
+    20
+}
+
+impl Default for AbyssScalingBackend {
+    fn default() -> Self {
+        Self {
+            slices_count: default_slices_count(),
+            max_difficulty: 400,
+            slices_count_above_player_level: default_slices_above_player_level(),
+            hardcore_slice_difficulty_offset: 10,
+            minimum_success_rating: 0.0,
+        }
+    }
+}
+
+/// One `_abyssScalingCurve` breakpoint: at `difficulty_offset` and above (until the
+/// next breakpoint), rewards are multiplied by these. Gold and XP are always equal in
+/// the source data, but they are separate fields in the asset so they stay separate here.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AbyssScalingCurveEntry {
+    pub difficulty_offset: i32,
+    pub gold_bonus_multiplier: f64,
+    #[serde(rename = "xpBonusMultiplier")]
+    pub xp_bonus_multiplier: f64,
+}
+
+/// `AbyssScaling._abyssScalingCurve`, wrapped so the JSON can carry `_source`/`_note`
+/// siblings next to `entries`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AbyssScalingCurve {
+    #[serde(default)]
+    pub entries: Vec<AbyssScalingCurveEntry>,
+}
+
+/// One `_perFloorData` row: the base gold/XP for clearing the floor at wire index
+/// `floor`, before the scaling-curve multiplier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AbyssPerFloorReward {
+    pub floor: u32,
+    pub base_gold_reward: u64,
+    /// `baseXPReward` — the game's own capitalisation, which `rename_all = "camelCase"`
+    /// would mangle to `baseXpReward`.
+    #[serde(rename = "baseXPReward")]
+    pub base_xp_reward: u64,
+}
+
+/// `AbyssScaling._perFloorData` (150 rows, indices 0–149).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AbyssPerFloorRewards {
+    #[serde(default)]
+    pub entries: Vec<AbyssPerFloorReward>,
+}
+
+/// `AbyssScaling`'s three kill-score fields.
+///
+/// Values and list lengths are read from the APK. The index alignment
+/// (`levelDelta > 0 → under[delta-1]`, `levelDelta < 0 → over[-delta-1]`) is backed by
+/// wire evidence: a captured floor-43 run at `initialPlayerLevel` 45 (`levelDelta` -2)
+/// scored 16.0, which `over[1] = 8` reaches as `8 × 2` (a boss `killScoreMultiplier`)
+/// while `over[2] = 5` cannot reach under any of the 0.33 / 1.0 / 2.0 multipliers.
+/// See [`AbyssStaticData::kill_score`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AbyssKillScores {
+    #[serde(default)]
+    pub same_level_kill_score: i64,
+    #[serde(default)]
+    pub under_leveled_kill_score: Vec<i64>,
+    #[serde(default)]
+    pub over_leveled_kill_score: Vec<i64>,
+}
+
+// ── Built-in fallbacks ──────────────────────────────────────────────────────
+//
+// `deploy/static/` is a bind-mounted data directory on the box: merging this repo
+// ships CODE but not DATA. Without these, a code-only deploy would read an
+// `abyss.json` that has no `perFloorRewards.entries` and grant players ZERO gold and
+// ZERO XP for a completed run. The fallbacks reproduce the shipped table exactly (a
+// unit test asserts file == fallback across every floor, offset and level delta), so the
+// only difference between "data deployed" and "not yet" is where the numbers came from.
+
+/// `_perFloorData[i] = (10 + 8i, 10 + 2i)`, where `i` is the wire `floorIndex`. Exactly
+/// linear over all 150 rows, and confirmed to the unit against five single-floor retail
+/// `/end` captures (floorIndex 49 → 402/108, 90 → 730/190, 118 → 954/246, 147 →
+/// 1186/304, 149 → 1202/308, before the multiplier). The rows are the game data; this is
+/// the observation about them, used only when the file has no rows.
+fn fallback_base_rewards(floor_index: u32) -> (u64, u64) {
+    let i = floor_index.min(FALLBACK_LAST_FLOOR_INDEX) as u64;
+    (10 + 8 * i, 10 + 2 * i)
+}
+
+/// `_perFloorData` has 150 rows, indices 0–149; past the end the last row repeats.
+const FALLBACK_LAST_FLOOR_INDEX: u32 = 149;
+
+/// `_abyssScalingCurve` breakpoints: `(difficultyOffset, multiplier)`. Gold == XP.
+/// There is no negative-offset breakpoint — below offset 0 the multiplier is 1.0.
+const FALLBACK_CURVE: [(i32, f64); 6] = [
+    (0, 1.25),
+    (2, 2.0),
+    (4, 3.0),
+    (6, 4.0),
+    (10, 5.0),
+    (14, 6.0),
+];
+
+const FALLBACK_SAME_LEVEL_KILL_SCORE: i64 = 10;
+/// `_underLeveledKillScore` — 100 entries; the tail repeats the last value.
+const FALLBACK_UNDER_LEVELED_HEAD: [i64; 6] = [12, 15, 19, 24, 30, 40];
+const FALLBACK_UNDER_LEVELED_TAIL: i64 = 30;
+const FALLBACK_UNDER_LEVELED_LEN: usize = 100;
+/// `_overLeveledKillScore` — 60 entries; the tail repeats the last value.
+const FALLBACK_OVER_LEVELED_HEAD: [i64; 6] = [10, 8, 5, 4, 3, 2];
+const FALLBACK_OVER_LEVELED_TAIL: i64 = 1;
+const FALLBACK_OVER_LEVELED_LEN: usize = 60;
+
+/// The built-in `_underLeveledKillScore` list, materialised.
+pub fn fallback_under_leveled_kill_score() -> Vec<i64> {
+    let mut v = FALLBACK_UNDER_LEVELED_HEAD.to_vec();
+    v.resize(FALLBACK_UNDER_LEVELED_LEN, FALLBACK_UNDER_LEVELED_TAIL);
+    v
+}
+
+/// The built-in `_overLeveledKillScore` list, materialised.
+pub fn fallback_over_leveled_kill_score() -> Vec<i64> {
+    let mut v = FALLBACK_OVER_LEVELED_HEAD.to_vec();
+    v.resize(FALLBACK_OVER_LEVELED_LEN, FALLBACK_OVER_LEVELED_TAIL);
+    v
+}
+
+/// Index a kill-score list, repeating the last entry past its end (both lists end in a
+/// long flat tail, so a delta beyond the table keeps that tail's value rather than
+/// falling off to zero).
+fn kill_score_at(list: &[i64], index: usize, fallback: &[i64]) -> Option<i64> {
+    let list = if list.is_empty() { fallback } else { list };
+    if list.is_empty() {
+        return None;
+    }
+    Some(*list.get(index).unwrap_or_else(|| list.last().unwrap()))
 }
 
 impl AbyssStaticData {
@@ -309,6 +487,89 @@ impl AbyssStaticData {
         self.depth_bands
             .iter()
             .find(|b| floor >= b.floor_min && floor <= b.floor_max)
+    }
+
+    /// `(base_gold, base_xp)` for clearing the floor at wire `floor_index`, BEFORE the
+    /// scaling-curve multiplier (`AbyssScaling.GetBaseGoldAndXPRewards`).
+    ///
+    /// Exact row first; past the last row (index 149) the last row repeats. With no
+    /// table at all, [`fallback_base_rewards`].
+    pub fn base_rewards_for_floor(&self, floor_index: u32) -> (u64, u64) {
+        let rows = &self.per_floor_rewards.entries;
+        if rows.is_empty() {
+            return fallback_base_rewards(floor_index);
+        }
+        let row = rows
+            .iter()
+            .find(|r| r.floor == floor_index)
+            .or_else(|| rows.iter().max_by_key(|r| r.floor));
+        match row {
+            Some(r) => (r.base_gold_reward, r.base_xp_reward),
+            None => fallback_base_rewards(floor_index),
+        }
+    }
+
+    /// `(gold_multiplier, xp_multiplier)` for a `difficulty_offset`, which is the
+    /// SLICE'S generated `difficultyLevel` minus the run's `initialPlayerLevel` — not
+    /// the floor index minus it. The two diverge as soon as a run starts below the
+    /// player's level.
+    ///
+    /// A STEP function: the highest breakpoint whose offset is `<=` the argument. The
+    /// asset has no negative-offset breakpoint, so a negative offset matches nothing and
+    /// the multiplier is **1.0** — the unmultiplied base reward, measured (a single-floor
+    /// run on floor 49 at `initialPlayerLevel` 59, offset -10, paid exactly 402/108).
+    /// It is neither a penalty (the `{-5, 0.5, 0.5}` row this file used to carry was an
+    /// invention) nor a clamp up to the offset-0 row's ×1.25. Above the last breakpoint
+    /// the curve plateaus (×6).
+    pub fn multiplier_for_offset(&self, difficulty_offset: i32) -> (f64, f64) {
+        let entries = &self.scaling_curve.entries;
+        if entries.is_empty() {
+            let mut m = 1.0;
+            for (off, mult) in FALLBACK_CURVE {
+                if difficulty_offset >= off {
+                    m = mult;
+                }
+            }
+            return (m, m);
+        }
+        match entries
+            .iter()
+            .filter(|e| e.difficulty_offset <= difficulty_offset)
+            .max_by_key(|e| e.difficulty_offset)
+        {
+            Some(e) => (e.gold_bonus_multiplier, e.xp_bonus_multiplier),
+            // Below every breakpoint: no bonus, base reward only.
+            None => (1.0, 1.0),
+        }
+    }
+
+    /// The in-run score for ONE kill at `level_delta = enemyLevel - initialPlayerLevel`,
+    /// before the enemy's own `killScoreMultiplier` (`AbyssScaling.GetKillScore`).
+    /// Past the end of either list its last entry repeats. See [`AbyssKillScores`] for
+    /// the evidence behind the index alignment.
+    pub fn kill_score(&self, level_delta: i32) -> i64 {
+        let k = &self.kill_scores;
+        match level_delta.cmp(&0) {
+            std::cmp::Ordering::Equal => {
+                if k.same_level_kill_score != 0 {
+                    k.same_level_kill_score
+                } else {
+                    FALLBACK_SAME_LEVEL_KILL_SCORE
+                }
+            }
+            std::cmp::Ordering::Greater => kill_score_at(
+                &k.under_leveled_kill_score,
+                (level_delta - 1) as usize,
+                &fallback_under_leveled_kill_score(),
+            )
+            .unwrap_or(FALLBACK_SAME_LEVEL_KILL_SCORE),
+            std::cmp::Ordering::Less => kill_score_at(
+                &k.over_leveled_kill_score,
+                (-level_delta - 1) as usize,
+                &fallback_over_leveled_kill_score(),
+            )
+            .unwrap_or(FALLBACK_SAME_LEVEL_KILL_SCORE),
+        }
     }
 }
 
