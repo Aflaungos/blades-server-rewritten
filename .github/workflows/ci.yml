@@ -54,6 +54,32 @@ jobs:
     name: cargo test --workspace
     runs-on: ubuntu-latest
     timeout-minutes: 30
+
+    # The device-claim guards (server/src/admin.rs) are a SQL `WHERE` clause and
+    # a rows-affected count. Nothing in Rust can check those, and a test that
+    # re-implemented the rule in Rust would pass happily with the guard deleted
+    # from the statement the server actually sends. So those tests run the real
+    # statements against a real Postgres — and CI has to provide one, or they
+    # skip and the guard goes unverified.
+    #
+    # 16-alpine matches docker-compose.arena.yml, i.e. production. `ON CONFLICT
+    # … DO UPDATE … WHERE` is the load-bearing syntax here, so proving it on a
+    # different major would not prove much.
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: blades
+          POSTGRES_PASSWORD: blades
+          POSTGRES_DB: blades_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U blades -d blades_test"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - uses: actions/checkout@v4
 
@@ -75,4 +101,25 @@ jobs:
           restore-keys: cargo-${{ runner.os }}-
 
       - name: cargo test
+        env:
+          TEST_DATABASE_URL: postgres://blades:blades@127.0.0.1:5432/blades_test
         run: cargo test --workspace --locked
+
+      # A skipped security test looks exactly like a passing one in the summary
+      # line. This fails the job if the DB tests did not actually run, so the
+      # guard cannot quietly stop being checked.
+      - name: the device-claim guards really ran
+        env:
+          TEST_DATABASE_URL: postgres://blades:blades@127.0.0.1:5432/blades_test
+        run: |
+          set -euo pipefail
+          out=$(cargo test --locked -p server device_claims -- --nocapture 2>&1)
+          echo "$out"
+          if grep -q 'TEST_DATABASE_URL unset' <<<"$out"; then
+            echo "::error::device-claim tests skipped — the guard was NOT verified"
+            exit 1
+          fi
+          grep -qE 'test result: ok\. 9 passed' <<<"$out" || {
+            echo "::error::expected 9 device-claim tests to run and pass"
+            exit 1
+          }

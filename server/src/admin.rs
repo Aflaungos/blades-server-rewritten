@@ -353,9 +353,39 @@ pub struct BindDeviceResponse {
     pub user_id: Uuid,
 }
 
+/// Claim a device, but never TAKE one.
+///
+/// The guard is the `WHERE` on `DO UPDATE`. The upsert may create a row, adopt
+/// an unclaimed one (`user_id IS NULL` — the state `anon_log_in` leaves a device
+/// in the first time it is seen), or re-affirm one the same user already holds.
+/// It may not move a binding that belongs to somebody else, and when it declines
+/// it leaves that row exactly as it was.
+///
+/// This has to be ONE statement. A `SELECT` to check the owner followed by an
+/// `UPDATE` is two round-trips with a gap in between, and two claims racing
+/// through that gap is the bug again — so the check lives inside the write,
+/// where the row is already locked. Postgres reports the decline as zero rows
+/// affected, which is what `bind_device` turns into a 409.
+///
+/// `EXCLUDED.user_id` rather than a second `$2` so the claimant is named once;
+/// the two are the same value.
+pub(crate) const BIND_DEVICE_SQL: &str =
+    "INSERT INTO device_bindings (device_id, user_id, bound_at, last_seen) \
+     VALUES ($1, $2, now(), now()) \
+     ON CONFLICT (device_id) DO UPDATE SET user_id = EXCLUDED.user_id, bound_at = now() \
+     WHERE device_bindings.user_id IS NULL OR device_bindings.user_id = EXCLUDED.user_id";
+
 /// `POST /…/api/dev/v1/bind-device` — bind a device to a user (the per-player
-/// claim link); after this the device's `auth/anon` logs in as that user. Upsert
-/// by device_id, so re-claiming moves the binding.
+/// claim link); after this the device's `auth/anon` logs in as that user.
+///
+/// Claiming an unbound device works, and re-claiming your own is idempotent.
+/// Claiming a device that already belongs to a DIFFERENT user is refused with
+/// `409 Conflict` and writes nothing — see `BIND_DEVICE_SQL`.
+///
+/// Why refusing matters: `device_id` is the WireGuard peer IP, and `anon_log_in`
+/// (authentification.rs) resolves a device to its bound user. Moving somebody
+/// else's binding therefore does not merely mislabel a row — it re-points their
+/// game client at the claimant's account on its next launch.
 #[post("/blades.bgs.services/api/dev/v1/bind-device")]
 pub async fn bind_device(
     req: HttpRequest,
@@ -365,16 +395,22 @@ pub async fn bind_device(
     check_import_token(&app_state, &req)?;
     let body = body.into_inner();
     let mut conn = app_state.db_pool.get().await.unwrap();
-    diesel::sql_query(
-        "INSERT INTO device_bindings (device_id, user_id, bound_at, last_seen) \
-         VALUES ($1, $2, now(), now()) \
-         ON CONFLICT (device_id) DO UPDATE SET user_id = $2, bound_at = now()",
-    )
-    .bind::<diesel::sql_types::Text, _>(body.device_id.clone())
-    .bind::<diesel::sql_types::Uuid, _>(body.user_id)
-    .execute(&mut conn)
-    .await
-    .map_err(|_| BladeApiError::new(StatusCode::INTERNAL_SERVER_ERROR, IMPORT_SERVICE_ID, 10))?;
+    let affected = diesel::sql_query(BIND_DEVICE_SQL)
+        .bind::<diesel::sql_types::Text, _>(body.device_id.clone())
+        .bind::<diesel::sql_types::Uuid, _>(body.user_id)
+        .execute(&mut conn)
+        .await
+        .map_err(|_| BladeApiError::new(StatusCode::INTERNAL_SERVER_ERROR, IMPORT_SERVICE_ID, 10))?;
+
+    if affected == 0 {
+        // The row exists and is held by another user; nothing was written.
+        return Err(BladeApiError::new(
+            StatusCode::CONFLICT,
+            IMPORT_SERVICE_ID,
+            12,
+        ));
+    }
+
     Ok(Json(BindDeviceResponse {
         device_id: body.device_id,
         user_id: body.user_id,
@@ -395,23 +431,56 @@ pub struct RecentDevice {
     pub age_seconds: i64,
 }
 
-/// `GET /…/api/dev/v1/recent-devices` — list recently-seen devices so a player
-/// can pick the one they just launched and claim it.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecentDevicesQuery {
+    /// The arena user asking. Devices already bound to somebody ELSE are not
+    /// theirs to see, so the answer is scoped to this id.
+    #[serde(default)]
+    user_id: Option<Uuid>,
+}
+
+/// The claim list, scoped to what the caller may act on.
+///
+/// A device already bound to another player is neither claimable (see
+/// `BIND_DEVICE_SQL`) nor any of the caller's business, so it is not returned at
+/// all. Filtering in the query rather than at the caller means the other
+/// player's `user_id` never crosses the wire, which matters because the web app
+/// forwards this list to a browser.
+///
+/// Two rows qualify:
+///   - `user_id IS NULL` — unclaimed, so claimable by anyone. This is the whole
+///     legitimate flow: launch the game, then claim the device you just
+///     launched, which nobody owns yet. Dropping these would leave the feature
+///     with nothing to show.
+///   - `user_id = $1` — already the caller's, shown so the UI can say "yours".
+///
+/// `$1` is `NULL` when the caller sends no `userId`. `user_id = NULL` is never
+/// true in SQL, so that case degrades to unclaimed-only: still useful, still
+/// leaks nothing. Fail-closed on purpose — an older web build that has not
+/// learned to send `userId` yet loses the "yours" rows, not its privacy.
+pub(crate) const RECENT_DEVICES_SQL: &str = "SELECT device_id, user_id, platform, \
+     CAST(EXTRACT(epoch FROM (now() - last_seen)) AS BIGINT) AS age_seconds \
+     FROM device_bindings \
+     WHERE user_id IS NULL OR user_id = $1 \
+     ORDER BY last_seen DESC LIMIT 50";
+
+/// `GET /…/api/dev/v1/recent-devices?userId=<uuid>` — the devices this player
+/// may claim: unclaimed ones, plus the ones already theirs. Never another
+/// player's. See `RECENT_DEVICES_SQL`.
 #[get("/blades.bgs.services/api/dev/v1/recent-devices")]
 pub async fn recent_devices(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
+    query: web::Query<RecentDevicesQuery>,
 ) -> Result<Json<Vec<RecentDevice>>, BladeApiError> {
     check_import_token(&app_state, &req)?;
     let mut conn = app_state.db_pool.get().await.unwrap();
-    let rows = diesel::sql_query(
-        "SELECT device_id, user_id, platform, \
-         CAST(EXTRACT(epoch FROM (now() - last_seen)) AS BIGINT) AS age_seconds \
-         FROM device_bindings ORDER BY last_seen DESC LIMIT 50",
-    )
-    .get_results::<RecentDevice>(&mut conn)
-    .await
-    .map_err(|_| BladeApiError::new(StatusCode::INTERNAL_SERVER_ERROR, IMPORT_SERVICE_ID, 11))?;
+    let rows = diesel::sql_query(RECENT_DEVICES_SQL)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Uuid>, _>(query.into_inner().user_id)
+        .get_results::<RecentDevice>(&mut conn)
+        .await
+        .map_err(|_| BladeApiError::new(StatusCode::INTERNAL_SERVER_ERROR, IMPORT_SERVICE_ID, 11))?;
     Ok(Json(rows))
 }
 
@@ -849,5 +918,314 @@ mod tests {
             .expect("a body predating the quests field must still deserialize");
         assert!(parsed.quests.is_empty());
         assert!(parsed.dungeon_generated_data_list.is_empty());
+    }
+
+    // --- device claims: who may bind, and who may see -----------------------
+    //
+    // These run the REAL statements — `BIND_DEVICE_SQL` and
+    // `RECENT_DEVICES_SQL`, imported from the handlers rather than retyped —
+    // against a real Postgres. That is deliberate. The whole guard is a SQL
+    // `WHERE` clause and a rows-affected count; a test that re-implemented the
+    // rule in Rust would pass just as happily with the guard deleted from the
+    // statement the server actually sends, which is the failure mode this
+    // repo has shipped before.
+    //
+    // Each test runs inside its own throwaway schema, in a transaction that is
+    // never committed, so they leave nothing behind and can run concurrently.
+    //
+    // They need a database. CI provides one (see .github/workflows/ci.yml);
+    // locally, set TEST_DATABASE_URL. Without it they SKIP rather than fail —
+    // and `bind_sql_still_carries_its_guard` below is the backstop that fails
+    // loudly if someone strips the guard while the DB tests are skipped.
+    mod device_claims {
+        use super::super::{BIND_DEVICE_SQL, RECENT_DEVICES_SQL};
+        use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
+        use uuid::Uuid;
+
+        /// The migration's shape, minus the columns these tests do not touch.
+        /// Mirrors migrations/2026-06-08-120000-0000_add_device_bindings and
+        /// 2026-06-21-000000-0000_device_bindings_wg_ip.
+        /// One statement per entry: Postgres refuses to prepare several at once.
+        const SCHEMA: [&str; 2] = [
+            "CREATE TABLE users (id UUID PRIMARY KEY)",
+            "CREATE TABLE device_bindings ( \
+                 device_id TEXT PRIMARY KEY, \
+                 user_id UUID REFERENCES users(id), \
+                 platform TEXT, \
+                 last_seen TIMESTAMPTZ NOT NULL DEFAULT now(), \
+                 bound_at TIMESTAMPTZ, \
+                 source_wg_ip TEXT)",
+        ];
+
+        /// A connection in a private schema inside an uncommitted transaction,
+        /// or `None` when no test database is configured.
+        async fn fixture() -> Option<AsyncPgConnection> {
+            let url = std::env::var("TEST_DATABASE_URL").ok()?;
+            let mut conn = AsyncPgConnection::establish(&url)
+                .await
+                .expect("TEST_DATABASE_URL is set but unreachable");
+            conn.begin_test_transaction()
+                .await
+                .expect("could not open a test transaction");
+            let schema = format!("t{}", Uuid::new_v4().simple());
+            diesel::sql_query(format!("CREATE SCHEMA {schema}"))
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            diesel::sql_query(format!("SET LOCAL search_path TO {schema}"))
+                .execute(&mut conn)
+                .await
+                .unwrap();
+            for stmt in SCHEMA {
+                diesel::sql_query(stmt).execute(&mut conn).await.unwrap();
+            }
+            Some(conn)
+        }
+
+        /// Two players, both known to the arena `users` table.
+        async fn two_users(conn: &mut AsyncPgConnection) -> (Uuid, Uuid) {
+            let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+            for id in [a, b] {
+                diesel::sql_query("INSERT INTO users (id) VALUES ($1)")
+                    .bind::<diesel::sql_types::Uuid, _>(id)
+                    .execute(conn)
+                    .await
+                    .unwrap();
+            }
+            (a, b)
+        }
+
+        /// Run the production bind statement. Returns rows affected — zero is
+        /// how Postgres reports the guard declining, and what the handler
+        /// turns into a 409.
+        async fn bind(conn: &mut AsyncPgConnection, device: &str, user: Uuid) -> usize {
+            diesel::sql_query(BIND_DEVICE_SQL)
+                .bind::<diesel::sql_types::Text, _>(device.to_string())
+                .bind::<diesel::sql_types::Uuid, _>(user)
+                .execute(conn)
+                .await
+                .expect("the bind statement must be valid SQL")
+        }
+
+        #[derive(diesel::QueryableByName)]
+        struct OwnerRow {
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+            user_id: Option<Uuid>,
+        }
+
+        async fn owner_of(conn: &mut AsyncPgConnection, device: &str) -> Option<Uuid> {
+            let rows: Vec<OwnerRow> =
+                diesel::sql_query("SELECT user_id FROM device_bindings WHERE device_id = $1")
+                    .bind::<diesel::sql_types::Text, _>(device.to_string())
+                    .get_results(conn)
+                    .await
+                    .unwrap();
+            rows.into_iter().next().and_then(|r| r.user_id)
+        }
+
+        #[derive(diesel::QueryableByName)]
+        struct ListedDevice {
+            #[diesel(sql_type = diesel::sql_types::Text)]
+            device_id: String,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Uuid>)]
+            user_id: Option<Uuid>,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            #[allow(dead_code)]
+            platform: Option<String>,
+            #[diesel(sql_type = diesel::sql_types::BigInt)]
+            #[allow(dead_code)]
+            age_seconds: i64,
+        }
+
+        /// Run the production list statement as `asker` would see it.
+        async fn list_for(conn: &mut AsyncPgConnection, asker: Option<Uuid>) -> Vec<ListedDevice> {
+            diesel::sql_query(RECENT_DEVICES_SQL)
+                .bind::<diesel::sql_types::Nullable<diesel::sql_types::Uuid>, _>(asker)
+                .get_results(conn)
+                .await
+                .expect("the recent-devices statement must be valid SQL")
+        }
+
+        /// Skip-with-a-shout, so a skipped run is visible in the CI log rather
+        /// than looking like a pass.
+        macro_rules! db {
+            () => {
+                match fixture().await {
+                    Some(c) => c,
+                    None => {
+                        eprintln!("SKIP: TEST_DATABASE_URL unset — device-claim guard NOT verified");
+                        return;
+                    }
+                }
+            };
+        }
+
+        // -- binding ---------------------------------------------------------
+
+        /// The legitimate flow: launch the game (which leaves an unclaimed row)
+        /// then claim it. If this breaks, the feature is gone.
+        #[tokio::test]
+        async fn claiming_an_unclaimed_device_works() {
+            let mut c = db!();
+            let (alice, _bob) = two_users(&mut c).await;
+            diesel::sql_query("INSERT INTO device_bindings (device_id, user_id) VALUES ('10.9.0.5', NULL)")
+                .execute(&mut c)
+                .await
+                .unwrap();
+
+            assert_eq!(bind(&mut c, "10.9.0.5", alice).await, 1, "an unclaimed device must be claimable");
+            assert_eq!(owner_of(&mut c, "10.9.0.5").await, Some(alice));
+        }
+
+        /// A device nobody has ever seen: the INSERT half of the upsert.
+        #[tokio::test]
+        async fn claiming_a_brand_new_device_works() {
+            let mut c = db!();
+            let (alice, _bob) = two_users(&mut c).await;
+
+            assert_eq!(bind(&mut c, "10.9.0.77", alice).await, 1, "a first-seen device must bind");
+            assert_eq!(owner_of(&mut c, "10.9.0.77").await, Some(alice));
+        }
+
+        /// Re-claiming your own device is a no-op, not an error. The transfer
+        /// flow re-binds every one of a user's peers on each import, so this
+        /// path runs constantly.
+        #[tokio::test]
+        async fn reclaiming_your_own_device_is_idempotent() {
+            let mut c = db!();
+            let (alice, _bob) = two_users(&mut c).await;
+            bind(&mut c, "10.9.0.5", alice).await;
+
+            for attempt in 0..3 {
+                assert_eq!(
+                    bind(&mut c, "10.9.0.5", alice).await,
+                    1,
+                    "re-claim #{attempt} of your own device must succeed"
+                );
+            }
+            assert_eq!(owner_of(&mut c, "10.9.0.5").await, Some(alice));
+        }
+
+        /// THE BUG. Alice may not take a device bound to Bob — and Bob's row
+        /// must be exactly as it was, because `anon_log_in` reads it to decide
+        /// whose character Bob's client loads.
+        #[tokio::test]
+        async fn claiming_another_players_device_is_refused_and_changes_nothing() {
+            let mut c = db!();
+            let (alice, bob) = two_users(&mut c).await;
+            bind(&mut c, "10.9.0.5", bob).await;
+            let before = owner_of(&mut c, "10.9.0.5").await;
+
+            assert_eq!(
+                bind(&mut c, "10.9.0.5", alice).await,
+                0,
+                "stealing Bob's device must affect zero rows (the handler's 409)"
+            );
+            assert_eq!(
+                owner_of(&mut c, "10.9.0.5").await,
+                before,
+                "Bob's binding must survive the attempt untouched"
+            );
+            assert_eq!(owner_of(&mut c, "10.9.0.5").await, Some(bob));
+        }
+
+        /// The refusal must not be a blanket "no". Alice being denied Bob's
+        /// device must not stop her claiming a free one — otherwise a passing
+        /// suite could mean the endpoint is simply dead.
+        #[tokio::test]
+        async fn a_refusal_does_not_disable_legitimate_claims() {
+            let mut c = db!();
+            let (alice, bob) = two_users(&mut c).await;
+            bind(&mut c, "10.9.0.5", bob).await;
+
+            assert_eq!(bind(&mut c, "10.9.0.5", alice).await, 0);
+            assert_eq!(bind(&mut c, "10.9.0.6", alice).await, 1, "a free device must still bind");
+            assert_eq!(owner_of(&mut c, "10.9.0.6").await, Some(alice));
+        }
+
+        // -- listing ---------------------------------------------------------
+
+        /// Alice must not be shown Bob's device — not the row, and above all
+        /// not Bob's `user_id`, which the web app forwards to a browser.
+        #[tokio::test]
+        async fn the_list_hides_another_players_device() {
+            let mut c = db!();
+            let (alice, bob) = two_users(&mut c).await;
+            bind(&mut c, "10.9.0.bob", bob).await;
+
+            let seen = list_for(&mut c, Some(alice)).await;
+            assert!(
+                !seen.iter().any(|d| d.device_id == "10.9.0.bob"),
+                "Bob's device must not appear in Alice's claim list"
+            );
+            assert!(
+                !seen.iter().any(|d| d.user_id == Some(bob)),
+                "Bob's user_id must never cross the wire to Alice"
+            );
+        }
+
+        /// The positive control for the test above. Without it, a `WHERE false`
+        /// would look like perfect security while breaking the feature.
+        #[tokio::test]
+        async fn the_list_shows_unclaimed_and_own_devices() {
+            let mut c = db!();
+            let (alice, bob) = two_users(&mut c).await;
+            diesel::sql_query("INSERT INTO device_bindings (device_id, user_id) VALUES ('10.9.0.free', NULL)")
+                .execute(&mut c)
+                .await
+                .unwrap();
+            bind(&mut c, "10.9.0.alice", alice).await;
+            bind(&mut c, "10.9.0.bob", bob).await;
+
+            let seen = list_for(&mut c, Some(alice)).await;
+            assert!(
+                seen.iter().any(|d| d.device_id == "10.9.0.free"),
+                "an unclaimed device must be listed, or nobody can ever claim anything"
+            );
+            assert!(
+                seen.iter().any(|d| d.device_id == "10.9.0.alice"),
+                "Alice's own device must be listed so the UI can mark it hers"
+            );
+            assert_eq!(seen.len(), 2, "exactly the free one and Alice's own");
+        }
+
+        /// A caller that sends no `userId` degrades to unclaimed-only. It must
+        /// not fall back to listing everything, which is the original defect.
+        #[tokio::test]
+        async fn an_anonymous_list_leaks_nothing() {
+            let mut c = db!();
+            let (alice, bob) = two_users(&mut c).await;
+            diesel::sql_query("INSERT INTO device_bindings (device_id, user_id) VALUES ('10.9.0.free', NULL)")
+                .execute(&mut c)
+                .await
+                .unwrap();
+            bind(&mut c, "10.9.0.alice", alice).await;
+            bind(&mut c, "10.9.0.bob", bob).await;
+
+            let seen = list_for(&mut c, None).await;
+            assert!(
+                seen.iter().all(|d| d.user_id.is_none()),
+                "a userId-less call must return only unclaimed rows, never a bound one"
+            );
+            assert!(seen.iter().any(|d| d.device_id == "10.9.0.free"));
+        }
+
+        // -- backstop --------------------------------------------------------
+
+        /// Runs with no database, so the guards cannot be quietly deleted
+        /// during a run where the DB tests all skipped. This asserts on the
+        /// same constants the handlers execute.
+        #[test]
+        fn the_statements_still_carry_their_guards() {
+            assert!(
+                BIND_DEVICE_SQL.contains("WHERE device_bindings.user_id IS NULL")
+                    && BIND_DEVICE_SQL.contains("device_bindings.user_id = EXCLUDED.user_id"),
+                "bind-device lost its ownership guard: {BIND_DEVICE_SQL}"
+            );
+            assert!(
+                RECENT_DEVICES_SQL.contains("WHERE user_id IS NULL OR user_id = $1"),
+                "recent-devices lost its user filter: {RECENT_DEVICES_SQL}"
+            );
+        }
     }
 }
