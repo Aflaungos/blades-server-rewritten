@@ -284,9 +284,9 @@ fn find_building_mut<'a>(town: &'a mut Value, building_id: Uuid) -> Option<&'a m
     None
 }
 
-/// The `typeId`/`styleId`/`level` of a building (read-only pre-scan before the
-/// mutable borrow, so cost lookup doesn't tangle with the `&mut` on the town).
-fn read_building_facts(town: &Value, building_id: Uuid) -> Option<(Uuid, Option<Uuid>, u64)> {
+/// Immutably borrow a building object by its `id` — the read-only twin of
+/// [`find_building_mut`], for pre-scans that must not tangle with the `&mut`.
+fn find_building<'a>(town: &'a Value, building_id: Uuid) -> Option<&'a Value> {
     let bid = building_id.to_string();
     let districts = town.get("districts")?.as_array()?;
     for district in districts {
@@ -300,20 +300,42 @@ fn read_building_facts(town: &Value, building_id: Uuid) -> Option<(Uuid, Option<
                 .and_then(Value::as_object)
                 .and_then(|m| m.get(&bid))
             {
-                let type_id = b
-                    .get("typeId")
-                    .and_then(Value::as_str)
-                    .and_then(|s| Uuid::parse_str(s).ok())?;
-                let style_id = b
-                    .get("styleId")
-                    .and_then(Value::as_str)
-                    .and_then(|s| Uuid::parse_str(s).ok());
-                let level = b.get("level").and_then(Value::as_u64).unwrap_or(0);
-                return Some((type_id, style_id, level));
+                return Some(b);
             }
         }
     }
     None
+}
+
+/// The `typeId`/`styleId`/`level` of a building (read-only pre-scan before the
+/// mutable borrow, so cost lookup doesn't tangle with the `&mut` on the town).
+fn read_building_facts(town: &Value, building_id: Uuid) -> Option<(Uuid, Option<Uuid>, u64)> {
+    let b = find_building(town, building_id)?;
+    let type_id = b
+        .get("typeId")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok())?;
+    let style_id = b
+        .get("styleId")
+        .and_then(Value::as_str)
+        .and_then(|s| Uuid::parse_str(s).ok());
+    let level = b.get("level").and_then(Value::as_u64).unwrap_or(0);
+    Some((type_id, style_id, level))
+}
+
+/// How much of a building's construction timer is still to run, in milliseconds, as
+/// of `now`. `constructionEnd` is stored as epoch MILLISECONDS (see
+/// [`apply_upgrade_transition`]); an absent, zero or already-past value gives `0`.
+///
+/// This is the ONLY input to the speed-up price. The client sends `speedUp: true`
+/// and nothing else — never a cost — so the price is derived server-side from stored
+/// state and a client cannot name its own.
+fn remaining_construction_ms(town: &Value, building_id: Uuid, now: u64) -> i64 {
+    let end = find_building(town, building_id)
+        .and_then(|b| b.get("constructionEnd"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    (end as i64) - (now as i64)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -486,28 +508,48 @@ fn apply_upgrade_transition(
 #[serde(rename_all = "camelCase")]
 struct CompleteRequest {
     /// `true` when the player paid gems to finish instantly (the timer hadn't
-    /// elapsed). We accept it but don't re-bill here — the timer is advisory on our
-    /// server and the gem cost, if any, is charged client-flow-side.
+    /// elapsed). This is BILLED — see [`blades_lib::economy::skip_time`] for the
+    /// curve and its provenance. The flag is the only thing the client sends; the
+    /// price comes from the stored `constructionEnd`, never from the request.
     #[serde(default)]
-    #[allow(dead_code)]
     speed_up: bool,
 }
 
-/// `complete`'s response: the wallet + inventory diff + updated town, plus the
-/// building's `shop` (empty by default — we don't model per-building shop stock
-/// generation) and the full character so the client refreshes town xp/level.
+/// `complete`'s response.
+///
+/// Retail's shape depends on the flag, measured across 159 captured completions:
+///
+/// ```text
+/// speedUp=false → { "town" }
+/// speedUp=true  → { "character", "inventory", "town", "wallet" }   // post-deduction
+/// ```
+///
+/// The wallet on the speed-up path is REQUIRED: it is how the client learns the gems
+/// left it. The other three keys are `Option` so the no-speed-up response is the
+/// bare `{town}` retail sends.
+///
+/// We used to send six keys unconditionally, including a `shop` that retail sends on
+/// this endpoint 0 times out of 159. That was not merely noise — a `shop` key here
+/// hands the client an EMPTY stock list for the building it just finished, which is
+/// the shape of a vendor that has nothing to sell. It is dropped, along with the
+/// `validationFlags` retail also does not send here (the town object carries its own
+/// `validationFlags` field, so nothing is lost).
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompleteResponse {
-    wallet: CompleteWallet,
-    inventory: CompleteInventoryUpdate,
+    /// Always sent — the completed building's new state.
     town: Value,
-    validation_flags: u64,
-    /// Per-building shop the completed building unlocks. We don't generate stock, so
-    /// this is an empty shop object; the client tolerates an empty `items` list.
-    shop: Value,
+    /// Post-deduction balance. Speed-up only; the client reads the gem debit here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wallet: Option<CompleteWallet>,
+    /// Inventory diff. Speed-up only (empty in practice — gems live in the wallet —
+    /// but retail sends the key and the client's parser expects the quartet).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    inventory: Option<CompleteInventoryUpdate>,
     /// Full character JSONB (verbatim) so the client re-reads town xp/level etc.
-    character: Value,
+    /// Speed-up only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    character: Option<Value>,
 }
 
 #[post(
@@ -517,17 +559,39 @@ pub async fn complete_building(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
     path: web::Path<(Uuid, Uuid)>,
-    _body: Json<CompleteRequest>,
+    body: Json<CompleteRequest>,
 ) -> Result<Json<CompleteResponse>, BladeApiError> {
     let session = session.get_session_or_error()?;
     let user_id = session.session.user_id;
     let (character_id, building_id) = path.into_inner();
+    let speed_up = body.into_inner().speed_up;
+    let globals: Arc<ServerGlobal> = app_state.get_ref().clone();
     let mut conn = app_state.db_pool.get().await?;
 
     conn.transaction(move |mut conn| {
         async move {
             let mut entry = load_town_economy(&mut conn, character_id, user_id).await?;
             let mut town = take_town(&mut entry)?;
+
+            // A 404 before anything is charged: an unknown building must never cost
+            // gems. (`find_building` is the read-only pre-scan; the mutation borrows
+            // separately below.)
+            if find_building(&town, building_id).is_none() {
+                return Err(BladeApiError::new(StatusCode::NOT_FOUND, TOWN_SERVICE_ID, 1));
+            }
+
+            // Bill the speed-up BEFORE clearing the timer — the price is a function
+            // of the time that is still to run, so the order matters. Insufficient
+            // gems fails the whole request (the transaction rolls back and the
+            // building stays under construction) rather than completing for free.
+            charge_construction_speed_up(
+                speed_up,
+                globals.skip_time_costs.as_ref(),
+                &town,
+                building_id,
+                now_ms(),
+                &mut entry.wallet.0,
+            )?;
 
             let building = find_building_mut(&mut town, building_id).ok_or_else(|| {
                 BladeApiError::new(StatusCode::NOT_FOUND, TOWN_SERVICE_ID, 1)
@@ -551,20 +615,72 @@ pub async fn complete_building(
                     .execute(&mut conn)
                     .await?;
 
-                Ok::<_, BladeApiError>(Json(CompleteResponse {
+                Ok::<_, BladeApiError>(Json(complete_response(
+                    speed_up,
+                    town_col,
                     wallet,
                     inventory,
-                    town: town_col,
-                    validation_flags: 1,
-                    shop: json!({ "items": [] }),
-                    character: serde_json::to_value(&character)
-                        .unwrap_or_else(|_| json!(null)),
-                }))
+                    serde_json::to_value(&character).unwrap_or_else(|_| json!(null)),
+                )))
             }
         }
         .scope_boxed()
     })
     .await
+}
+
+/// Bill a `/complete` speed-up against the wallet. The whole billed path minus the
+/// database, so tests exercise exactly what the handler runs.
+///
+/// * `speed_up == false` → nothing is charged, full stop.
+/// * no table (static data not pushed yet) → nothing is charged; see
+///   [`blades_lib::economy::skip_time::SkipTimeCostTable::from_static`].
+/// * timer already elapsed → nothing is charged; the player is not paying to skip
+///   time that has already passed.
+/// * not enough gems → `400` (the same envelope [`charge_cost`] uses for "you cannot
+///   afford this") and the wallet is untouched. It must FAIL: silently skipping the
+///   charge would hand out free speed-ups, which is the bug being fixed.
+fn charge_construction_speed_up(
+    speed_up: bool,
+    table: Option<&blades_lib::economy::skip_time::SkipTimeCostTable>,
+    town: &Value,
+    building_id: Uuid,
+    now: u64,
+    wallet: &mut CompleteWallet,
+) -> Result<Vec<blades_lib::economy::Price>, BladeApiError> {
+    if !speed_up {
+        return Ok(Vec::new());
+    }
+    let remaining_ms = remaining_construction_ms(town, building_id, now);
+    blades_lib::economy::skip_time::charge_skip_time(table, remaining_ms, wallet)
+        .map_err(|_| BladeApiError::new(StatusCode::BAD_REQUEST, TOWN_SERVICE_ID, 4))
+}
+
+/// Assemble `/complete`'s response for the retail shape (see [`CompleteResponse`]):
+/// `{town}` on a plain completion, `{character, inventory, town, wallet}` when gems
+/// were spent. Split out so the shape is unit-testable without a database.
+fn complete_response(
+    speed_up: bool,
+    town: Value,
+    wallet: CompleteWallet,
+    inventory: CompleteInventoryUpdate,
+    character: Value,
+) -> CompleteResponse {
+    if speed_up {
+        CompleteResponse {
+            town,
+            wallet: Some(wallet),
+            inventory: Some(inventory),
+            character: Some(character),
+        }
+    } else {
+        CompleteResponse {
+            town,
+            wallet: None,
+            inventory: None,
+            character: None,
+        }
+    }
 }
 
 /// Finalize a building: clear the timer, back to NORMAL. The `level` was already
@@ -1267,5 +1383,276 @@ mod tests {
         assert_eq!(b["state"], json!("UPGRADING"));
         assert_eq!(b["constructionEnd"], json!(6000));
         assert_eq!(b["typeId"], json!(ty.to_string()));
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Speed-up (tracker #88): paying gems to finish a building instantly.
+    //
+    // The curve itself is unit-tested in `blades_lib::economy::skip_time`. What
+    // is pinned HERE is the wiring: that the table we SHIP parses and prices the
+    // captured numbers, that `/complete` actually debits it, that a player who
+    // cannot pay is refused, and that the response carries the new balance.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    use blades_lib::economy::Price;
+    use blades_lib::economy::skip_time::SkipTimeCostTable;
+
+    /// The building id `sample_town` puts in the one addressable segment.
+    const TIMED_BID: &str = "af0a05c7-9765-4c59-8799-6fc00f8a16c8";
+    const TIMED_SEG: &str = "71c4b321-825a-4fde-bdcc-c584f1d2db83";
+
+    /// The static file the SERVER reads in production (the `deploy/static` bind
+    /// mount), not a fixture — so a regeneration that drops the table fails here.
+    fn shipped_prod_static() -> Value {
+        serde_json::from_str(include_str!("../../deploy/static/building_upgrades.json"))
+            .expect("deploy/static/building_upgrades.json is valid JSON")
+    }
+
+    /// The local-dev copy (`--static-data server/data/static`).
+    fn shipped_dev_static() -> Value {
+        serde_json::from_str(include_str!("../data/static/building_upgrades.json"))
+            .expect("server/data/static/building_upgrades.json is valid JSON")
+    }
+
+    fn shipped_table() -> SkipTimeCostTable {
+        SkipTimeCostTable::from_static(&shipped_prod_static())
+            .expect("the shipped static carries _meta.skipTimeCostTable")
+    }
+
+    fn town_with_timer(construction_end: u64) -> Value {
+        let mut town = sample_town(TIMED_BID);
+        let b = &mut town["districts"][0]["segments"][TIMED_SEG]["buildings"][TIMED_BID];
+        b["state"] = json!("UPGRADING");
+        b["level"] = json!(1);
+        b["constructionEnd"] = json!(construction_end);
+        town
+    }
+
+    fn wallet_with(gems: u64) -> CompleteWallet {
+        let mut w = CompleteWallet::default();
+        w.credit(GEMS, gems);
+        w
+    }
+
+    /// The DATA, not just the code: the table we ship has to be the measured one.
+    /// If `extract_town_static.py` is re-run and drops `_meta.skipTimeCostTable`,
+    /// or someone edits the rates, this is the test that goes red.
+    #[test]
+    fn the_shipped_static_carries_the_measured_skip_time_table() {
+        let t = shipped_table();
+        assert_eq!(t.rate_list.len(), 2, "two bands: 12/hr to 12 h, then 6/hr");
+        assert!(
+            t.rate_list.iter().all(|b| b.currency == GEMS),
+            "the skip-time table prices in Gem"
+        );
+
+        // The two captured points that straddle the 12 h join.
+        assert_eq!(t.cost_for_time(38_394.0), vec![Price::new(GEMS, 128)]);
+        assert_eq!(t.cost_for_time(47_994.0), vec![Price::new(GEMS, 152)]);
+        // And the f32 boundary case (an f64 walk would say 200 here).
+        assert_eq!(t.cost_for_time(76_800.0), vec![Price::new(GEMS, 201)]);
+    }
+
+    /// The prod bind-mount copy and the local-dev copy must agree, or a developer
+    /// tests against a price players are not charged.
+    #[test]
+    fn both_shipped_static_copies_carry_the_same_table() {
+        assert_eq!(
+            shipped_prod_static()["_meta"]["skipTimeCostTable"],
+            shipped_dev_static()["_meta"]["skipTimeCostTable"],
+            "deploy/static and server/data/static disagree on the skip-time price"
+        );
+    }
+
+    /// The billed path: a timer with 47 994 s left costs 152 gems, exactly the
+    /// captured retail debit, and the wallet ends 152 lighter.
+    #[test]
+    fn speed_up_debits_the_measured_gem_price() {
+        let now = 1_800_000_000_000u64;
+        let town = town_with_timer(now + 47_994_000);
+        let mut wallet = wallet_with(1_000);
+
+        let charged = charge_construction_speed_up(
+            true,
+            Some(&shipped_table()),
+            &town,
+            TIMED_BID.parse().unwrap(),
+            now,
+            &mut wallet,
+        )
+        .expect("affordable");
+
+        assert_eq!(charged, vec![Price::new(GEMS, 152)]);
+        assert_eq!(wallet.balance(GEMS), 848);
+    }
+
+    /// Without the flag, nothing is charged — a normal completion of an elapsed
+    /// timer is free, and always was.
+    #[test]
+    fn completing_without_speed_up_charges_nothing() {
+        let now = 1_800_000_000_000u64;
+        let town = town_with_timer(now + 47_994_000);
+        let mut wallet = wallet_with(1_000);
+
+        let charged = charge_construction_speed_up(
+            false,
+            Some(&shipped_table()),
+            &town,
+            TIMED_BID.parse().unwrap(),
+            now,
+            &mut wallet,
+        )
+        .unwrap();
+
+        assert!(charged.is_empty());
+        assert_eq!(wallet.balance(GEMS), 1_000, "speedUp:false must not debit");
+    }
+
+    /// An already-elapsed timer costs nothing even with `speedUp: true` — the
+    /// player is not buying anything, and a faithful walk over a negative
+    /// remainder would CREDIT gems.
+    #[test]
+    fn speed_up_on_an_elapsed_timer_is_free() {
+        let now = 1_800_000_000_000u64;
+        for end in [now, now - 1, now - 86_400_000, 0] {
+            let town = town_with_timer(end);
+            let mut wallet = wallet_with(1_000);
+            let charged = charge_construction_speed_up(
+                true,
+                Some(&shipped_table()),
+                &town,
+                TIMED_BID.parse().unwrap(),
+                now,
+                &mut wallet,
+            )
+            .unwrap();
+            assert!(charged.is_empty(), "constructionEnd {end} should be free");
+            assert_eq!(wallet.balance(GEMS), 1_000);
+        }
+    }
+
+    /// Not enough gems must FAIL with a 400 and leave the balance untouched. If
+    /// this ever "passes" by skipping the charge, players get free speed-ups —
+    /// which is precisely the bug this fixes.
+    #[test]
+    fn speed_up_without_enough_gems_fails_and_debits_nothing() {
+        use actix_web::ResponseError;
+
+        let now = 1_800_000_000_000u64;
+        let town = town_with_timer(now + 47_994_000);
+        let mut wallet = wallet_with(151); // one gem short of 152
+
+        let err = charge_construction_speed_up(
+            true,
+            Some(&shipped_table()),
+            &town,
+            TIMED_BID.parse().unwrap(),
+            now,
+            &mut wallet,
+        )
+        .expect_err("151 gems cannot buy a 152-gem skip");
+
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(wallet.balance(GEMS), 151, "a refused charge must not debit");
+    }
+
+    /// `deploy/static/` is a bind mount: merging this ships the CODE but not the
+    /// JSON. Between the merge and `deploy/arena.sh static` the table is absent,
+    /// and the server must charge NOTHING rather than crash or invent a price.
+    #[test]
+    fn without_the_static_table_speed_up_is_free_not_broken() {
+        let now = 1_800_000_000_000u64;
+        let town = town_with_timer(now + 47_994_000);
+        let mut wallet = wallet_with(1_000);
+
+        let charged = charge_construction_speed_up(
+            true,
+            None,
+            &town,
+            TIMED_BID.parse().unwrap(),
+            now,
+            &mut wallet,
+        )
+        .expect("a missing table must not error");
+
+        assert!(charged.is_empty());
+        assert_eq!(wallet.balance(GEMS), 1_000);
+    }
+
+    /// The price comes from stored state only. A building the town does not carry
+    /// has no timer, so it has no price — and the handler 404s before this runs.
+    #[test]
+    fn remaining_time_of_an_unknown_building_is_not_positive() {
+        let now = 1_800_000_000_000u64;
+        let town = town_with_timer(now + 47_994_000);
+        assert_eq!(
+            remaining_construction_ms(&town, Uuid::new_v4(), now),
+            -(now as i64)
+        );
+        assert_eq!(
+            remaining_construction_ms(&town, TIMED_BID.parse().unwrap(), now),
+            47_994_000
+        );
+    }
+
+    /// Retail's `/complete` sends `{town}` alone without the flag, and
+    /// `{character, inventory, town, wallet}` with it — measured over 159
+    /// captures. In particular it NEVER sends `shop`, which we used to send on
+    /// every completion and which tells the client the finished building's vendor
+    /// has nothing to sell.
+    #[test]
+    fn complete_response_matches_the_captured_retail_shape() {
+        use blades_lib::user_data::{Backpack, CompleteInventory, Loadout, Treasury};
+        let inv = CompleteInventory {
+            backpack: Backpack::default(),
+            loadout: Loadout::default(),
+            treasury: Treasury::default(),
+            overflow_treasury: Treasury::default(),
+            backpack_version: 1,
+            treasury_version: 0,
+        }
+        .generate_client_update(&InventoryChangeTracker::default());
+        let plain = serde_json::to_value(complete_response(
+            false,
+            json!({"levelInfo": {"level": 6}}),
+            wallet_with(848),
+            inv.clone(),
+            json!({"name": "Swanne"}),
+        ))
+        .unwrap();
+        let keys: Vec<&str> = plain
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, vec!["town"], "speedUp:false sends the town alone");
+
+        let sped = serde_json::to_value(complete_response(
+            true,
+            json!({"levelInfo": {"level": 6}}),
+            wallet_with(848),
+            inv,
+            json!({"name": "Swanne"}),
+        ))
+        .unwrap();
+        let obj = sped.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, vec!["character", "inventory", "town", "wallet"]);
+        assert!(!obj.contains_key("shop"), "retail sends no shop here");
+        // The post-deduction balance is the point of returning the wallet at all.
+        // The wire wallet is an array of `{currencyId, balance}`.
+        let gem_line = sped["wallet"]
+            .as_array()
+            .expect("wallet serializes as an array")
+            .iter()
+            .find(|e| e["currencyId"] == json!(GEMS.to_string()))
+            .expect("the gem line is present");
+        assert_eq!(
+            gem_line["balance"],
+            json!(848),
+            "the client learns the gem debit from this field"
+        );
     }
 }

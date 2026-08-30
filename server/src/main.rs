@@ -127,6 +127,16 @@ pub struct ServerGlobal {
     /// handlers; a missing/invalid file loads as `Null` and that feature degrades
     /// gracefully (no panic at startup).
     pub building_upgrades: serde_json::Value,
+    /// The GLOBAL "pay gems to skip a running timer" curve, parsed once at startup
+    /// out of `building_upgrades.json`'s `_meta.skipTimeCostTable` (the same
+    /// `SkipTimeCostTable` asset retail used for BOTH town construction and
+    /// crafting — see [`blades_lib::economy::skip_time`]).
+    ///
+    /// `None` when the static file predates the table — `deploy/static/` is a bind
+    /// mount that merging does NOT ship, so this is the state between a merge and
+    /// `deploy/arena.sh static`. Handlers then charge nothing rather than guessing a
+    /// price: a few free speed-ups are recoverable, a wrong gem debit is not.
+    pub skip_time_costs: Option<blades_lib::economy::skip_time::SkipTimeCostTable>,
     pub job_pools: serde_json::Value,
     pub appearance_change_cost: serde_json::Value,
     /// Authored, admin-editable per-level town-shop STOCK generation config
@@ -250,6 +260,22 @@ async fn main() -> Result<()> {
                 }
             };
             let building_upgrades = load_static_json("building_upgrades.json");
+            // One global skip-time curve for town construction AND crafting, parsed
+            // once here so the handlers don't re-walk the JSON per request. Logged
+            // loudly when absent, because "absent" means every speed-up is free —
+            // `deploy/static/` is a bind mount and a merge alone does not ship it.
+            let skip_time_costs =
+                blades_lib::economy::skip_time::SkipTimeCostTable::from_static(&building_upgrades);
+            match &skip_time_costs {
+                Some(t) => log::info!(
+                    "[static] skip-time cost table loaded ({} bands)",
+                    t.rate_list.len()
+                ),
+                None => log::warn!(
+                    "[static] building_upgrades.json has no usable _meta.skipTimeCostTable; \
+                     speed-ups (speedUp:true) will be FREE until `deploy/arena.sh static` runs"
+                ),
+            }
             let job_pools = load_static_json("job_pools.json");
             let appearance_change_cost = load_static_json("appearance_change_cost.json");
 
@@ -329,6 +355,7 @@ async fn main() -> Result<()> {
                 static_data: static_data_defs,
                 repair_data,
                 building_upgrades,
+                skip_time_costs,
                 job_pools,
                 appearance_change_cost,
                 shop_stock,
