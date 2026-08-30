@@ -26,6 +26,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
+/// Gem pricing for skipping a running timer (`speedUp: true`) — shared by town
+/// building construction and crafting, which retail priced from ONE asset.
+pub mod skip_time;
+
 use crate::user_data::{
     CompleteCharacter, CompleteInventory, CompleteWallet, InventoryChangeTracker, Item, WalletEntry,
 };

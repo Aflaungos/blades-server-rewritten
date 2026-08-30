@@ -460,8 +460,11 @@ pub async fn create_craft(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct FinishCraftRequest {
+    /// `true` when the player paid gems to collect before the timer elapsed. This is
+    /// BILLED, from the SAME global curve as town construction: retail's
+    /// `RecipeData._skipTimeData` and `BuildingConstructionDataList._skipTimeData`
+    /// point at one `SkipTimeCostTable` asset. See [`blades_lib::economy::skip_time`].
     #[serde(default)]
-    #[allow(dead_code)]
     speed_up: bool,
 }
 
@@ -480,17 +483,21 @@ struct FinishCraftResponse {
 /// its stored `results` (re-minting instanced item ids with `Uuid::new_v4()`),
 /// calls `apply_reward`, removes the job, and returns the character + reward.
 ///
-/// `speedUp: true` is accepted but gems are NOT charged (lenient).
+/// `speedUp: true` charges gems for the time still on the clock — the same
+/// [`blades_lib::economy::skip_time`] curve town construction uses. A player who
+/// cannot afford it gets an error and keeps the job; the alternative (collect early
+/// for free) is what this endpoint used to do.
 #[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/crafts/{craft_id}/finish")]
 pub async fn finish_craft(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
     path: web::Path<(Uuid, Uuid)>,
-    _body: Json<FinishCraftRequest>,
+    body: Json<FinishCraftRequest>,
 ) -> Result<Json<FinishCraftResponse>, BladeApiError> {
     let session = session.get_session_or_error()?;
     let user_id = session.session.user_id;
     let (character_id, craft_id) = path.into_inner();
+    let speed_up = body.into_inner().speed_up;
     let globals = app_state.get_ref().clone();
     let mut conn = app_state.db_pool.get().await.unwrap();
 
@@ -507,6 +514,18 @@ pub async fn finish_craft(
                 .position(|j| j.id == craft_id)
                 .ok_or_else(|| BladeApiError::new(StatusCode::NOT_FOUND, 20000, 5))?;
             let job = entry.server_state.0.craft_jobs.remove(job_pos);
+
+            // Bill the speed-up from the job's own stored `completedAt` — never from
+            // anything the client sent. A job whose timer already elapsed is free
+            // (the player is just collecting), so a client that sets `speedUp` on a
+            // finished craft is not overcharged.
+            charge_craft_speed_up(
+                speed_up,
+                globals.skip_time_costs.as_ref(),
+                job.completed_at_ms,
+                now_ms(),
+                &mut entry.wallet.0,
+            )?;
 
             // Build a RewardGrant from the job's results, re-minting item ids. Repair
             // first, for the same reason `GET /crafts` does: a pre-fix job stored
@@ -545,6 +564,31 @@ pub async fn finish_craft(
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+
+/// Bill a craft speed-up against the wallet — the whole billed path minus the
+/// database, so tests exercise exactly what the handler runs.
+///
+/// The price comes from the job's STORED `completedAt`, never from the request: the
+/// client sends only the `speedUp` flag, and a client-supplied cost is not a cost.
+/// The curve is the shared [`blades_lib::economy::skip_time`] one (retail's
+/// `RecipeData._skipTimeData` is the same asset as the town's).
+///
+/// * `speed_up == false`, no table, or an already-elapsed job → charge nothing.
+/// * not enough gems → the economy 400, wallet untouched; the job stays uncollected
+///   rather than being handed over for free.
+fn charge_craft_speed_up(
+    speed_up: bool,
+    table: Option<&blades_lib::economy::skip_time::SkipTimeCostTable>,
+    completed_at_ms: i64,
+    now: i64,
+    wallet: &mut CompleteWallet,
+) -> Result<Vec<blades_lib::economy::Price>, BladeApiError> {
+    if !speed_up {
+        return Ok(Vec::new());
+    }
+    blades_lib::economy::skip_time::charge_skip_time(table, completed_at_ms - now, wallet)
+        .map_err(BladeApiError::from_economy)
+}
 
 /// Repair a STORED craft job on the way out to the client.
 ///
@@ -2664,5 +2708,88 @@ mod tests {
         let ctid = wire["craftingTypeId"].as_str().unwrap();
         assert_ne!(ctid, unknown.to_string(), "must never echo the recipe id");
         assert_eq!(ctid, ALCHEMY_CRAFTING_TYPE_ID, "falls back exactly as before");
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Speed-up (tracker #88): `finish` with `speedUp: true` used to hand the
+    // craft over for free. It is billed from the SAME global curve as town
+    // construction — retail's `RecipeData._skipTimeData` and
+    // `BuildingConstructionDataList._skipTimeData` point at one asset.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    use blades_lib::economy::skip_time::SkipTimeCostTable;
+    use blades_lib::economy::{GEMS, Price};
+
+    fn shipped_table() -> SkipTimeCostTable {
+        let v: serde_json::Value =
+            serde_json::from_str(include_str!("../../deploy/static/building_upgrades.json"))
+                .expect("valid JSON");
+        SkipTimeCostTable::from_static(&v).expect("the shipped static carries the table")
+    }
+
+    fn wallet_with(gems: u64) -> CompleteWallet {
+        let mut w = CompleteWallet::default();
+        w.credit(GEMS, gems);
+        w
+    }
+
+    /// The captured band-join price applies to crafts too: 47 994 s left = 152 gems.
+    #[test]
+    fn craft_speed_up_debits_the_measured_gem_price() {
+        let now = 1_800_000_000_000i64;
+        let mut w = wallet_with(1_000);
+        let charged =
+            charge_craft_speed_up(true, Some(&shipped_table()), now + 47_994_000, now, &mut w)
+                .expect("affordable");
+        assert_eq!(charged, vec![Price::new(GEMS, 152)]);
+        assert_eq!(w.balance(GEMS), 848);
+    }
+
+    /// Collecting a finished craft is free, flag or no flag.
+    #[test]
+    fn craft_speed_up_without_the_flag_or_on_an_elapsed_job_is_free() {
+        let now = 1_800_000_000_000i64;
+
+        let mut w = wallet_with(1_000);
+        assert!(
+            charge_craft_speed_up(false, Some(&shipped_table()), now + 47_994_000, now, &mut w)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(w.balance(GEMS), 1_000, "speedUp:false must not debit");
+
+        let mut w = wallet_with(1_000);
+        assert!(
+            charge_craft_speed_up(true, Some(&shipped_table()), now - 60_000, now, &mut w)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(w.balance(GEMS), 1_000, "an elapsed job is just a collect");
+    }
+
+    /// Not enough gems fails, and the wallet is untouched — the player keeps the
+    /// job instead of collecting it early for nothing.
+    #[test]
+    fn craft_speed_up_without_enough_gems_fails_and_debits_nothing() {
+        use actix_web::ResponseError;
+        let now = 1_800_000_000_000i64;
+        let mut w = wallet_with(151);
+        let err = charge_craft_speed_up(true, Some(&shipped_table()), now + 47_994_000, now, &mut w)
+            .expect_err("151 gems cannot buy a 152-gem skip");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        assert_eq!(w.balance(GEMS), 151);
+    }
+
+    /// No table (static not pushed to the box yet) → free, not an error.
+    #[test]
+    fn craft_speed_up_without_a_table_is_free_not_broken() {
+        let now = 1_800_000_000_000i64;
+        let mut w = wallet_with(1_000);
+        assert!(
+            charge_craft_speed_up(true, None, now + 47_994_000, now, &mut w)
+                .expect("a missing table must not error")
+                .is_empty()
+        );
+        assert_eq!(w.balance(GEMS), 1_000);
     }
 }

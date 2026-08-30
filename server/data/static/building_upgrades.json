@@ -21,7 +21,34 @@
     "notes": [
       "level index == level built toward; 0 == initial construction on an empty lot (gold/time LOW confidence there, HIGH for 1..N).",
       "buildInputs = base materials; styleInputs = extra materials per style variant."
-    ]
+    ],
+    "skipTimeCostTable": {
+      "description": "Gem cost of skipping a running timer (speedUp:true). ONE GLOBAL curve, not per-building: it prices town building construction AND crafting alike.",
+      "algorithm": "Tax-bracket with a PER-BAND ceil, computed in f32: H = (f32)seconds / 3600f; cursor = 0; rem = H; for band in rateList: hours = min(rem, band.maxHour - cursor); cost[band.currency] += ceil(hours * band.costPerHour); cursor = band.maxHour; rem -= band.maxHour; break when rem <= 0. The f32 is load-bearing: 76800 s costs 201 gems in f32 and 200 in f64, and the client displays the f32 number.",
+      "sources": {
+        "rateList": "APK bundle gameplaymetadata -> BuildingConstructionDataList._skipTimeData -> ScriptableObject SkipTimeCostTable (asset fields _rateList/_currency/_costPerHour/_maxHour, renamed to camelCase here). RecipeData._skipTimeData points at the SAME asset.",
+        "algorithm": "il2cpp disassembly of TimeCostTable.GetCostForTime(double) at RVA 0x1C7B1DC (read, not inferred: the tax-bracket and tier-select readings differ by up to 2x). BuildingSiteGroupSegment.GetConstructionSkipCosts() tail-calls it with the timer's raw remaining time - no clamp, no minimum, no per-building multiplier.",
+        "confirmation": "159 captured retail speedUp:true completions: gems are debited at /complete and never at /upgrade. 145/146 usable pairs reproduce exactly; the strictly-uncontaminated subset is 15/15; range covered 1 s -> 460795 s (1 -> 840 gems). Rule discrimination over 155 pairs: this rule 154, flat ceil(r/300) 135, flat ceil(r/600) 3, round-instead-of-ceil 133."
+      },
+      "notes": [
+        "The 12 h band join is crossed by the captures: 38394 s -> 128 gems (last band-1 point) and 47994 s -> 152 gems (first band-2 point; a flat 12/hr would have said 160). Both the two-band structure and the ceil are therefore pinned, not assumed.",
+        "Third corroboration: feeding the 49 authored construction durations through this curve yields whole-gem prices for 46/49, monotone, with no cliff at the join.",
+        "This is NOT gemsPayment:true on /upgrade (pay gems to cover missing gold/materials). That price depends on the resource shortfall at click time and is still unsolved - nothing models it.",
+        "Regenerating this file (blades-capture tools/apk-extract/extract_town_static.py) MUST preserve this key. server/src/town.rs::the_shipped_static_carries_the_measured_skip_time_table fails if it is dropped."
+      ],
+      "rateList": [
+        {
+          "currency": "470c8f58-a8dd-4c07-8c92-843b785e1139",
+          "costPerHour": 12,
+          "maxHour": 12.0
+        },
+        {
+          "currency": "470c8f58-a8dd-4c07-8c92-843b785e1139",
+          "costPerHour": 6,
+          "maxHour": 1000.0
+        }
+      ]
+    }
   },
   "buildings": {
     "9a05d031-197c-4a8f-b097-ec743a77cee0": {
