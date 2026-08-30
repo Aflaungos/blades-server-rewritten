@@ -119,7 +119,7 @@ jobs:
             echo "::error::device-claim tests skipped — the guard was NOT verified"
             exit 1
           fi
-          grep -qE 'test result: ok\. 9 passed' <<<"$out" || {
-            echo "::error::expected 9 device-claim tests to run and pass"
+          grep -qE 'test result: ok\. 16 passed' <<<"$out" || {
+            echo "::error::expected 16 device-claim tests to run and pass"
             exit 1
           }
