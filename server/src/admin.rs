@@ -344,6 +344,11 @@ pub async fn recent_matches(
 pub struct BindDeviceRequest {
     pub device_id: String,
     pub user_id: Uuid,
+    /// Every WireGuard peer IP the capture platform has allocated to the
+    /// claimant, as the capture platform knows it. Optional on the wire, and
+    /// the reason it is optional is deploy ordering — see `BIND_DEVICE_SQL`.
+    #[serde(default)]
+    pub own_wg_ips: Option<Vec<String>>,
 }
 
 #[derive(Serialize)]
@@ -369,18 +374,61 @@ pub struct BindDeviceResponse {
 ///
 /// `EXCLUDED.user_id` rather than a second `$2` so the claimant is named once;
 /// the two are the same value.
+///
+/// WHAT THE FIRST FIX MISSED
+///
+/// The guard above only refuses to MOVE a binding. An UNCLAIMED row
+/// (`user_id IS NULL`) it hands to whoever asks first — and that is a real
+/// breach, not a theoretical one, because `anon_log_in` creates exactly that
+/// row the first time it sees any device. A player launches the game, the row
+/// appears unclaimed, and somebody else claims it before they do; their client
+/// then logs into the claimant's account on next launch. Ten of seventy rows in
+/// production got there this way, across nine victims, after the first fix
+/// shipped.
+///
+/// The row carries the missing evidence. `source_wg_ip` (migration
+/// 2026-06-21-000000-0000_device_bindings_wg_ip) is the WireGuard peer IP the
+/// device was seen on, and the capture platform ALLOCATED that IP, so it knows
+/// whose it is. This server does not — the allocation table lives in the
+/// capture platform's SQLite, not here — so the claimant's own peer IPs arrive
+/// as `$3` and the comparison happens where the row is locked.
+///
+/// The rule, in the `WHERE`:
+///   - re-affirming a binding you already hold always works (`user_id =
+///     EXCLUDED.user_id`), whatever `source_wg_ip` says. The transfer flow
+///     re-binds every one of a user's peers on each import, so this runs
+///     constantly, and refusing it would break imports without protecting
+///     anyone — nothing is acquired.
+///   - ACQUIRING an unclaimed row additionally requires that its
+///     `source_wg_ip` is unrecorded, or is one of the claimant's own peer IPs.
+///     A device last seen on somebody else's tunnel is refused.
+///
+/// `$3 IS NULL` — the caller sent no peer list at all — falls back to the old
+/// rule. That is a deploy ramp, not a resting state: the arena server and the
+/// capture platform's web container deploy independently and in either order,
+/// so a fail-closed `$3` would 409 every claim and every auto-bind in the
+/// window where this build is live and the web build is not. The web side
+/// always sends the list (empty array when the claimant has no peers, which is
+/// fail-closed: `= ANY('{}')` is false, so every attributable row is refused).
+/// Tighten this to `NOT NULL` once both halves are in production.
 pub(crate) const BIND_DEVICE_SQL: &str =
     "INSERT INTO device_bindings (device_id, user_id, bound_at, last_seen) \
      VALUES ($1, $2, now(), now()) \
      ON CONFLICT (device_id) DO UPDATE SET user_id = EXCLUDED.user_id, bound_at = now() \
-     WHERE device_bindings.user_id IS NULL OR device_bindings.user_id = EXCLUDED.user_id";
+     WHERE device_bindings.user_id = EXCLUDED.user_id \
+        OR (device_bindings.user_id IS NULL \
+            AND ($3::text[] IS NULL \
+                 OR device_bindings.source_wg_ip IS NULL \
+                 OR device_bindings.source_wg_ip = ANY($3::text[])))";
 
 /// `POST /…/api/dev/v1/bind-device` — bind a device to a user (the per-player
 /// claim link); after this the device's `auth/anon` logs in as that user.
 ///
 /// Claiming an unbound device works, and re-claiming your own is idempotent.
 /// Claiming a device that already belongs to a DIFFERENT user is refused with
-/// `409 Conflict` and writes nothing — see `BIND_DEVICE_SQL`.
+/// `409 Conflict` and writes nothing — and so is claiming an UNBOUND device
+/// last seen on a WireGuard peer IP that is not the claimant's. See
+/// `BIND_DEVICE_SQL`.
 ///
 /// Why refusing matters: `device_id` is the WireGuard peer IP, and `anon_log_in`
 /// (authentification.rs) resolves a device to its bound user. Moving somebody
@@ -398,12 +446,16 @@ pub async fn bind_device(
     let affected = diesel::sql_query(BIND_DEVICE_SQL)
         .bind::<diesel::sql_types::Text, _>(body.device_id.clone())
         .bind::<diesel::sql_types::Uuid, _>(body.user_id)
+        .bind::<diesel::sql_types::Nullable<diesel::sql_types::Array<diesel::sql_types::Text>>, _>(
+            body.own_wg_ips.clone(),
+        )
         .execute(&mut conn)
         .await
         .map_err(|_| BladeApiError::new(StatusCode::INTERNAL_SERVER_ERROR, IMPORT_SERVICE_ID, 10))?;
 
     if affected == 0 {
-        // The row exists and is held by another user; nothing was written.
+        // Either the row is held by another user, or it is unclaimed but was
+        // seen on a peer IP that is not the claimant's. Nothing was written.
         return Err(BladeApiError::new(
             StatusCode::CONFLICT,
             IMPORT_SERVICE_ID,
@@ -429,6 +481,16 @@ pub struct RecentDevice {
     pub platform: Option<String>,
     #[diesel(sql_type = diesel::sql_types::BigInt)]
     pub age_seconds: i64,
+    /// The WireGuard peer IP this device was last seen on, or NULL if it was
+    /// never seen over a tunnel we recorded.
+    ///
+    /// This server cannot say anything about who that IP belongs to — the
+    /// allocation table is the capture platform's. Returning it is what lets
+    /// the capture platform decide, and it is only ever returned for rows the
+    /// caller may already act on (unclaimed, or already theirs), so it
+    /// discloses no third party's tunnel.
+    #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+    pub source_wg_ip: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -459,8 +521,15 @@ pub struct RecentDevicesQuery {
 /// true in SQL, so that case degrades to unclaimed-only: still useful, still
 /// leaks nothing. Fail-closed on purpose — an older web build that has not
 /// learned to send `userId` yet loses the "yours" rows, not its privacy.
+/// `source_wg_ip` rides along because "unclaimed" is not the same as
+/// "unowned". An unclaimed row created by `anon_log_in` still records the
+/// tunnel the device was seen on, and that tunnel was allocated by the capture
+/// platform to somebody. Only the capture platform can make that judgement, so
+/// the column has to reach it — without it, its claim rule can only ever say
+/// "nobody has claimed this yet", which is precisely the hole this closes.
 pub(crate) const RECENT_DEVICES_SQL: &str = "SELECT device_id, user_id, platform, \
-     CAST(EXTRACT(epoch FROM (now() - last_seen)) AS BIGINT) AS age_seconds \
+     CAST(EXTRACT(epoch FROM (now() - last_seen)) AS BIGINT) AS age_seconds, \
+     source_wg_ip \
      FROM device_bindings \
      WHERE user_id IS NULL OR user_id = $1 \
      ORDER BY last_seen DESC LIMIT 50";
@@ -998,13 +1067,47 @@ mod tests {
         /// Run the production bind statement. Returns rows affected — zero is
         /// how Postgres reports the guard declining, and what the handler
         /// turns into a 409.
-        async fn bind(conn: &mut AsyncPgConnection, device: &str, user: Uuid) -> usize {
+        ///
+        /// `own_wg_ips` is the claimant's WireGuard peers as the capture
+        /// platform reports them; `None` is the pre-upgrade web build that
+        /// sends no list at all.
+        async fn bind_with(
+            conn: &mut AsyncPgConnection,
+            device: &str,
+            user: Uuid,
+            own_wg_ips: Option<Vec<String>>,
+        ) -> usize {
             diesel::sql_query(BIND_DEVICE_SQL)
                 .bind::<diesel::sql_types::Text, _>(device.to_string())
                 .bind::<diesel::sql_types::Uuid, _>(user)
+                .bind::<diesel::sql_types::Nullable<
+                    diesel::sql_types::Array<diesel::sql_types::Text>,
+                >, _>(own_wg_ips)
                 .execute(conn)
                 .await
                 .expect("the bind statement must be valid SQL")
+        }
+
+        /// A claimant with no WireGuard peers at all — the strictest caller,
+        /// and the shape most of the pre-existing tests want.
+        async fn bind(conn: &mut AsyncPgConnection, device: &str, user: Uuid) -> usize {
+            bind_with(conn, device, user, Some(vec![])).await
+        }
+
+        /// Seed an unclaimed row the way `anon_log_in` leaves one: nobody owns
+        /// it yet, but it remembers the tunnel it was seen on.
+        async fn seen_on(conn: &mut AsyncPgConnection, device: &str, wg_ip: Option<&str>) {
+            diesel::sql_query(
+                "INSERT INTO device_bindings (device_id, user_id, source_wg_ip) \
+                 VALUES ($1, NULL, $2)",
+            )
+            .bind::<diesel::sql_types::Text, _>(device.to_string())
+            .bind::<diesel::sql_types::Nullable<diesel::sql_types::Text>, _>(
+                wg_ip.map(|s| s.to_string()),
+            )
+            .execute(conn)
+            .await
+            .unwrap();
         }
 
         #[derive(diesel::QueryableByName)]
@@ -1035,6 +1138,8 @@ mod tests {
             #[diesel(sql_type = diesel::sql_types::BigInt)]
             #[allow(dead_code)]
             age_seconds: i64,
+            #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
+            source_wg_ip: Option<String>,
         }
 
         /// Run the production list statement as `asker` would see it.
@@ -1143,6 +1248,145 @@ mod tests {
             assert_eq!(owner_of(&mut c, "10.9.0.6").await, Some(alice));
         }
 
+        // -- the unclaimed-but-attributable hole -----------------------------
+
+        /// THE REMAINING BUG, at the layer that has the row.
+        ///
+        /// `anon_log_in` leaves an unclaimed row the moment Bob launches the
+        /// game. Before this change every guard in this file said yes to it,
+        /// because none of them looked at whose tunnel it came from.
+        #[tokio::test]
+        async fn claiming_an_unclaimed_device_seen_on_another_players_tunnel_is_refused() {
+            let mut c = db!();
+            let (alice, _bob) = two_users(&mut c).await;
+            // A stable-hash deviceId — the shape rule 1 in the web layer
+            // cannot attribute, which is why the ten production rows got past
+            // the first fix.
+            seen_on(&mut c, "7d46ac1bf926f22120c2ce82fb834052", Some("10.99.0.37")).await;
+
+            assert_eq!(
+                bind_with(
+                    &mut c,
+                    "7d46ac1bf926f22120c2ce82fb834052",
+                    alice,
+                    Some(vec!["10.99.0.24".into()]),
+                )
+                .await,
+                0,
+                "a device seen on somebody else's peer IP must not be claimable"
+            );
+            assert_eq!(
+                owner_of(&mut c, "7d46ac1bf926f22120c2ce82fb834052").await,
+                None,
+                "the refusal must leave the row unclaimed, not half-written"
+            );
+        }
+
+        /// The positive control: the SAME row, claimed by the peer it was seen
+        /// on. Without this a `WHERE false` would pass the test above.
+        #[tokio::test]
+        async fn claiming_an_unclaimed_device_seen_on_your_own_tunnel_works() {
+            let mut c = db!();
+            let (alice, _bob) = two_users(&mut c).await;
+            seen_on(&mut c, "7d46ac1bf926f22120c2ce82fb834052", Some("10.99.0.24")).await;
+
+            assert_eq!(
+                bind_with(
+                    &mut c,
+                    "7d46ac1bf926f22120c2ce82fb834052",
+                    alice,
+                    Some(vec!["10.99.0.9".into(), "10.99.0.24".into()]),
+                )
+                .await,
+                1,
+                "your own tunnel must still claim your own device"
+            );
+            assert_eq!(
+                owner_of(&mut c, "7d46ac1bf926f22120c2ce82fb834052").await,
+                Some(alice)
+            );
+        }
+
+        /// First launch through a path that recorded no tunnel at all. Refusing
+        /// this would break the feature for everyone the rigged APK reaches
+        /// outside a captured tunnel, so it must stay open.
+        #[tokio::test]
+        async fn claiming_an_unclaimed_device_with_no_recorded_tunnel_works() {
+            let mut c = db!();
+            let (alice, _bob) = two_users(&mut c).await;
+            seen_on(&mut c, "unattributable-hash", None).await;
+
+            assert_eq!(
+                bind_with(&mut c, "unattributable-hash", alice, Some(vec![])).await,
+                1,
+                "a device with no source_wg_ip is nobody's, so first launch must work"
+            );
+            assert_eq!(owner_of(&mut c, "unattributable-hash").await, Some(alice));
+        }
+
+        /// Re-affirming a binding you already hold is exempt from the tunnel
+        /// check. The transfer flow re-binds every peer on each import, and a
+        /// row whose `source_wg_ip` drifted must not start failing imports —
+        /// nothing is acquired, so there is nobody to protect.
+        #[tokio::test]
+        async fn reaffirming_your_own_binding_ignores_the_tunnel() {
+            let mut c = db!();
+            let (alice, _bob) = two_users(&mut c).await;
+            seen_on(&mut c, "alices-device", Some("10.99.0.24")).await;
+            assert_eq!(
+                bind_with(&mut c, "alices-device", alice, Some(vec!["10.99.0.24".into()])).await,
+                1
+            );
+
+            assert_eq!(
+                bind_with(&mut c, "alices-device", alice, Some(vec![])).await,
+                1,
+                "a re-bind of a row already yours must succeed regardless of $3"
+            );
+            assert_eq!(owner_of(&mut c, "alices-device").await, Some(alice));
+        }
+
+        /// A claimant with no peers at all sends `[]`, and `= ANY('{}')` is
+        /// false — so every attributable row is refused. Fail-closed, not
+        /// fail-open, which is the difference between an empty list and a
+        /// missing one.
+        #[tokio::test]
+        async fn an_empty_peer_list_claims_nothing_attributable() {
+            let mut c = db!();
+            let (alice, _bob) = two_users(&mut c).await;
+            seen_on(&mut c, "somebodys-device", Some("10.99.0.37")).await;
+
+            assert_eq!(
+                bind_with(&mut c, "somebodys-device", alice, Some(vec![])).await,
+                0,
+                "an empty peer list must not match an attributable row"
+            );
+        }
+
+        /// A pre-upgrade web build sends no list. It falls back to the old rule
+        /// rather than 409-ing every claim in the deploy window. This test
+        /// exists so the ramp is a deliberate, visible decision — delete it
+        /// when `$3` is tightened to NOT NULL.
+        #[tokio::test]
+        async fn a_caller_that_sends_no_peer_list_falls_back_to_the_old_rule() {
+            let mut c = db!();
+            let (alice, bob) = two_users(&mut c).await;
+            seen_on(&mut c, "unclaimed-elsewhere", Some("10.99.0.37")).await;
+            bind(&mut c, "bobs-device", bob).await;
+
+            assert_eq!(
+                bind_with(&mut c, "unclaimed-elsewhere", alice, None).await,
+                1,
+                "no list = old rule = unclaimed rows still bind"
+            );
+            assert_eq!(
+                bind_with(&mut c, "bobs-device", alice, None).await,
+                0,
+                "the ramp must not also give away the ownership guard"
+            );
+            assert_eq!(owner_of(&mut c, "bobs-device").await, Some(bob));
+        }
+
         // -- listing ---------------------------------------------------------
 
         /// Alice must not be shown Bob's device — not the row, and above all
@@ -1210,6 +1454,34 @@ mod tests {
             assert!(seen.iter().any(|d| d.device_id == "10.9.0.free"));
         }
 
+        /// The list must carry `source_wg_ip`, or the capture platform has no
+        /// evidence to judge an unclaimed row with and its own rule degrades to
+        /// "nobody has claimed this yet" — the hole.
+        #[tokio::test]
+        async fn the_list_carries_the_tunnel_each_device_was_seen_on() {
+            let mut c = db!();
+            let (alice, _bob) = two_users(&mut c).await;
+            seen_on(&mut c, "seen-somewhere", Some("10.99.0.37")).await;
+            seen_on(&mut c, "seen-nowhere", None).await;
+
+            let seen = list_for(&mut c, Some(alice)).await;
+            let ip = |id: &str| {
+                seen.iter()
+                    .find(|d| d.device_id == id)
+                    .map(|d| d.source_wg_ip.clone())
+            };
+            assert_eq!(
+                ip("seen-somewhere"),
+                Some(Some("10.99.0.37".to_string())),
+                "the recorded tunnel must reach the caller"
+            );
+            assert_eq!(
+                ip("seen-nowhere"),
+                Some(None),
+                "and an unrecorded one must arrive as NULL, not be dropped"
+            );
+        }
+
         // -- backstop --------------------------------------------------------
 
         /// Runs with no database, so the guards cannot be quietly deleted
@@ -1218,13 +1490,29 @@ mod tests {
         #[test]
         fn the_statements_still_carry_their_guards() {
             assert!(
-                BIND_DEVICE_SQL.contains("WHERE device_bindings.user_id IS NULL")
+                BIND_DEVICE_SQL.contains("device_bindings.user_id IS NULL")
                     && BIND_DEVICE_SQL.contains("device_bindings.user_id = EXCLUDED.user_id"),
                 "bind-device lost its ownership guard: {BIND_DEVICE_SQL}"
             );
             assert!(
+                BIND_DEVICE_SQL.contains("device_bindings.source_wg_ip = ANY($3::text[])"),
+                "bind-device lost its source_wg_ip guard — an unclaimed row seen on \
+                 another player's tunnel is claimable again: {BIND_DEVICE_SQL}"
+            );
+            assert!(
                 RECENT_DEVICES_SQL.contains("WHERE user_id IS NULL OR user_id = $1"),
                 "recent-devices lost its user filter: {RECENT_DEVICES_SQL}"
+            );
+            // A whole-token check, not `contains`: `NULL::text AS
+            // not_the_source_wg_ip` satisfies a substring match while
+            // returning nothing, and that is exactly the kind of green-against-
+            // broken-code this suite exists to prevent.
+            assert!(
+                RECENT_DEVICES_SQL
+                    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .any(|t| t == "source_wg_ip"),
+                "recent-devices stopped returning source_wg_ip, so the capture \
+                 platform cannot attribute an unclaimed device: {RECENT_DEVICES_SQL}"
             );
         }
     }
