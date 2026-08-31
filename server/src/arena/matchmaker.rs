@@ -2384,6 +2384,24 @@ fn fallback_deadline(
         None => since + delay,
         Some((current, previous_tier)) => next_floor(current, previous_tier, tier, since, delay, now),
     };
+
+    // Say WHY this deadline is what it is, but only when it moves. `fallback_tier`
+    // was written for this line and then never called — the compiler had been
+    // reporting it as dead code, and a player noticed before we did (tracker #84).
+    //
+    // Logging every pass would bury it: the loop recomputes constantly. Logging on a
+    // tier change is the moment the answer to "why did I get a bot" actually changes.
+    if prev.map(|(_, t)| t) != Some(tier) {
+        log::info!(
+            "matchmaker: fallback tier -> {} (delay {:?}, live {}, recent {}, waiting {})",
+            fallback_tier(live, recent, waiting_others),
+            delay,
+            live,
+            recent,
+            waiting_others,
+        );
+    }
+
     (floor, tier)
 }
 
