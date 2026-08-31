@@ -119,7 +119,16 @@ jobs:
             echo "::error::device-claim tests skipped — the guard was NOT verified"
             exit 1
           fi
-          grep -qE 'test result: ok\. 16 passed' <<<"$out" || {
-            echo "::error::expected 16 device-claim tests to run and pass"
+          # A MINIMUM, not an exact count. The point of this guard is to catch
+          # the tests silently not running (a skip, a filter typo, a harness
+          # change) -- and a count that only ever drops catches that just as
+          # well. Pinning it exactly meant every legitimately-added test failed
+          # CI until someone bumped the number, which trains people to edit the
+          # guard rather than read it. Raise the floor when you add coverage you
+          # want protected.
+          n=$(grep -oE 'test result: ok\. [0-9]+ passed' <<<"$out" | grep -oE '[0-9]+' | tail -1)
+          if [ -z "$n" ] || [ "$n" -lt 16 ]; then
+            echo "::error::expected at least 16 device-claim tests to run and pass, saw '${n:-none}'"
             exit 1
-          }
+          fi
+          echo "device-claim guards verified: $n tests passed"
