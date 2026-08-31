@@ -52,6 +52,18 @@ use crate::{
 // out-of-band so import failures are easy to spot in logs.
 const IMPORT_SERVICE_ID: u64 = 9001;
 
+/// `bind-device` error codes inside `IMPORT_SERVICE_ID`. Named because the
+/// endpoint now distinguishes four failures where it used to distinguish two,
+/// and a bare integer at the call site says nothing about which.
+///
+/// `NO_CONNECTION` and `NO_SUCH_USER` are new; `DB_FAILED` (10) and `REFUSED`
+/// (12) keep the numbers they already had on the wire, so nothing the capture
+/// platform already handles changes meaning under it.
+const BIND_DEVICE_DB_FAILED: u64 = 10;
+const BIND_DEVICE_REFUSED: u64 = 12;
+const BIND_DEVICE_NO_CONNECTION: u64 = 17;
+const BIND_DEVICE_NO_SUCH_USER: u64 = 18;
+
 /// Deserialize `quests[]` entry by entry, DROPPING any the schema cannot read
 /// instead of failing the whole body.
 ///
@@ -434,6 +446,61 @@ pub(crate) const BIND_DEVICE_SQL: &str =
 /// (authentification.rs) resolves a device to its bound user. Moving somebody
 /// else's binding therefore does not merely mislabel a row — it re-points their
 /// game client at the claimant's account on its next launch.
+/// Turn a failure of `BIND_DEVICE_SQL` into an HTTP envelope — and say what it
+/// WAS first.
+///
+/// The previous `.map_err(|_| …500…)` discarded the error object entirely. Nine
+/// production 500s in one evening (and more across the two days before) left no
+/// message, no constraint name and no offending key anywhere in this server's
+/// log; the only record of the cause was Postgres's own log inside the
+/// `arena-db` container, which nobody reads. Whatever else this function does,
+/// it must not fail silently again.
+///
+/// The classification that matters is `ForeignKeyViolation`.
+/// `device_bindings.user_id` references `users(id)`, so a claim naming a user
+/// this server has never heard of is rejected by the DATABASE, not by the
+/// guard — and that is a bad request, not a server fault. It gets `404` so the
+/// caller can tell "you named a user that does not exist" apart from "we
+/// broke", and so it stops paging as a 5xx.
+///
+/// On SQLSTATE: diesel 2.3's `DatabaseErrorInformation` does not expose the raw
+/// five-character code. `DatabaseErrorKind` is diesel's own classification OF
+/// that code and is logged in its place; `details()` carries Postgres's DETAIL
+/// line, which for this constraint names the offending key —
+/// `Key (user_id)=(…) is not present in table "users"`. That is precisely the
+/// diagnostic that was missing.
+pub(crate) fn map_bind_device_error(e: &diesel::result::Error) -> BladeApiError {
+    use diesel::result::{DatabaseErrorKind, Error as DieselError};
+
+    if let DieselError::DatabaseError(kind, info) = e {
+        // Logged for EVERY database rejection, classified or not: the
+        // unclassified ones are exactly the ones we would next be blind to.
+        warn!(
+            "bind-device: database rejected the bind: kind={:?} message={:?} detail={:?} table={:?} constraint={:?}",
+            kind,
+            info.message(),
+            info.details(),
+            info.table_name(),
+            info.constraint_name(),
+        );
+        if matches!(kind, DatabaseErrorKind::ForeignKeyViolation) {
+            return BladeApiError::new(
+                StatusCode::NOT_FOUND,
+                IMPORT_SERVICE_ID,
+                BIND_DEVICE_NO_SUCH_USER,
+            );
+        }
+    } else {
+        warn!("bind-device: the bind statement failed: {e}");
+    }
+
+    BladeApiError::new(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        IMPORT_SERVICE_ID,
+        BIND_DEVICE_DB_FAILED,
+    )
+}
+
 #[post("/blades.bgs.services/api/dev/v1/bind-device")]
 pub async fn bind_device(
     req: HttpRequest,
@@ -442,7 +509,17 @@ pub async fn bind_device(
 ) -> Result<Json<BindDeviceResponse>, BladeApiError> {
     check_import_token(&app_state, &req)?;
     let body = body.into_inner();
-    let mut conn = app_state.db_pool.get().await.unwrap();
+    // Was `.unwrap()`. A pool that cannot hand out a connection is a real
+    // operational state — restarting database, exhausted pool — and panicking
+    // on it kills the worker instead of answering the request.
+    let mut conn = app_state.db_pool.get().await.map_err(|e| {
+        log::error!("bind-device: could not acquire a database connection: {e}");
+        BladeApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            IMPORT_SERVICE_ID,
+            BIND_DEVICE_NO_CONNECTION,
+        )
+    })?;
     let affected = diesel::sql_query(BIND_DEVICE_SQL)
         .bind::<diesel::sql_types::Text, _>(body.device_id.clone())
         .bind::<diesel::sql_types::Uuid, _>(body.user_id)
@@ -451,15 +528,22 @@ pub async fn bind_device(
         )
         .execute(&mut conn)
         .await
-        .map_err(|_| BladeApiError::new(StatusCode::INTERNAL_SERVER_ERROR, IMPORT_SERVICE_ID, 10))?;
+        .map_err(|e| map_bind_device_error(&e))?;
 
     if affected == 0 {
         // Either the row is held by another user, or it is unclaimed but was
         // seen on a peer IP that is not the claimant's. Nothing was written.
+        // Logged because a refusal is a security-relevant event and, until
+        // now, an indistinguishable one: 409s and 500s looked identical in the
+        // access log and neither said who or what.
+        warn!(
+            "bind-device: guard declined the claim of {:?} by {} (nothing written)",
+            body.device_id, body.user_id
+        );
         return Err(BladeApiError::new(
             StatusCode::CONFLICT,
             IMPORT_SERVICE_ID,
-            12,
+            BIND_DEVICE_REFUSED,
         ));
     }
 
@@ -989,6 +1073,75 @@ mod tests {
         assert!(parsed.dungeon_generated_data_list.is_empty());
     }
 
+    /// Captures `log` records so a test can assert that something was
+    /// REPORTED, not merely that it returned the right status.
+    ///
+    /// Only one logger may be installed per process, so this installs once and
+    /// hands out an exclusive lease; `start()` returns `None` if some other
+    /// logger got there first, which the caller must treat as a skip rather
+    /// than a pass. The lease serialises capturing tests against each other so
+    /// one cannot drain another's records.
+    mod log_capture {
+        use std::sync::{Mutex, MutexGuard, Once, OnceLock};
+
+        static RECORDS: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+        static LEASE: Mutex<()> = Mutex::new(());
+        static INSTALL: Once = Once::new();
+
+        fn records() -> &'static Mutex<Vec<String>> {
+            RECORDS.get_or_init(|| Mutex::new(Vec::new()))
+        }
+
+        struct Capture;
+        impl log::Log for Capture {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, r: &log::Record<'_>) {
+                records()
+                    .lock()
+                    .unwrap()
+                    .push(format!("{} {}", r.level(), r.args()));
+            }
+            fn flush(&self) {}
+        }
+
+        pub struct Lease(#[allow(dead_code)] MutexGuard<'static, ()>);
+
+        impl Lease {
+            /// Everything logged since the lease began.
+            pub fn take(&self) -> Vec<String> {
+                std::mem::take(&mut *records().lock().unwrap())
+            }
+        }
+
+        /// Install the capturing logger and clear the buffer, or `None` if this
+        /// process's logger is not ours.
+        ///
+        /// The control probe matters: `set_boxed_logger` failing is not the only
+        /// way to end up capturing nothing, so we prove the pipe works by
+        /// pushing a record through it before letting the test rely on it.
+        /// Without that, "no records" and "logger not installed" are the same
+        /// observation, and the test would report a defect that is not there.
+        pub fn start() -> Option<Lease> {
+            let guard = LEASE.lock().unwrap_or_else(|e| e.into_inner());
+            INSTALL.call_once(|| {
+                if log::set_boxed_logger(Box::new(Capture)).is_ok() {
+                    log::set_max_level(log::LevelFilter::Trace);
+                }
+            });
+            records().lock().unwrap().clear();
+            log::warn!("log-capture control probe");
+            let works = records()
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("log-capture control probe"));
+            records().lock().unwrap().clear();
+            works.then_some(Lease(guard))
+        }
+    }
+
     // --- device claims: who may bind, and who may see -----------------------
     //
     // These run the REAL statements — `BIND_DEVICE_SQL` and
@@ -1007,7 +1160,10 @@ mod tests {
     // and `bind_sql_still_carries_its_guard` below is the backstop that fails
     // loudly if someone strips the guard while the DB tests are skipped.
     mod device_claims {
-        use super::super::{BIND_DEVICE_SQL, RECENT_DEVICES_SQL};
+        use super::super::{
+            BIND_DEVICE_NO_SUCH_USER, BIND_DEVICE_SQL, RECENT_DEVICES_SQL, map_bind_device_error,
+        };
+        use actix_web::{ResponseError, http::StatusCode};
         use diesel_async::{AsyncConnection, AsyncPgConnection, RunQueryDsl};
         use uuid::Uuid;
 
@@ -1457,6 +1613,97 @@ mod tests {
         /// The list must carry `source_wg_ip`, or the capture platform has no
         /// evidence to judge an unclaimed row with and its own rule degrades to
         /// "nobody has claimed this yet" — the hole.
+        // -- reporting the failure -------------------------------------------
+        //
+        // Nine production 500s on 2026-08-30 came out of this endpoint with no
+        // diagnostic at all, because the handler mapped the diesel error with
+        // `.map_err(|_| …)`. Postgres's own log had the answer the whole time:
+        // `device_bindings_user_id_fkey` — the claim named a user with no row
+        // in `users`. Two of the three offending ids had still never existed
+        // days later, so this is not a creation race that retrying would fix;
+        // it is a caller naming a user that is not there.
+        //
+        // These two tests pin the two halves of that: the failure must be
+        // CLASSIFIED (so the caller gets 404, not 500) and it must be LOGGED
+        // (so the next unclassified one is not invisible).
+
+        /// Provoke the REAL production failure: run the real statement against
+        /// a real Postgres with a `user_id` that has no `users` row, and take
+        /// the error diesel actually produces. Nothing here is synthetic, so
+        /// it cannot drift from what the server hits.
+        async fn real_fk_violation(conn: &mut AsyncPgConnection) -> diesel::result::Error {
+            let ghost = Uuid::new_v4(); // deliberately never inserted into `users`
+            diesel::sql_query(BIND_DEVICE_SQL)
+                .bind::<diesel::sql_types::Text, _>("10.9.0.201".to_string())
+                .bind::<diesel::sql_types::Uuid, _>(ghost)
+                .bind::<diesel::sql_types::Nullable<
+                    diesel::sql_types::Array<diesel::sql_types::Text>,
+                >, _>(Some(Vec::<String>::new()))
+                .execute(conn)
+                .await
+                .expect_err("binding a user with no `users` row must be refused by the FK")
+        }
+
+        /// A claim naming a user this server has never heard of is the
+        /// CALLER's mistake. It must not come back as a 500.
+        #[tokio::test]
+        async fn claiming_for_a_user_that_does_not_exist_is_a_404_not_a_500() {
+            let mut c = db!();
+            let err = real_fk_violation(&mut c).await;
+
+            let mapped = map_bind_device_error(&err);
+            assert_eq!(
+                mapped.status_code(),
+                StatusCode::NOT_FOUND,
+                "a claim for a nonexistent arena user must be reported as such, \
+                 not as a server fault — got {}",
+                mapped.status_code()
+            );
+            assert_eq!(
+                mapped.error_code(),
+                BIND_DEVICE_NO_SUCH_USER,
+                "the envelope must carry the no-such-user code so the capture \
+                 platform can say something useful"
+            );
+        }
+
+        /// The regression that hid the outage: the diesel error was thrown
+        /// away. Whatever the status, the cause must reach the log.
+        #[tokio::test]
+        async fn a_database_rejection_is_logged_not_swallowed() {
+            let mut c = db!();
+            let err = real_fk_violation(&mut c).await;
+
+            let Some(captured) = super::log_capture::start() else {
+                eprintln!(
+                    "SKIP: another logger owns this process — silent-failure regression NOT verified"
+                );
+                return;
+            };
+
+            let _ = map_bind_device_error(&err);
+
+            let lines = captured.take();
+            let found = lines
+                .iter()
+                .find(|l| l.contains("bind-device"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "mapping a database failure logged NOTHING about bind-device; \
+                         that is the defect that hid nine production 500s. Captured: {lines:?}"
+                    )
+                });
+            assert!(
+                found.contains("device_bindings_user_id_fkey"),
+                "the log line must name the constraint that rejected the write, \
+                 or it is not a diagnostic. Got: {found}"
+            );
+            assert!(
+                found.contains("ForeignKeyViolation"),
+                "the log line must carry diesel's classification of the SQLSTATE. Got: {found}"
+            );
+        }
+
         #[tokio::test]
         async fn the_list_carries_the_tunnel_each_device_was_seen_on() {
             let mut c = db!();

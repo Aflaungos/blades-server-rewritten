@@ -41,6 +41,13 @@ impl BladeApiError {
         }
     }
 
+    /// The envelope's error code. Exposed so tests can assert WHICH failure a
+    /// handler decided on, not merely that it failed — `status_code()` alone
+    /// cannot tell two 500s apart.
+    pub fn error_code(&self) -> u64 {
+        self.error_code
+    }
+
     pub fn unauthorized() -> Self {
         Self::new(StatusCode::UNAUTHORIZED, 1, 200)
     }
