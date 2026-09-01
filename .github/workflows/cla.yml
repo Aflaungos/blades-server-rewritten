@@ -156,13 +156,49 @@ jobs:
             lines.splice(last + 1, 0, row.trimEnd());
             next = lines.join('\n');
 
-            await github.rest.repos.createOrUpdateFileContents({
-              owner, repo, path: LEDGER,
-              message: `chore(cla): record acceptance by @${author} (#${prNumber})`,
-              content: Buffer.from(next, 'utf8').toString('base64'),
-              sha: file.data.sha,
-              branch: pr.base.ref,
-            });
+            // The acceptance is already PROVEN at this point — the comment exists
+            // and is quoted below. Recording it is bookkeeping, and bookkeeping
+            // failing must not read as "this person did not accept".
+            //
+            // It failed exactly that way once: a ruleset on the default branch
+            // required this very check on every push, so the write below 409'd
+            // with "Repository rule violations found — Required status check
+            // 'CLA accepted' is expected." The check that gates the push is the
+            // one produced by this job, so the job could never write and the job
+            // therefore always failed. Every contributor was blocked by a
+            // deadlock that reported itself as their fault.
+            try {
+              await github.rest.repos.createOrUpdateFileContents({
+                owner, repo, path: LEDGER,
+                message: `chore(cla): record acceptance by @${author} (#${prNumber})`,
+                content: Buffer.from(next, 'utf8').toString('base64'),
+                sha: file.data.sha,
+                branch: pr.base.ref,
+              });
+            } catch (err) {
+              // Pass the check — they accepted — but make the missing row loud
+              // and hand the maintainer the exact line to paste.
+              core.warning(
+                `Could not write ${LEDGER} (${err.status ?? '?'}: ${err.message}). ` +
+                `The acceptance is valid; the ledger row must be added by hand.`,
+              );
+              await github.rest.issues.createComment({
+                owner, repo, issue_number: prNumber,
+                body: [
+                  `@${author}'s acceptance of CLA v${CLA_VERSION} is **recorded as given** —`,
+                  `their comment on this pull request is the citation. This check passes.`,
+                  '',
+                  `The ledger row could not be written automatically (\`${err.status ?? 'error'}\`),`,
+                  `so a maintainer needs to add this line to \`${LEDGER}\`:`,
+                  '',
+                  '```',
+                  row.trimEnd(),
+                  '```',
+                ].join('\n'),
+              });
+              core.info(`${author} accepted; ledger row pending by hand.`);
+              return;
+            }
 
             await github.rest.issues.createComment({
               owner, repo, issue_number: prNumber,

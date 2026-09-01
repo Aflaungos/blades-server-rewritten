@@ -17,7 +17,7 @@ signing (CLA section 1), so each person appears once.
 
 | Contributor (GitHub) | CLA version | Accepted | Where |
 |---|---|---|---|
-| _none yet_ | | | |
+| [@Aflaungos](https://github.com/Aflaungos) | 1.0 | 2026-09-01 | [#123 comment](https://github.com/b3rntsen/blades-server-rewritten/pull/123#issuecomment-5486525080) |
 
 ## Before merging a first-time contributor
 
