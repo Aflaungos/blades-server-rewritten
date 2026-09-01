@@ -1068,7 +1068,7 @@ pub async fn update_quest_objectives(
 //     job_pools.json.
 //   * Never panics on the `Value` shape: a malformed / Null `job_pools` yields an
 //     empty jobs list and empty timers rather than a 500.
-mod jobs_gen {
+pub(crate) mod jobs_gen {
     use super::*;
     use blades_lib::game_data::GameData;
     use blades_lib::static_data::QuestLevelScaling;
@@ -1713,7 +1713,7 @@ mod jobs_gen {
 //     instance id resolves to nothing at all in `parsed.json`.
 //   * Completing the instance is repeatable: the Nth completion pays the Nth
 //     milestone, and the last also pays `finalReward` (see `complete_quest`).
-mod event_quests {
+pub(crate) mod event_quests {
     use super::*;
     use blades_lib::features::game_events::{self, EventDef, WARNING_LEAD_SECS};
     use blades_lib::game_data::GameData;

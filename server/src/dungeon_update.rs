@@ -204,7 +204,14 @@ pub async fn dungeon_update(
             {
                 use crate::schema::quests;
                 diesel::update(quests::table)
+                    // BOTH halves of the primary key. `quests.id` alone is NOT unique:
+                    // an ordinary story quest is stored under the template id, so every
+                    // character on that quest has a row with the same `id`, and an
+                    // update filtered on `id` writes one player's dungeon state into
+                    // all of them. The SELECT above is already scoped to this
+                    // character; the write has to be too.
                     .filter(quests::id.eq(quest_id))
+                    .filter(quests::character_id.eq(character_id))
                     .set(quest_data_rebuilt)
                     .execute(&mut conn)
                     .await?;
