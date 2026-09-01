@@ -1083,7 +1083,7 @@ pub struct PlacePropsResponse {
 /// The client sends a list of {propId, districtId} pairs to remove.
 /// Returns updated wallet, inventory, and town state.
 #[post(
-    "/api/game/v1/public/characters/{character_id}/towns/current/props/remove"
+    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/towns/current/props/remove"
 )]
 pub async fn remove_town_props(
     session: SessionLookedUpMaybe,
@@ -1301,7 +1301,7 @@ fn remove_decoration_from_inventory(
 }
 
 #[post(
-    "/api/game/v1/public/characters/{character_id}/towns/current/props"
+    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/towns/current/props"
 )]
 pub async fn place_town_props(
     session: SessionLookedUpMaybe,
@@ -1466,7 +1466,7 @@ fn place_props_in_town(
 // ─────────────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
-mod tests {
+mod prop_tests {
     use super::*;
 
     fn sample_town_with_props() -> Value {
@@ -1497,12 +1497,12 @@ mod tests {
                     }
                 },
                 {
-                    "id": "another-district-id",
+                    "id": "b2c3d4e5-6789-4abc-8def-0123456789ab",
                     "props": {
                         "key3": {
-                            "id": "g9876543-21ab-cdef-0123-456789abcdef",
-                            "propId": "g9876543-21ab-cdef-0123-456789abcdef",
-                            "districtId": "another-district-id",
+                            "id": "a9876543-21ab-4def-8123-456789abcdef",
+                            "propId": "a9876543-21ab-4def-8123-456789abcdef",
+                            "districtId": "b2c3d4e5-6789-4abc-8def-0123456789ab",
                             "typeId": "prop-in-other-district",
                             "x": 50.0,
                             "y": 60.0,
@@ -1524,16 +1524,16 @@ mod tests {
             DeletedProp { prop_id, district_id }
         ];
 
-        let (removed_count, failed) = remove_props_from_town(&mut town, &props_to_remove);
+        let (removed_count, failed, ..) = remove_props_from_town(&mut town, &props_to_remove);
         
         assert_eq!(removed_count, 1);
         assert!(failed.is_empty());
         
         // Verify the prop was removed
         let district = &town["districts"][0];
-        let props = district["props"].as_array().unwrap();
+        let props = district["props"].as_object().unwrap();
         assert_eq!(props.len(), 1);
-        assert_eq!(props[0]["id"], "f1234567-89ab-cdef-0123-456789abcdef");
+        assert_eq!(props["key2"]["id"], "f1234567-89ab-cdef-0123-456789abcdef");
     }
 
     #[test]
@@ -1548,14 +1548,14 @@ mod tests {
             DeletedProp { prop_id: prop2, district_id },
         ];
 
-        let (removed_count, failed) = remove_props_from_town(&mut town, &props_to_remove);
+        let (removed_count, failed, ..) = remove_props_from_town(&mut town, &props_to_remove);
         
         assert_eq!(removed_count, 2);
         assert!(failed.is_empty());
         
         // Verify all props were removed from the district
         let district = &town["districts"][0];
-        let props = district["props"].as_array().unwrap();
+        let props = district["props"].as_object().unwrap();
         assert_eq!(props.len(), 0);
     }
 
@@ -1571,7 +1571,7 @@ mod tests {
             DeletedProp { prop_id: non_existing_prop, district_id },
         ];
 
-        let (removed_count, failed) = remove_props_from_town(&mut town, &props_to_remove);
+        let (removed_count, failed, ..) = remove_props_from_town(&mut town, &props_to_remove);
         
         assert_eq!(removed_count, 1);
         assert_eq!(failed.len(), 1);
@@ -1579,7 +1579,7 @@ mod tests {
         
         // Verify the existing prop was removed
         let district = &town["districts"][0];
-        let props = district["props"].as_array().unwrap();
+        let props = district["props"].as_object().unwrap();
         assert_eq!(props.len(), 1);
     }
 
@@ -1602,7 +1602,7 @@ mod tests {
             DeletedProp { prop_id, district_id }
         ];
 
-        let (removed_count, failed) = remove_props_from_town(&mut town, &props_to_remove);
+        let (removed_count, failed, ..) = remove_props_from_town(&mut town, &props_to_remove);
         
         assert_eq!(removed_count, 0);
         assert_eq!(failed.len(), 1);
@@ -1619,7 +1619,7 @@ mod tests {
             DeletedProp { prop_id, district_id: wrong_district_id }
         ];
 
-        let (removed_count, failed) = remove_props_from_town(&mut town, &props_to_remove);
+        let (removed_count, failed, ..) = remove_props_from_town(&mut town, &props_to_remove);
         
         assert_eq!(removed_count, 0);
         assert_eq!(failed.len(), 1);
@@ -1627,7 +1627,7 @@ mod tests {
         
         // Verify the prop is still there (unchanged)
         let district = &town["districts"][0];
-        let props = district["props"].as_array().unwrap();
+        let props = district["props"].as_object().unwrap();
         assert_eq!(props.len(), 2);
     }
 
@@ -1636,14 +1636,14 @@ mod tests {
         let mut town = sample_town_with_props();
         let props_to_remove: Vec<DeletedProp> = vec![];
 
-        let (removed_count, failed) = remove_props_from_town(&mut town, &props_to_remove);
+        let (removed_count, failed, ..) = remove_props_from_town(&mut town, &props_to_remove);
         
         assert_eq!(removed_count, 0);
         assert!(failed.is_empty());
         
         // Town should be unchanged
         let district = &town["districts"][0];
-        let props = district["props"].as_array().unwrap();
+        let props = district["props"].as_object().unwrap();
         assert_eq!(props.len(), 2);
     }
 
@@ -1652,28 +1652,28 @@ mod tests {
         let mut town = sample_town_with_props();
         let prop1 = Uuid::parse_str("e915e0f4-3f86-41cb-b9e2-1ead10025c06").unwrap();
         let district1 = Uuid::parse_str("9a12c0d3-218c-4ef2-b78c-b6e3bca60719").unwrap();
-        let prop2 = Uuid::parse_str("g9876543-21ab-cdef-0123-456789abcdef").unwrap();
-        let district2 = Uuid::parse_str("another-district-id").unwrap();
+        let prop2 = Uuid::parse_str("a9876543-21ab-4def-8123-456789abcdef").unwrap();
+        let district2 = Uuid::parse_str("b2c3d4e5-6789-4abc-8def-0123456789ab").unwrap();
         
         let props_to_remove = vec![
             DeletedProp { prop_id: prop1, district_id: district1 },
             DeletedProp { prop_id: prop2, district_id: district2 },
         ];
 
-        let (removed_count, failed) = remove_props_from_town(&mut town, &props_to_remove);
+        let (removed_count, failed, ..) = remove_props_from_town(&mut town, &props_to_remove);
         
         assert_eq!(removed_count, 2);
         assert!(failed.is_empty());
         
         // Verify first district props
         let district = &town["districts"][0];
-        let props = district["props"].as_array().unwrap();
+        let props = district["props"].as_object().unwrap();
         assert_eq!(props.len(), 1); // Only prop2 remains
-        assert_eq!(props[0]["id"], "f1234567-89ab-cdef-0123-456789abcdef");
+        assert_eq!(props["key2"]["id"], "f1234567-89ab-cdef-0123-456789abcdef");
         
         // Verify second district props
         let district2 = &town["districts"][1];
-        let props2 = district2["props"].as_array().unwrap();
+        let props2 = district2["props"].as_object().unwrap();
         assert_eq!(props2.len(), 0);
     }
 }
