@@ -24,6 +24,7 @@
 //! the connection and surface to the player as the reported "network error upgrading
 //! smithy".
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use actix_web::{
@@ -1203,27 +1204,32 @@ pub async fn remove_town_props(
             let mut town = take_town(&mut entry, &app_state_clone)?;
 
             // Process prop removals and get decoration IDs removed
-            let (removed_count, failed_props, removed_decoration_ids, removed_prop_ids) = 
+            let (removed_count, failed_props, removed_decoration_ids, removed_prop_ids) =
                 remove_props_from_town(&mut town, &req.deleted_props);
 
+            // A prop the town doesn't hold refunds nothing, so don't half-apply the
+            // batch either: reject the whole request and let the transaction roll
+            // back. Crediting a "best effort" for a prop we never found is exactly
+            // how a remove endpoint turns into an item printer.
+            if !failed_props.is_empty() {
+                log::warn!(
+                    "character {character_id} asked to remove props not in its town: {failed_props:?}"
+                );
+                return Err(BladeApiError::new(
+                    StatusCode::CONFLICT,
+                    PROPS_SERVICE_ID,
+                    5,
+                ));
+            }
+
+            // CREDIT decorations back to inventory. `removed_decoration_ids` is
+            // read off the stored props, not off the request body.
             let mut tracker = InventoryChangeTracker::default();
-            
-            // RETURN decorations to inventory (add them back)
-            for decoration_id_str in &removed_decoration_ids {
-                if let Ok(decoration_uuid) = Uuid::parse_str(decoration_id_str) {
-                    entry
-                        .inventory
-                        .0
-                        .backpack
-                        .stackable_items
-                        .add(decoration_uuid, 1);
-                    tracker.modified_backpack.stackable_items.insert(decoration_uuid);
-                }
-            }
-            
-            if !removed_decoration_ids.is_empty() {
-                entry.inventory.0.backpack_version += 1;
-            }
+            credit_removed_decorations(
+                &mut entry.inventory.0,
+                &removed_decoration_ids,
+                &mut tracker,
+            );
 
             let inventory = entry.inventory.0.generate_client_update(&tracker);
             let wallet = entry.wallet.0.clone();
@@ -1243,12 +1249,6 @@ pub async fn remove_town_props(
                 .execute(&mut conn)
                 .await?;
 
-            // The client needs the prop IDs that were removed
-            let client_prop_ids: Vec<String> = req.deleted_props
-                .iter()
-                .map(|p| p.prop_id.to_string())
-                .collect();
-
             Ok(Json(RemovePropsResponse {
                 wallet,
                 inventory,
@@ -1256,7 +1256,9 @@ pub async fn remove_town_props(
                 validation_flags: 1,
                 removed_count,
                 failed_props,
-                removed_props: client_prop_ids,
+                // The ids we actually removed, read off the stored props — not
+                // echoed back from the request.
+                removed_props: removed_prop_ids,
                 placed_props: vec![],
                 success: removed_count > 0,
             }))
@@ -1267,12 +1269,20 @@ pub async fn remove_town_props(
 }
 
 /// Remove props from the town JSON structure and track what was removed.
-/// 
+///
 /// Returns (removed_count, failed_prop_ids, removed_decoration_ids, removed_prop_ids)
+///
+/// SECURITY: `removed_decoration_ids` is read off the *stored* prop's `propId`,
+/// never off the request. A caller names a prop by its `id` (the placement's own
+/// uuid, which the server minted and handed back in the town) and gets back
+/// whatever decoration that placement actually consumed. This is what retail
+/// does: the captured remove request carries only `{propId, districtId}` and the
+/// credited `itemTemplateId` is a different uuid entirely, so the refund cannot
+/// be steered by naming a template you'd like to be paid in.
 fn remove_props_from_town(
     town: &mut Value,
     props_to_remove: &[DeletedProp],
-) -> (usize, Vec<String>, Vec<String>, Vec<String>) {
+) -> (usize, Vec<String>, Vec<Uuid>, Vec<String>) {
     let mut removed_count = 0;
     let mut failed_props = Vec::new();
     let mut removed_decoration_ids = Vec::new();
@@ -1303,35 +1313,35 @@ fn remove_props_from_town(
                 None => continue,
             };
 
+            // Match on the placement's own `id` ONLY. Matching `propId` as well
+            // would let a caller address a placement by the decoration template
+            // it holds, which is not how retail addresses one and which makes
+            // "which prop did you mean" caller-controlled.
             let prop_key_to_remove = props.iter().find_map(|(key, prop_obj)| {
-                let matches_id = prop_obj
+                prop_obj
                     .get("id")
                     .and_then(Value::as_str)
                     .filter(|&id| id == target_prop_id)
-                    .is_some();
-                
-                let matches_prop_id = prop_obj
-                    .get("propId")
-                    .and_then(Value::as_str)
-                    .filter(|&prop_id| prop_id == target_prop_id)
-                    .is_some();
-                
-                if matches_id || matches_prop_id {
-                    Some(key.clone())
-                } else {
-                    None
-                }
+                    .map(|_| key.clone())
             });
 
             if let Some(key) = prop_key_to_remove {
-                // Get the prop data before removing
+                // Read the refund off the stored prop BEFORE removing it.
                 if let Some(prop_obj) = props.get(&key) {
                     // Track the decoration_id (propId field)
-                    if let Some(decoration_id) = prop_obj
-                        .get("propId")
-                        .and_then(Value::as_str)
-                    {
-                        removed_decoration_ids.push(decoration_id.to_string());
+                    match prop_obj.get("propId").and_then(Value::as_str) {
+                        Some(decoration_id) => match Uuid::parse_str(decoration_id) {
+                            Ok(uuid) => removed_decoration_ids.push(uuid),
+                            // A stored prop whose propId isn't a uuid is data we
+                            // can't refund against. Drop the refund rather than
+                            // guess one; losing an item beats minting one.
+                            Err(_) => log::warn!(
+                                "prop {target_prop_id} stores a non-uuid propId; refunding nothing"
+                            ),
+                        },
+                        None => log::warn!(
+                            "prop {target_prop_id} stores no propId; refunding nothing"
+                        ),
                     }
                     // Track the actual prop ID (id field) - this is what the client sent
                     if let Some(prop_id) = prop_obj
@@ -1341,7 +1351,7 @@ fn remove_props_from_town(
                         removed_prop_ids.push(prop_id.to_string());
                     }
                 }
-                
+
                 props.remove(&key);
                 removed_count += 1;
                 found = true;
@@ -1357,36 +1367,81 @@ fn remove_props_from_town(
     (removed_count, failed_props, removed_decoration_ids, removed_prop_ids)
 }
 
-/// Remove props from inventory after they're removed from the town.
-fn remove_decoration_from_inventory(
+/// Debit one of every decoration the client just placed.
+///
+/// Decorations are ordinary stackable backpack items and placing one CONSUMES it:
+/// the captured retail place response answers with the placed `decorationId` in
+/// `inventory.backpack.removedStackableItems`, i.e. the stack it came from went to
+/// zero. So a placement by a player who owns none of that decoration is not a
+/// warning to log past — it is a request to reject.
+///
+/// Two-phase like `charge_cost`: verify the whole batch (counting duplicates, so
+/// placing three of a decoration you own two of fails) before touching anything,
+/// so a rejected request leaves the inventory exactly as it found it.
+fn debit_placed_decorations(
     inventory: &mut CompleteInventory,
-    decoration_id: Uuid,
+    decoration_ids: &[Uuid],
     tracker: &mut InventoryChangeTracker,
 ) -> Result<(), BladeApiError> {
-    // Remove 1 of the decoration item from stackable items
-    // The decoration is stored as a stackable item in the backpack
-    let count = inventory.backpack.stackable_items.count(decoration_id);
-    if count > 0 {
+    if decoration_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut needed: HashMap<Uuid, u64> = HashMap::new();
+    for id in decoration_ids {
+        *needed.entry(*id).or_insert(0) += 1;
+    }
+
+    // Phase 1: verify ownership (no mutation) so we fail cleanly.
+    for (decoration_id, want) in &needed {
+        if inventory.backpack.stackable_items.count(*decoration_id) < *want {
+            log::warn!("decoration {decoration_id} not owned in sufficient quantity; refusing placement");
+            return Err(BladeApiError::new(
+                StatusCode::BAD_REQUEST,
+                PROPS_SERVICE_ID,
+                4,
+            ));
+        }
+    }
+
+    // Phase 2: commit. Every step was checked above, so these cannot fail.
+    for (decoration_id, want) in &needed {
         inventory
             .backpack
             .stackable_items
-            .remove(decoration_id, 1)
-            .map_err(|_| {
-                BladeApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    PROPS_SERVICE_ID,
-                    3,
-                )
+            .remove(*decoration_id, *want)
+            .map_err(|_have| {
+                BladeApiError::new(StatusCode::BAD_REQUEST, PROPS_SERVICE_ID, 4)
             })?;
-        tracker.modified_backpack.stackable_items.insert(decoration_id);
-        inventory.backpack_version += 1;
-        Ok(())
-    } else {
-        // The decoration might be in the treasury or elsewhere
-        // For now, just log and continue
-        log::warn!("Decoration {} not found in inventory", decoration_id);
-        Ok(())
+        tracker
+            .modified_backpack
+            .stackable_items
+            .insert(*decoration_id);
     }
+    inventory.backpack_version += 1;
+    Ok(())
+}
+
+/// Credit back the decorations the removed props were actually holding.
+///
+/// `decoration_ids` must come from the stored props (see `remove_props_from_town`),
+/// never from the request body.
+fn credit_removed_decorations(
+    inventory: &mut CompleteInventory,
+    decoration_ids: &[Uuid],
+    tracker: &mut InventoryChangeTracker,
+) {
+    if decoration_ids.is_empty() {
+        return;
+    }
+    for decoration_id in decoration_ids {
+        inventory.backpack.stackable_items.add(*decoration_id, 1);
+        tracker
+            .modified_backpack
+            .stackable_items
+            .insert(*decoration_id);
+    }
+    inventory.backpack_version += 1;
 }
 
 #[post(
@@ -1422,25 +1477,18 @@ pub async fn place_town_props(
             let mut town = take_town(&mut entry, &app_state_clone)?;
 
             // Process prop placements and get decoration IDs placed
-            let (placed_count, failed_props, placed_decoration_ids) = 
+            let (placed_count, failed_props, placed_decoration_ids) =
                 place_props_in_town(&mut town, &req.placed_props);
 
-            // REMOVE decorations from inventory (consuming the items)
+            // DEBIT the decorations from inventory (placing one consumes it).
+            // Fails closed: if the player doesn't own them, the `?` aborts the
+            // transaction and neither the town nor the inventory is written.
             let mut tracker = InventoryChangeTracker::default();
-            
-            for decoration_id_str in &placed_decoration_ids {
-                if let Ok(decoration_uuid) = Uuid::parse_str(decoration_id_str) {
-                    remove_decoration_from_inventory(
-                        &mut entry.inventory.0,
-                        decoration_uuid,
-                        &mut tracker,
-                    )?;
-                }
-            }
-            
-            if !placed_decoration_ids.is_empty() {
-                entry.inventory.0.backpack_version += 1;
-            }
+            debit_placed_decorations(
+                &mut entry.inventory.0,
+                &placed_decoration_ids,
+                &mut tracker,
+            )?;
 
             let inventory = entry.inventory.0.generate_client_update(&tracker);
             let wallet = entry.wallet.0.clone();
@@ -1461,7 +1509,11 @@ pub async fn place_town_props(
                 validation_flags: 1,
                 placed_count,
                 failed_props,
-                placed_props: placed_decoration_ids, // Send back what was placed
+                // Send back what was placed
+                placed_props: placed_decoration_ids
+                    .iter()
+                    .map(Uuid::to_string)
+                    .collect(),
             }))
         }
         .scope_boxed()
@@ -1477,7 +1529,7 @@ pub async fn place_town_props(
 fn place_props_in_town(
     town: &mut Value,
     props_to_place: &[PlacedProp],
-) -> (usize, Vec<String>, Vec<String>) {
+) -> (usize, Vec<String>, Vec<Uuid>) {
     let mut placed_count = 0;
     let mut failed_props = Vec::new();
     let mut placed_decoration_ids = Vec::new(); // Track decoration IDs placed
@@ -1537,9 +1589,9 @@ fn place_props_in_town(
 
             props.insert(anchor_id_str.clone(), prop_obj);
             placed_count += 1;
-            
+
             // Track the decoration ID that was placed
-            placed_decoration_ids.push(decoration_id_str);
+            placed_decoration_ids.push(decoration_id);
             break;
         }
 
@@ -1559,6 +1611,16 @@ fn place_props_in_town(
 mod prop_tests {
     use super::*;
 
+    /// A placement's own `id` and the decoration template it holds (`propId`) are
+    /// DIFFERENT uuids — that is how `deploy/static/default_town.json` stores them
+    /// and how the captured retail remove pair reads: the request names
+    /// `propId: 56ae4e9f-…` (the placement) and the response credits
+    /// `itemTemplateId: 3fc190cd-…` (the decoration). A fixture that sets the two
+    /// equal cannot tell a stored-state refund from a request-echo refund.
+    const DECORATION_A: &str = "fa792ef4-4ef2-4f7b-80a9-8e6b6e205374";
+    const DECORATION_B: &str = "3fc190cd-c244-43b9-9a78-fcecb0d6860c";
+    const DECORATION_C: &str = "7666963f-5769-4c41-aa2d-474c05bd717e";
+
     fn sample_town_with_props() -> Value {
         json!({
             "levelInfo": { "level": 6 },
@@ -1568,7 +1630,7 @@ mod prop_tests {
                     "props": {
                         "key1": {
                             "id": "e915e0f4-3f86-41cb-b9e2-1ead10025c06",
-                            "propId": "e915e0f4-3f86-41cb-b9e2-1ead10025c06",
+                            "propId": DECORATION_A,
                             "districtId": "9a12c0d3-218c-4ef2-b78c-b6e3bca60719",
                             "typeId": "some-prop-type",
                             "x": 10.0,
@@ -1577,7 +1639,7 @@ mod prop_tests {
                         },
                         "key2": {
                             "id": "f1234567-89ab-cdef-0123-456789abcdef",
-                            "propId": "f1234567-89ab-cdef-0123-456789abcdef",
+                            "propId": DECORATION_B,
                             "districtId": "9a12c0d3-218c-4ef2-b78c-b6e3bca60719",
                             "typeId": "another-prop",
                             "x": 30.0,
@@ -1591,7 +1653,7 @@ mod prop_tests {
                     "props": {
                         "key3": {
                             "id": "a9876543-21ab-4def-8123-456789abcdef",
-                            "propId": "a9876543-21ab-4def-8123-456789abcdef",
+                            "propId": DECORATION_C,
                             "districtId": "b2c3d4e5-6789-4abc-8def-0123456789ab",
                             "typeId": "prop-in-other-district",
                             "x": 50.0,
@@ -1602,6 +1664,29 @@ mod prop_tests {
                 }
             ]
         })
+    }
+
+    fn inventory_with(stack: &[(&str, u64)]) -> CompleteInventory {
+        use blades_lib::user_data::*;
+        let mut inventory = CompleteInventory {
+            backpack: Backpack::default(),
+            loadout: Loadout::default(),
+            treasury: Treasury::default(),
+            overflow_treasury: Treasury::default(),
+            backpack_version: 41,
+            treasury_version: 4,
+        };
+        for (template, count) in stack {
+            inventory
+                .backpack
+                .stackable_items
+                .add(Uuid::parse_str(template).unwrap(), *count);
+        }
+        inventory
+    }
+
+    fn uuid(s: &str) -> Uuid {
+        Uuid::parse_str(s).unwrap()
     }
 
     #[test]
@@ -1765,6 +1850,267 @@ mod prop_tests {
         let district2 = &town["districts"][1];
         let props2 = district2["props"].as_object().unwrap();
         assert_eq!(props2.len(), 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Placing DEBITS the decoration, and it fails closed.
+    //
+    // Captured retail place request/response:
+    //   REQ  {"placedProps":[{"anchorId":…,"decorationId":"fa792ef4-…","districtId":…}]}
+    //   RESP {"inventory":{"backpack":{"removedStackableItems":["fa792ef4-…"]}}, …}
+    // The placed decorationId comes back as a REMOVED stackable, i.e. the stack it
+    // was taken from hit zero. Decorations are stackable inventory and placing one
+    // spends it.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn placing_a_decoration_you_own_debits_exactly_one() {
+        let mut inventory = inventory_with(&[(DECORATION_A, 3)]);
+        let mut tracker = InventoryChangeTracker::default();
+
+        debit_placed_decorations(&mut inventory, &[uuid(DECORATION_A)], &mut tracker).unwrap();
+
+        assert_eq!(
+            inventory.backpack.stackable_items.count(uuid(DECORATION_A)),
+            2
+        );
+        assert_eq!(inventory.backpack_version, 42);
+    }
+
+    #[test]
+    fn placing_a_decoration_you_do_not_own_fails_and_debits_nothing() {
+        // Owns B, tries to place A. Before the fix this logged a warning and
+        // returned Ok, so the placement stuck and the later remove credited a
+        // decoration that had never been paid for.
+        let mut inventory = inventory_with(&[(DECORATION_B, 5)]);
+        let mut tracker = InventoryChangeTracker::default();
+
+        use actix_web::ResponseError;
+        let err = debit_placed_decorations(&mut inventory, &[uuid(DECORATION_A)], &mut tracker)
+            .expect_err("placing an unowned decoration must fail");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+
+        assert_eq!(
+            inventory.backpack.stackable_items.count(uuid(DECORATION_A)),
+            0
+        );
+        assert_eq!(
+            inventory.backpack.stackable_items.count(uuid(DECORATION_B)),
+            5,
+            "a rejected placement must not touch the rest of the backpack"
+        );
+        assert_eq!(inventory.backpack_version, 41, "version must not move");
+        assert!(tracker.modified_backpack.stackable_items.is_empty());
+    }
+
+    #[test]
+    fn placing_more_copies_than_you_own_fails_and_debits_nothing() {
+        // Two of A owned, three placed in one batch. Verifying per-item as we go
+        // would debit the first two before failing on the third.
+        let mut inventory = inventory_with(&[(DECORATION_A, 2)]);
+        let mut tracker = InventoryChangeTracker::default();
+
+        debit_placed_decorations(
+            &mut inventory,
+            &[uuid(DECORATION_A), uuid(DECORATION_A), uuid(DECORATION_A)],
+            &mut tracker,
+        )
+        .expect_err("placing three of a decoration you own two of must fail");
+
+        assert_eq!(
+            inventory.backpack.stackable_items.count(uuid(DECORATION_A)),
+            2,
+            "the whole batch must roll back, not just the unaffordable tail"
+        );
+        assert_eq!(inventory.backpack_version, 41);
+    }
+
+    #[test]
+    fn a_placed_decoration_spent_to_zero_is_reported_as_a_removed_stackable() {
+        // Retail response shape: inventory.backpack.removedStackableItems carries
+        // the placed decorationId.
+        let mut inventory = inventory_with(&[(DECORATION_A, 1)]);
+        let mut tracker = InventoryChangeTracker::default();
+        debit_placed_decorations(&mut inventory, &[uuid(DECORATION_A)], &mut tracker).unwrap();
+
+        let update = serde_json::to_value(inventory.generate_client_update(&tracker)).unwrap();
+        assert_eq!(
+            update["backpack"]["removedStackableItems"],
+            json!([DECORATION_A])
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Removing REFUNDS from stored state — the anti-mint property.
+    //
+    // Captured retail remove request/response:
+    //   REQ  {"deletedProps":[{"propId":"56ae4e9f-…","districtId":…}]}
+    //   RESP {"inventory":{"backpack":{"stackableItems":[
+    //           {"itemTemplateId":"3fc190cd-…","count":1}]}},
+    //         "town":{"removedProps":["56ae4e9f-…"], …}}
+    // The request names a PLACEMENT; the credited itemTemplateId is a different
+    // uuid. Retail therefore resolves what to refund from the stored prop. The
+    // request body carries no refundable id at all, so it cannot name one.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_refund_is_read_off_the_stored_prop_not_the_request() {
+        let mut town = sample_town_with_props();
+        // The caller names the placement's own id. It is not a decoration id, and
+        // it is not what gets credited.
+        let placement_id = uuid("e915e0f4-3f86-41cb-b9e2-1ead10025c06");
+        let district_id = uuid("9a12c0d3-218c-4ef2-b78c-b6e3bca60719");
+
+        let (removed_count, failed, refunds, removed_prop_ids) = remove_props_from_town(
+            &mut town,
+            &[DeletedProp {
+                prop_id: placement_id,
+                district_id,
+            }],
+        );
+
+        assert_eq!(removed_count, 1);
+        assert!(failed.is_empty());
+        assert_eq!(
+            refunds,
+            vec![uuid(DECORATION_A)],
+            "the refund must be the stored propId, not the id the caller sent"
+        );
+        assert_ne!(
+            refunds[0], placement_id,
+            "fixture is degenerate if these are equal"
+        );
+        assert_eq!(removed_prop_ids, vec![placement_id.to_string()]);
+    }
+
+    #[test]
+    fn naming_a_decoration_template_removes_nothing_and_refunds_nothing() {
+        // The mint: ask to remove a "prop" by naming the stackable template you
+        // want to be paid in. DECORATION_B really is stored on a prop in this
+        // district — as its propId, never as its id — so a lookup that also
+        // matched propId would remove that prop and hand back a template the
+        // caller chose.
+        let mut town = sample_town_with_props();
+        let district_id = uuid("9a12c0d3-218c-4ef2-b78c-b6e3bca60719");
+
+        let (removed_count, failed, refunds, removed_prop_ids) = remove_props_from_town(
+            &mut town,
+            &[DeletedProp {
+                prop_id: uuid(DECORATION_B),
+                district_id,
+            }],
+        );
+
+        assert_eq!(removed_count, 0);
+        assert_eq!(failed, vec![DECORATION_B.to_string()]);
+        assert!(refunds.is_empty(), "a template id must not name a placement");
+        assert!(removed_prop_ids.is_empty());
+        // And nothing left the town.
+        assert_eq!(town["districts"][0]["props"].as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn removing_a_prop_the_town_does_not_hold_credits_nothing() {
+        let mut town = sample_town_with_props();
+        let district_id = uuid("9a12c0d3-218c-4ef2-b78c-b6e3bca60719");
+
+        let (removed_count, failed, refunds, _) = remove_props_from_town(
+            &mut town,
+            &[DeletedProp {
+                prop_id: uuid("00000000-0000-0000-0000-0000000000ff"),
+                district_id,
+            }],
+        );
+
+        assert_eq!(removed_count, 0);
+        assert_eq!(failed.len(), 1);
+        assert!(refunds.is_empty());
+
+        // And with nothing to refund, the credit path is a no-op on the wallet-side
+        // inventory: no item, no version bump.
+        let mut inventory = inventory_with(&[(DECORATION_A, 1)]);
+        let mut tracker = InventoryChangeTracker::default();
+        credit_removed_decorations(&mut inventory, &refunds, &mut tracker);
+        assert_eq!(
+            inventory.backpack.stackable_items.count(uuid(DECORATION_A)),
+            1
+        );
+        assert_eq!(inventory.backpack_version, 41);
+        assert!(tracker.modified_backpack.stackable_items.is_empty());
+    }
+
+    #[test]
+    fn a_refund_is_reported_with_item_template_id_and_count() {
+        // Retail response shape: inventory.backpack.stackableItems carries
+        // [{itemTemplateId, count}].
+        let mut inventory = inventory_with(&[]);
+        let mut tracker = InventoryChangeTracker::default();
+        credit_removed_decorations(&mut inventory, &[uuid(DECORATION_B)], &mut tracker);
+
+        assert_eq!(
+            inventory.backpack.stackable_items.count(uuid(DECORATION_B)),
+            1
+        );
+        assert_eq!(inventory.backpack_version, 42);
+
+        let update = serde_json::to_value(inventory.generate_client_update(&tracker)).unwrap();
+        assert_eq!(
+            update["backpack"]["stackableItems"],
+            json!([{ "itemTemplateId": DECORATION_B, "count": 1 }])
+        );
+    }
+
+    #[test]
+    fn place_then_remove_is_a_round_trip_not_a_profit() {
+        // The end-to-end property: whatever a place/remove cycle names, the player
+        // ends with what they started with — never a template they picked.
+        let district_id = uuid("9a12c0d3-218c-4ef2-b78c-b6e3bca60719");
+        let anchor_id = uuid("5facb057-1c1e-4ae0-9d2a-6f0d3c4b8a11");
+        let mut town = sample_town_with_props();
+        let mut inventory = inventory_with(&[(DECORATION_A, 1)]);
+        let mut tracker = InventoryChangeTracker::default();
+
+        let (_, _, placed) = place_props_in_town(
+            &mut town,
+            &[PlacedProp {
+                anchor_id,
+                decoration_id: uuid(DECORATION_A),
+                district_id,
+            }],
+        );
+        debit_placed_decorations(&mut inventory, &placed, &mut tracker).unwrap();
+        assert_eq!(
+            inventory.backpack.stackable_items.count(uuid(DECORATION_A)),
+            0
+        );
+
+        // Read the server-minted placement id back out of the town, as the client
+        // would, and remove it.
+        let placement_id = town["districts"][0]["props"][&anchor_id.to_string()]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (removed_count, failed, refunds, _) = remove_props_from_town(
+            &mut town,
+            &[DeletedProp {
+                prop_id: uuid(&placement_id),
+                district_id,
+            }],
+        );
+        assert_eq!(removed_count, 1);
+        assert!(failed.is_empty());
+        credit_removed_decorations(&mut inventory, &refunds, &mut tracker);
+
+        assert_eq!(
+            inventory.backpack.stackable_items.count(uuid(DECORATION_A)),
+            1,
+            "back to where we started"
+        );
+        assert_eq!(
+            inventory.backpack.stackable_items.count(uuid(DECORATION_B)),
+            0,
+            "and nothing else was minted along the way"
+        );
     }
 }
 
