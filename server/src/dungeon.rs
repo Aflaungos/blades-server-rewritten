@@ -1,4 +1,6 @@
-use std::{collections::HashMap, sync::Arc};
+use blades_lib::util::dungeon::generate_for_dungeon;
+
+use std::{collections::{HashMap, HashSet}, sync::Arc};
 
 use actix_web::{
     get,
@@ -10,6 +12,7 @@ use blades_lib::game_data::GameData;
 use blades_lib::user_data::{
     B64EncodedData, CompleteCharacterWithIdWithoutData, DungeonState, DungeonStatus, Quest,
 };
+
 use diesel::{
     BoolExpressionMethods, ExpressionMethods, QueryDsl, SelectableHelper, associations::HasTable,
 };
@@ -313,6 +316,21 @@ pub async fn enter_quest_dungeon(
                 if quest.dungeon_state.is_some() {
                     return Err(BladeApiError::new(StatusCode::CONFLICT, 20003, 1));
                 }
+
+                let dungeon_data = generate_for_dungeon(
+                    &app_state_clone.game_data,
+                    &app_state_clone.static_data,
+                    &dungeon_info.dungeon_uuid,
+                    1,   // enemy_level
+                    100, // given_xp
+                ).unwrap_or_else(|| DungeonGeneratedData {
+                    enemy_generated_data: HashMap::new(),
+                    item_generated_data: HashMap::new(),
+                    chest_generated_data: HashMap::new(),
+                    algorithm_version: 1,
+                    version: 0,
+                });
+
                 let status = DungeonStatus {
                     dungeon_settings_ids: vec![dungeon_settings_id],
                     revive_count: 0,
@@ -322,6 +340,7 @@ pub async fn enter_quest_dungeon(
                     seed: 54321,
                     level: 1,
                     version: 1, //TODO: figure out where this version come from.
+                    collected_chests: HashSet::default(),
                 };
 
                 {
@@ -334,6 +353,7 @@ pub async fn enter_quest_dungeon(
                                 dungeon_status: status.clone(),
                             }))),
                             initial_state.eq(Some(JsonDbWrapper(dungeon_instance.clone()))),
+                            generated_data.eq(JsonDbWrapper(dungeon_data)),
                         ))
                         .execute(&mut conn)
                         .await
