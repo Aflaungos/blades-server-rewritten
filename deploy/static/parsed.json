@@ -3452,62 +3452,6 @@
 			"name": "Items.Name.SteelWarhammer",
 			"type": 2
 		},
-		"ddbfda14-263b-46cd-8baa-866addf222d8": {
-			"name": "Items.Name.Large_Gazebo",
-			"type": 4
-		},
-		"ea5b4d2c-61cc-49e6-acaa-e41d6dd4adc9": {
-			"name": "Items.Name.Large_Tree1",
-			"type": 4
-		},
-		"88a6343f-12dd-4b01-a936-34fd7b73df95": {
-			"name": "Items.Name.Large_Tree2",
-			"type": 4
-		},
-		"ad7b7fac-7fb3-494a-8771-6db6cb060fe4": {
-			"name": "Items.Name.Large_Gallows",
-			"type": 4
-		},
-		"d25c8faa-5943-4ab1-99d2-aab025ecb581": {
-			"name": "Items.Name.Large_CreepyTree",
-			"type": 4
-		},
-		"d13183d0-56e4-4ea6-9514-6270b4097dea": {
-			"name": "Items.Name.SmallFirePit",
-			"type": 4
-		},
-		"023ee5a7-ea62-4214-8749-84da4de5793b": {
-			"name": "Items.Name.Medium_Stele1",
-			"type": 4
-		},
-		"2cf13c38-bfb1-4668-93a2-1199478854b6": {
-			"name": "Items.Name.Medium_Stele2",
-			"type": 4
-		},
-		"aade0180-4604-45ce-b80e-10887c76ea8e": {
-			"name": "Items.Name.Medium_Pillories",
-			"type": 4
-		},
-		"94424df9-f602-433d-bb20-253239ef1a11": {
-			"name": "Items.Name.Medium_Tree1",
-			"type": 4
-		},
-		"020a4cb8-7ffc-473c-87b6-cfc1fe5215f8": {
-			"name": "Items.Name.Medium_Tree2",
-			"type": 4
-		},
-		"052459c3-e349-492a-a2c4-71f366780fbf": {
-			"name": "Items.Name.Medium_Tree3",
-			"type": 4
-		},
-		"0bb2b12e-49f6-4f7d-bcd1-c8b4fd548786": {
-			"name": "Items.Name.Medium_Tree4",
-			"type": 4
-		},
-		"eba7fa4c-680f-419f-9327-c029eaece391": {
-			"name": "Items.Name.Medium_Outhouse",
-			"type": 4
-		},
 		"32e687ba-bcda-4233-ab59-b168137e0e90": {
 			"name": "Items.Name.Medium_ArcheryTarget",
 			"type": 4
@@ -4072,29 +4016,441 @@
 			"name": "Items.Name.Small_ImperialArenaBanner",
 			"type": 4
 		},
-		"38d32048-ce01-4390-a4f0-cdb94ef3ce72": {
-			"name": "Item.DecorationResource.Bronze",
-			"type": 8
+		"6a970282-7c77-4ea6-858a-4243dbae300a": {
+			"name": "Items.Name.DwarvenDagger",
+			"type": 2
 		},
-		"61d5e5c7-78b8-4fc3-ba6a-5b7c2a15866d": {
-			"name": "Item.DecorationResource.Marble",
-			"type": 8
+		"1d473c61-d4b3-4cea-9779-e76f30ae8736": {
+			"name": "Items.Name.DwarvenHandAxe",
+			"type": 2
 		},
-		"574ab81c-1ba1-4127-a4aa-e9cbba5767ad": {
-			"name": "Item.DecorationResource.Fabric",
-			"type": 8
+		"893142cb-42fe-432a-a363-bd92601d00e6": {
+			"name": "Items.Name.DwarvenLightHammer",
+			"type": 2
 		},
-		"b94c2028-dba7-44bd-b6f9-6f85ab0195b6": {
-			"name": "Item.DecorationResource.Seed",
-			"type": 8
+		"91cc0563-6717-4275-abf5-a97eeee84847": {
+			"name": "Items.Name.DwarvenWarAxe",
+			"type": 2
 		},
-		"6bd960ca-9af3-4b33-9ec0-5c06d50ad43e": {
-			"name": "Item.DecorationResource.Dye",
-			"type": 8
+		"8535e31c-a154-40e2-96af-cd5258a5ba8d": {
+			"name": "Items.Name.DwarvenLongsword",
+			"type": 2
 		},
-		"8ac9076c-cba9-4cf4-a8a5-d2303aab22b0": {
-			"name": "Item.DecorationResource.Crystal",
-			"type": 8
+		"a9a0800e-4363-41a0-ae4c-465f2d1c0089": {
+			"name": "Items.Name.DwarvenMace",
+			"type": 2
+		},
+		"995a487c-3221-4622-bfd3-67f8a7d08919": {
+			"name": "Items.Name.DwarvenGreatsword",
+			"type": 2
+		},
+		"d028c583-84bf-4cde-a0be-a648a5efa563": {
+			"name": "Items.Name.DwarvenBattleaxe",
+			"type": 2
+		},
+		"da35b882-dde4-44ce-ad03-8d472c20b91b": {
+			"name": "Items.Name.DwarvenWarhammer",
+			"type": 2
+		},
+		"c756bb4f-3717-4e18-a003-23f1fa0b3f32": {
+			"name": "Items.Name.EbonyDagger",
+			"type": 2
+		},
+		"f49b1546-8d71-4d68-98e8-9ec706a11b2a": {
+			"name": "Items.Name.EbonyHandAxe",
+			"type": 2
+		},
+		"2772e3de-814d-4b00-9ad1-a030e1d85f25": {
+			"name": "Items.Name.EbonyLightHammer",
+			"type": 2
+		},
+		"abb5db28-a599-450c-b3d4-315e60bde6e1": {
+			"name": "Items.Name.EbonyWarAxe",
+			"type": 2
+		},
+		"40ab6f8f-ef43-417a-a8e6-182837f4c10f": {
+			"name": "Items.Name.EbonyLongsword",
+			"type": 2
+		},
+		"0bb745aa-9a4a-483f-a23f-e8c773391321": {
+			"name": "Items.Name.EbonyMace",
+			"type": 2
+		},
+		"54f92dc7-7b26-4b07-bcb4-6c14732ca3ba": {
+			"name": "Items.Name.EbonyGreatsword",
+			"type": 2
+		},
+		"7d7fe9d2-3965-416f-839a-42f30663b78e": {
+			"name": "Items.Name.EbonyBattleaxe",
+			"type": 2
+		},
+		"6f4d3002-37f8-4396-9caf-33143f464911": {
+			"name": "Items.Name.EbonyWarhammer",
+			"type": 2
+		},
+		"6225ea23-85e3-4d74-ac54-f91e77b36867": {
+			"name": "Items.Name.ElvenDagger",
+			"type": 2
+		},
+		"ff1f3743-5092-49cc-8e10-39c524cea07c": {
+			"name": "Items.Name.ElvenHandAxe",
+			"type": 2
+		},
+		"e5f4f10d-2607-49ff-955c-43d4e2b260d5": {
+			"name": "Items.Name.ElvenLightHammer",
+			"type": 2
+		},
+		"9d269f59-e9c2-46ae-8b19-b68e13365387": {
+			"name": "Items.Name.ElvenWarAxe",
+			"type": 2
+		},
+		"99007305-7e07-42ae-a1b2-aa5f3fa08fd7": {
+			"name": "Items.Name.ElvenLongsword",
+			"type": 2
+		},
+		"ade3e935-3882-44bc-9c3f-583c6da7c5fb": {
+			"name": "Items.Name.ElvenMace",
+			"type": 2
+		},
+		"24c5f3a7-d89a-4582-8d06-d6c59b2b34d3": {
+			"name": "Items.Name.ElvenGreatsword",
+			"type": 2
+		},
+		"244ab654-adfd-4b63-acdd-80793d9bb8e7": {
+			"name": "Items.Name.ElvenBattleaxe",
+			"type": 2
+		},
+		"074dc210-2cd0-4c9a-8c43-48b481d010c3": {
+			"name": "Items.Name.ElvenWarhammer",
+			"type": 2
+		},
+		"0f2f990b-99fd-4ac8-9fbb-2d45abcabe6a": {
+			"name": "Items.Name.ForswornDagger",
+			"type": 2
+		},
+		"373d4247-0b86-4353-ab0a-27f884461d19": {
+			"name": "Items.Name.ForswornHandAxe",
+			"type": 2
+		},
+		"d7fbfbff-3a86-4f20-8301-fe9f28133584": {
+			"name": "Items.Name.ForswornLightHammer",
+			"type": 2
+		},
+		"5a6c2eb7-b430-4574-aad9-72f0657fc694": {
+			"name": "Items.Name.ForswornWarAxe",
+			"type": 2
+		},
+		"9eff3765-6849-4f46-8cfb-afd43aae4b32": {
+			"name": "Items.Name.ForswornLongsword",
+			"type": 2
+		},
+		"1ac5f725-b6e2-4bfa-b4bf-1b5787e7eaa5": {
+			"name": "Items.Name.ForswornMace",
+			"type": 2
+		},
+		"727ea9a4-0c59-4ea7-ab23-6400ad32030e": {
+			"name": "Items.Name.ForswornGreatsword",
+			"type": 2
+		},
+		"dddadcb6-81a1-4e16-88e0-c141e6c87e0d": {
+			"name": "Items.Name.ForswornBattleaxe",
+			"type": 2
+		},
+		"85234482-0baf-4ac2-8dee-5e086368f7dc": {
+			"name": "Items.Name.ForswornWarhammer",
+			"type": 2
+		},
+		"82ed9c7a-bda4-446d-a83f-586d239e2fb9": {
+			"name": "Items.Name.GlassDagger",
+			"type": 2
+		},
+		"02e24de3-8a40-483c-a404-eee6a0016ed0": {
+			"name": "Items.Name.GlassHandAxe",
+			"type": 2
+		},
+		"1201033d-4d70-405b-95a1-1e0cb827e180": {
+			"name": "Items.Name.GlassLightHammer",
+			"type": 2
+		},
+		"cf3e7430-ef8d-4d57-95be-773373540f99": {
+			"name": "Items.Name.GlassWarAxe",
+			"type": 2
+		},
+		"e3e4b409-60c6-4ba9-aa5d-5fbdc5621cb0": {
+			"name": "Items.Name.GlassLongsword",
+			"type": 2
+		},
+		"347d1331-f81c-468d-a6cd-cc412e72f87a": {
+			"name": "Items.Name.GlassMace",
+			"type": 2
+		},
+		"5dbdf6ab-71ce-44ce-8d31-a8522291f43d": {
+			"name": "Items.Name.GlassGreatsword",
+			"type": 2
+		},
+		"767e0dde-f70c-4c27-b896-ac70ad6c8aed": {
+			"name": "Items.Name.GlassBattleaxe",
+			"type": 2
+		},
+		"f083d578-b181-4f82-9cf2-f0c8def9272c": {
+			"name": "Items.Name.GlassWarhammer",
+			"type": 2
+		},
+		"69448727-ce84-4942-bc04-47b26f67d1ef": {
+			"name": "NO_KEY",
+			"type": 2
+		},
+		"a3afdc1f-dbb1-4f37-b8e9-2c7d1fb31db3": {
+			"name": "Items.Name.GoldenSaintDagger",
+			"type": 2
+		},
+		"6cac9081-a5ca-4429-bccc-af745d8f98ab": {
+			"name": "Items.Name.GoldenSaintHandAxe",
+			"type": 2
+		},
+		"c83e2044-6c37-470a-8c5e-a6d09f9f858c": {
+			"name": "Items.Name.GoldenSaintLightHammer",
+			"type": 2
+		},
+		"22e7d97c-cb89-4bb4-8051-0673cdc20a3e": {
+			"name": "Items.Name.GoldenSaintWarAxe",
+			"type": 2
+		},
+		"767b01b9-42e3-4a9a-a263-f71799b8f6b9": {
+			"name": "Items.Name.GoldenSaintLongsword",
+			"type": 2
+		},
+		"c451f484-bde1-47d9-87af-137688216c35": {
+			"name": "Items.Name.GoldenSaintMace",
+			"type": 2
+		},
+		"cb942551-5e93-493d-ab61-0d8ccfd9fe85": {
+			"name": "Items.Name.GoldenSaintGreatsword",
+			"type": 2
+		},
+		"780cc7c6-a472-43ec-abdc-02419d0c0ade": {
+			"name": "Items.Name.GoldenSaintBattleaxe",
+			"type": 2
+		},
+		"9d70a58c-75dc-4724-82e3-33a70ea2f803": {
+			"name": "Items.Name.GoldenSaintWarhammer",
+			"type": 2
+		},
+		"cdbabba6-a6a2-46ed-a086-93d77acc274a": {
+			"name": "Items.Name.IronDagger",
+			"type": 2
+		},
+		"11565fed-66a0-40a4-ac8d-65c7161c3283": {
+			"name": "Items.Name.IronHandAxe",
+			"type": 2
+		},
+		"a56f9a46-85d3-4d11-8da3-f8073a2eb064": {
+			"name": "Items.Name.IronLightHammer",
+			"type": 2
+		},
+		"6fe63664-4252-4269-9f51-8546b5f138da": {
+			"name": "Items.Name.IronWarAxe",
+			"type": 2
+		},
+		"606c8bf6-9dc7-4c5f-b44b-36eb02306c96": {
+			"name": "Items.Name.IronLongsword",
+			"type": 2
+		},
+		"9814bcf0-a984-49e2-84f6-a8b0f3695f84": {
+			"name": "Items.Name.IronMace",
+			"type": 2
+		},
+		"aadb8911-d7bb-4ea9-a7f4-6aeb99ad8ed3": {
+			"name": "Items.Name.IronGreatsword",
+			"type": 2
+		},
+		"8d5a227b-9660-4f6a-b3b7-c9e8cb76651a": {
+			"name": "Items.Name.IronBattleaxe",
+			"type": 2
+		},
+		"fb4cd249-fb01-4604-8cf3-5bc3e4c9a4d8": {
+			"name": "Items.Name.IronWarhammer",
+			"type": 2
+		},
+		"c1d682a7-d07d-43c9-b022-c3a033a6976d": {
+			"name": "Items.Name.NordicSteelDagger",
+			"type": 2
+		},
+		"7e354002-2d94-4296-a4a5-592f81ba04e3": {
+			"name": "Items.Name.NordicSteelHandAxe",
+			"type": 2
+		},
+		"26e46ca5-cee6-45a4-9f46-41fb9364b0ec": {
+			"name": "Items.Name.NordicSteelLightHammer",
+			"type": 2
+		},
+		"6d4fd4bc-c439-4fcd-9004-85d9aa0c7bf4": {
+			"name": "Items.Name.NordicSteelWarAxe",
+			"type": 2
+		},
+		"9837e077-7dd4-4a93-97d8-d8348a17d0a0": {
+			"name": "Items.Name.NordicSteelLongsword",
+			"type": 2
+		},
+		"900b34ad-61c9-4f97-adac-4ff0f099de04": {
+			"name": "Items.Name.NordicSteelMace",
+			"type": 2
+		},
+		"980c823b-8edc-463f-a6b0-f901a1db1dc5": {
+			"name": "Items.Name.NordicSteelGreatsword",
+			"type": 2
+		},
+		"cc3de495-c8d3-497d-9d1e-f9c4e014f54f": {
+			"name": "Items.Name.NordicSteelBattleaxe",
+			"type": 2
+		},
+		"d25e2ddd-854a-4e36-b970-d00c1f893bd4": {
+			"name": "Items.Name.NordicSteelWarhammer",
+			"type": 2
+		},
+		"881e91f3-a5bb-4c71-ab42-39614cc4dc33": {
+			"name": "Items.Name.OrcishDagger",
+			"type": 2
+		},
+		"172d5f1c-839a-4949-888d-9fdf80993001": {
+			"name": "Items.Name.OrcishHandAxe",
+			"type": 2
+		},
+		"60994d55-022c-4918-a524-ce90e84b5922": {
+			"name": "Items.Name.OrcishLightHammer",
+			"type": 2
+		},
+		"cadac95d-bf21-4c62-9d6a-23cafccfb292": {
+			"name": "Items.Name.OrcishWarAxe",
+			"type": 2
+		},
+		"d85462ed-fa08-4d38-9718-db7c975edba1": {
+			"name": "Items.Name.OrcishLongsword",
+			"type": 2
+		},
+		"d4e55349-36b7-4adf-b16f-19b35368a7cd": {
+			"name": "Items.Name.OrcishMace",
+			"type": 2
+		},
+		"46b6c709-3409-4ecf-8bd4-5646fbb38e55": {
+			"name": "Items.Name.OrcishGreatsword",
+			"type": 2
+		},
+		"25f94085-72b7-4b84-852d-679a50b31675": {
+			"name": "Items.Name.OrcishBattleaxe",
+			"type": 2
+		},
+		"6ddb56a9-0635-453d-bc76-43988bef433f": {
+			"name": "Items.Name.OrcishWarhammer",
+			"type": 2
+		},
+		"0970b90d-9b35-4d13-aecf-57ea97e7df2a": {
+			"name": "Items.Name.SilverDagger",
+			"type": 2
+		},
+		"95fa311e-e025-46c7-8277-b4e880fa6544": {
+			"name": "Items.Name.SilverHandAxe",
+			"type": 2
+		},
+		"c12d107b-5dc7-4cb3-8166-23644e94d03a": {
+			"name": "Items.Name.SilverLightHammer",
+			"type": 2
+		},
+		"f263a284-00cb-4c2c-9012-6455df1e8ee3": {
+			"name": "Items.Name.SilverWarAxe",
+			"type": 2
+		},
+		"c34f8b76-0b45-4702-a37f-e363e6e59cf6": {
+			"name": "Items.Name.SilverLongsword",
+			"type": 2
+		},
+		"48500816-3dd2-4e51-8ea9-e92064668197": {
+			"name": "Items.Name.SilverMace",
+			"type": 2
+		},
+		"c16518e9-065c-4d96-b866-f718ab4287ba": {
+			"name": "Items.Name.SilverGreatsword",
+			"type": 2
+		},
+		"ce0c2c25-98d6-48c9-a4db-80f85506d191": {
+			"name": "Items.Name.SilverBattleaxe",
+			"type": 2
+		},
+		"a04c6261-f0bb-48fb-84e4-51517bc04b7c": {
+			"name": "Items.Name.SilverWarhammer",
+			"type": 2
+		},
+		"dc8f205f-577a-4239-a0f7-4625230aa145": {
+			"name": "Items.Name.StalhrimDagger",
+			"type": 2
+		},
+		"48cf4bad-4f19-48e4-9f16-9c8c8cbf268d": {
+			"name": "Items.Name.StalhrimHandAxe",
+			"type": 2
+		},
+		"14333bde-b5ea-4f3e-9347-69f76cc7390e": {
+			"name": "Items.Name.StalhrimLightHammer",
+			"type": 2
+		},
+		"b8326c8d-9537-4507-ad10-bfda780ab540": {
+			"name": "Items.Name.StalhrimWarAxe",
+			"type": 2
+		},
+		"6a307853-3bc7-4cbc-a5bf-41b93110df8f": {
+			"name": "Items.Name.StalhrimLongsword",
+			"type": 2
+		},
+		"9141509a-54aa-4d43-8f03-350e67578a3d": {
+			"name": "Items.Name.StalhrimMace",
+			"type": 2
+		},
+		"96a1a962-e2ab-4d0d-a0af-63978e67e818": {
+			"name": "Items.Name.StalhrimGreatsword",
+			"type": 2
+		},
+		"9ce6b55d-3661-47b4-8d27-b3040550533a": {
+			"name": "Items.Name.StalhrimBattleaxe",
+			"type": 2
+		},
+		"7f0fbb92-1535-42a0-b34e-b6babd467a64": {
+			"name": "Items.Name.StalhrimWarhammer",
+			"type": 2
+		},
+		"c469682f-6fb5-4323-b06e-b20c21d0ad44": {
+			"name": "Items.Name.SteelDagger",
+			"type": 2
+		},
+		"f7475d9a-7a3a-426e-b604-05afa46a2b05": {
+			"name": "Items.Name.SteelHandAxe",
+			"type": 2
+		},
+		"667b42ba-190b-4600-a289-feaee6af2af8": {
+			"name": "Items.Name.SteelLightHammer",
+			"type": 2
+		},
+		"dfa6be04-f10e-46ff-8ba8-8d7b4bb0ce3b": {
+			"name": "Items.Name.SteelWarAxe",
+			"type": 2
+		},
+		"ef6f6965-f75d-4443-a992-630709262c0f": {
+			"name": "Items.Name.SteelLongsword",
+			"type": 2
+		},
+		"7bf2ddab-fa1e-45d5-a41c-e85de16b0597": {
+			"name": "Items.Name.SteelMace",
+			"type": 2
+		},
+		"dcaaade2-7eb6-4175-876b-f40a35a36919": {
+			"name": "Items.Name.SteelGreatsword",
+			"type": 2
+		},
+		"b3ba11cd-21c6-46de-9e63-7564f437363c": {
+			"name": "Items.Name.SteelBattleaxe",
+			"type": 2
+		},
+		"f9176e04-09bd-4785-a473-0110d7129b99": {
+			"name": "Items.Name.SteelWarhammer",
+			"type": 2
 		}
 	},
 	"interactables": {
@@ -4476,9 +4832,6 @@
 				"dungeon_uuid": "b08cc930-2030-41ec-92e8-044e0bad9aa8"
 			}
 		},
-		"3e382c0a-0ccb-4009-9d24-d168f9fe92a1": {
-			"dungeon_info": null
-		},
 		"5ad30483-8994-484e-b6dc-a5e9014cc4d5": {
 			"dungeon_info": {
 				"objectives": {
@@ -4514,9 +4867,6 @@
 				"dungeon_uuid": "51470ac0-46eb-4790-8de1-d51d7c36908c"
 			}
 		},
-		"3b478dfa-73bb-42df-a420-05cf83d015bc": {
-			"dungeon_info": null
-		},
 		"e53a430b-35f4-4848-8b4e-c1f0089e098a": {
 			"dungeon_info": {
 				"objectives": {
@@ -4546,9 +4896,6 @@
 				"version": 2,
 				"dungeon_uuid": "32b5e43c-9a08-473d-af5c-05f7584865c5"
 			}
-		},
-		"1709a8bc-79dd-4a7f-b7f8-3a6022646dda": {
-			"dungeon_info": null
 		},
 		"d4a88399-0518-4b72-872c-de8cbb191dae": {
 			"dungeon_info": {
@@ -4706,9 +5053,6 @@
 				"dungeon_uuid": "3ef2b1f9-9dc9-44ba-b18b-93dac3f2f3d3"
 			}
 		},
-		"b7f4d378-566b-45eb-9bda-206911901821": {
-			"dungeon_info": null
-		},
 		"378307c6-0a23-41f8-b721-5282fa0a8a2b": {
 			"dungeon_info": {
 				"objectives": {
@@ -4817,12 +5161,6 @@
 				"version": 1,
 				"dungeon_uuid": "9f7f0c2d-ebc2-494c-be2d-3fc9dc5c19fb"
 			}
-		},
-		"49e0b072-ffd7-44e7-8d72-8f001d1a079f": {
-			"dungeon_info": null
-		},
-		"7db39937-ad5d-49ab-9d43-0379f14848de": {
-			"dungeon_info": null
 		},
 		"585137fa-5a78-48a7-99f7-f744a5f6cfdc": {
 			"dungeon_info": {
@@ -4975,9 +5313,6 @@
 				"dungeon_uuid": "50f0e783-32a4-4487-a61a-bc2d4e890b87"
 			}
 		},
-		"51e41844-7c98-44a6-802c-05b7e0bed137": {
-			"dungeon_info": null
-		},
 		"4f552ec2-83d7-4b13-b290-c78ef6816939": {
 			"dungeon_info": {
 				"objectives": {
@@ -5042,9 +5377,6 @@
 				"version": 2,
 				"dungeon_uuid": "1be8e0b3-a7a3-4ec6-ad16-4a7353374899"
 			}
-		},
-		"e46ddb4e-6d61-498b-bff7-ed83c4053e71": {
-			"dungeon_info": null
 		},
 		"0c9fc46d-9cb3-41b9-9e73-70c331533131": {
 			"dungeon_info": {
@@ -5363,9 +5695,6 @@
 				"version": 1,
 				"dungeon_uuid": "3635d747-98ff-44e1-b64a-19f458006661"
 			}
-		},
-		"cca4a80b-96f1-4b5c-82b8-9d4964c7f44a": {
-			"dungeon_info": null
 		},
 		"898d2182-da65-4003-90c0-b986c5ad52a8": {
 			"dungeon_info": {
@@ -6849,9 +7178,6 @@
 				"dungeon_uuid": "7f3ca11c-bfc7-40ec-bf72-7fb5c45ddbd0"
 			}
 		},
-		"6e9e8b45-20ce-4004-bc49-7ba81de18b0e": {
-			"dungeon_info": null
-		},
 		"334e582f-95ba-4263-b381-ac6d91eabe92": {
 			"dungeon_info": {
 				"objectives": {
@@ -6864,9 +7190,6 @@
 				"version": 3,
 				"dungeon_uuid": "108a7290-cea1-4af2-b58d-9c592af7d9d8"
 			}
-		},
-		"095b8109-0e57-400d-bcf4-70e10df8cdbf": {
-			"dungeon_info": null
 		},
 		"45c042e1-538b-4079-8b92-06f1d7677b6f": {
 			"dungeon_info": {
@@ -6908,9 +7231,6 @@
 				"version": 2,
 				"dungeon_uuid": "91890529-00c0-437a-9b36-1dffb7505561"
 			}
-		},
-		"77c752cb-c7cb-4ad9-b8d6-dae7064540d0": {
-			"dungeon_info": null
 		},
 		"3c5ada24-8706-4e65-af90-675a00756c29": {
 			"dungeon_info": {
@@ -7137,9 +7457,6 @@
 				"dungeon_uuid": "bc928826-67c4-4cca-b7ea-9799383ff790"
 			}
 		},
-		"11bbd032-4451-48fd-9c00-ec6438f14f04": {
-			"dungeon_info": null
-		},
 		"909431a2-177c-4719-8326-7523fdf104e2": {
 			"dungeon_info": {
 				"objectives": {
@@ -7165,9 +7482,6 @@
 				"version": 2,
 				"dungeon_uuid": "55411362-7c35-41ab-a84d-ff96e820e417"
 			}
-		},
-		"60f1aaae-2ac1-4fa9-ad17-78a24452ffc6": {
-			"dungeon_info": null
 		},
 		"b2f3ffa8-8d5f-41d5-9b3e-ae97f3f519a1": {
 			"dungeon_info": {
