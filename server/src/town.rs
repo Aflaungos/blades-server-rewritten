@@ -303,9 +303,14 @@ fn lookup_level_cost(
     {
         // Get the style data
         if let Some(style_data) = style_inputs.get(&style.to_string()) {
-            // Check for style-specific gold cost
+            // A style row is a *surcharge* on top of the level, not a replacement for
+            // it: the level carries the build's own price and the style adds the cost
+            // of finishing it in Timber / Stone / Castle. Taking the style value
+            // instead would price an EnchantersShop level 9 at the 100 gold of its
+            // timber trim rather than 412,290, and would lower a town's total
+            // available prestige below the level 6 threshold.
             if let Some(style_gold) = style_data.get("goldCost").and_then(Value::as_u64) {
-                gold = style_gold;
+                gold = gold.saturating_add(style_gold);
             }
 
             // Check if the style has a requireTownLevel
@@ -313,9 +318,8 @@ fn lookup_level_cost(
                 require_town_level = std::cmp::max(require_town_level, style_require);
             }
 
-            // Check for style-specific prestige
             if let Some(style_prestige) = style_data.get("prestigeForLevel").and_then(Value::as_u64) {
-                prestige = style_prestige;
+                prestige = prestige.saturating_add(style_prestige);
             }
 
             // Add style materials (skip special fields)
@@ -2350,6 +2354,65 @@ mod tests {
         let bronze = Uuid::parse_str(BRONZE).unwrap();
         assert_eq!(cost.materials.iter().find(|(m, _)| *m == lumber).unwrap().1, 43);
         assert_eq!(cost.materials.iter().find(|(m, _)| *m == bronze).unwrap().1, 5);
+    }
+
+    /// A style row is a surcharge on top of the level, not a replacement for it.
+    ///
+    /// The shipped table is authored that way: `building_upgrades.json` carries the
+    /// build's own price on the level and a flat per-style trim beside it (Timber
+    /// 100 / Stone 1500 / Castle 5000), and for 40 of the 41 levels that have both,
+    /// `level + timber` reproduces the gold cost observed in the retail captures
+    /// exactly. Taking the style value instead would charge 100 gold for an
+    /// EnchantersShop level 9 that really costs 412,290.
+    fn styled_upgrades() -> Value {
+        json!({
+            "buildings": {
+                (FORGE): {
+                    "editorName": "EnchantersShop",
+                    "maxLevel": 9,
+                    "styleIds": [STYLE],
+                    "levels": {
+                        "9": {
+                            "goldCost": 412_190,
+                            "constructionTimeMs": 1_200_000,
+                            "prestigeForLevel": 300,
+                            "buildInputs": {(LUMBER): 43},
+                            "styleInputs": {
+                                (STYLE): {
+                                    "goldCost": 100,
+                                    "prestigeForLevel": 68,
+                                    (BRONZE): 5
+                                }
+                            },
+                            "requireTownLevel": 8
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn style_gold_and_prestige_add_to_the_level_rather_than_replacing_it() {
+        let cost = lookup_level_cost(
+            &styled_upgrades(),
+            Uuid::parse_str(FORGE).unwrap(),
+            9,
+            Some(Uuid::parse_str(STYLE).unwrap()),
+        )
+        .unwrap();
+
+        // 412,190 + 100 == the 412,290 the captures show, not the bare 100.
+        assert_eq!(cost.gold, 412_290, "style gold must add to the level's gold");
+        assert_eq!(cost.prestige, 368, "style prestige must add to the level's prestige");
+    }
+
+    #[test]
+    fn a_level_with_no_style_chosen_charges_neither_surcharge() {
+        let cost =
+            lookup_level_cost(&styled_upgrades(), Uuid::parse_str(FORGE).unwrap(), 9, None).unwrap();
+        assert_eq!(cost.gold, 412_190);
+        assert_eq!(cost.prestige, 300);
     }
 
     /// A town with one building, in the nested districts/segments shape the real
