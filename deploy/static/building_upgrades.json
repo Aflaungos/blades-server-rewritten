@@ -173,8 +173,8 @@
       ],
       "levels": {
         "0": {
-          "goldCost": 2100,
-          "constructionTimeMs": 0,
+          "goldCost": 28900,
+          "constructionTimeMs": 8100000,
           "buildInputs": {
             "e7193116-d761-479b-8a20-5633737977f5": 60,
             "fd67bbc6-20f4-44a3-9614-28265ebb8c67": 50,
@@ -581,8 +581,8 @@
       ],
       "levels": {
         "0": {
-          "goldCost": 6000,
-          "constructionTimeMs": 7200000,
+          "goldCost": 64900,
+          "constructionTimeMs": 16200000,
           "buildInputs": {
             "e7193116-d761-479b-8a20-5633737977f5": 76,
             "fd67bbc6-20f4-44a3-9614-28265ebb8c67": 63,
@@ -991,8 +991,8 @@
       ],
       "levels": {
         "0": {
-          "goldCost": 500,
-          "constructionTimeMs": 5000,
+          "goldCost": 14900,
+          "constructionTimeMs": 3600000,
           "buildInputs": {
             "e7193116-d761-479b-8a20-5633737977f5": 43,
             "fd67bbc6-20f4-44a3-9614-28265ebb8c67": 36,
@@ -1396,8 +1396,8 @@
       ],
       "levels": {
         "0": {
-          "goldCost": 600,
-          "constructionTimeMs": 30000,
+          "goldCost": 24325,
+          "constructionTimeMs": 11100000,
           "buildInputs": {
             "e7193116-d761-479b-8a20-5633737977f5": 24,
             "fd67bbc6-20f4-44a3-9614-28265ebb8c67": 20,
@@ -1528,8 +1528,8 @@
       ],
       "levels": {
         "0": {
-          "goldCost": 600,
-          "constructionTimeMs": 30000,
+          "goldCost": 250,
+          "constructionTimeMs": 2160000,
           "buildInputs": {
             "e7193116-d761-479b-8a20-5633737977f5": 24,
             "fd67bbc6-20f4-44a3-9614-28265ebb8c67": 20,
@@ -1606,7 +1606,7 @@
           "_capture_time_samples": 2
         },
         "2": {
-          "goldCost": 15000,
+          "goldCost": 15900,
           "constructionTimeMs": 1380000,
           "buildInputs": {
             "e7193116-d761-479b-8a20-5633737977f5": 672,
@@ -1660,8 +1660,8 @@
       ],
       "levels": {
         "0": {
-          "goldCost": 600,
-          "constructionTimeMs": 30000,
+          "goldCost": 58265,
+          "constructionTimeMs": 27480000,
           "buildInputs": {
             "e7193116-d761-479b-8a20-5633737977f5": 24,
             "fd67bbc6-20f4-44a3-9614-28265ebb8c67": 20,
@@ -1827,7 +1827,7 @@
       "categoryId": "d34e334c-b99a-4699-af42-05d3f28d681d",
       "lotSize": 1,
       "allowedCraftingTypes": [],
-      "maxLevel": 9,
+      "maxLevel": 10,
       "styleIds": [
         "aa133662-053d-434e-8779-3f2a41d1271e",
         "1d6696b3-963b-48d4-8924-d43505cb2807",
@@ -1835,7 +1835,7 @@
       ],
       "levels": {
         "0": {
-          "goldCost": 200,
+          "goldCost": 0,
           "constructionTimeMs": 5000,
           "buildInputs": {
             "e7193116-d761-479b-8a20-5633737977f5": 104,
@@ -2224,8 +2224,8 @@
       ],
       "levels": {
         "0": {
-          "goldCost": 4000,
-          "constructionTimeMs": 4500000,
+          "goldCost": 40000,
+          "constructionTimeMs": 10500000,
           "buildInputs": {
             "e7193116-d761-479b-8a20-5633737977f5": 64,
             "fd67bbc6-20f4-44a3-9614-28265ebb8c67": 53,
