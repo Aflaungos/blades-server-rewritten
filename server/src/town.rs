@@ -24,6 +24,7 @@
 //! the connection and surface to the player as the reported "network error upgrading
 //! smithy".
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use actix_web::{
@@ -33,7 +34,9 @@ use actix_web::{
     web::{self, Json},
 };
 use blades_lib::economy::{GEMS, GOLD};
-use blades_lib::user_data::{CompleteInventoryUpdate, CompleteWallet, InventoryChangeTracker};
+use blades_lib::user_data::{
+    CompleteInventory, CompleteInventoryUpdate, CompleteWallet, InventoryChangeTracker,
+};
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt};
 use serde::{Deserialize, Serialize};
@@ -53,6 +56,8 @@ use crate::{
 /// Out-of-band service id for town-lifecycle error envelopes (not a real Blades
 /// service id; the client pre-checks affordability/level so these rarely fire).
 const TOWN_SERVICE_ID: u64 = 9005;
+/// Service id reported on prop place/remove errors.
+const PROPS_SERVICE_ID: u64 = 9006;
 
 /// Wall-clock milliseconds since the unix epoch. This is a real server — no
 /// determinism requirement — so `SystemTime` is fine (a pre-1970 clock, which can't
@@ -90,19 +95,21 @@ pub async fn get_town(
     // actix worker and the client saw a dropped connection ("Communication/Network
     // error"). Handle each failure as a 500 so the worker survives and logs why.
     let path = app_state.static_data_path.join("default_town.json");
-    let mut file = File::open(&path).await.map_err(|e| {
-        eprintln!("[town] cannot open {path:?}: {e}");
+
+    let mut file = File::open(&path).await.map_err(|_e| {
         BladeApiError::new(StatusCode::INTERNAL_SERVER_ERROR, 3, 0)
     })?;
+
     let mut content = String::new();
-    file.read_to_string(&mut content).await.map_err(|e| {
-        eprintln!("[town] cannot read {path:?}: {e}");
+
+    file.read_to_string(&mut content).await.map_err(|_e| {
         BladeApiError::new(StatusCode::INTERNAL_SERVER_ERROR, 3, 0)
     })?;
-    let town = serde_json::from_str(&content).map_err(|e| {
-        eprintln!("[town] invalid json in {path:?}: {e}");
+
+    let town = serde_json::from_str(&content).map_err(|_e| {
         BladeApiError::new(StatusCode::INTERNAL_SERVER_ERROR, 3, 0)
     })?;
+
     Ok(Json(GetTownResponse { town }))
 }
 
@@ -132,6 +139,60 @@ async fn load_personal_town(
     }
 }
 
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct TownNameRequest {
+    name: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct TownNameResponse {
+    town: Value,
+}
+
+#[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/towns/current/name")]
+pub async fn set_town_name(
+    session: SessionLookedUpMaybe,
+    app_state: web::Data<Arc<ServerGlobal>>,
+    path: web::Path<Uuid>,
+    body: Json<TownNameRequest>,
+) -> Result<Json<TownNameResponse>, BladeApiError> {
+    let session = session.get_session_or_error()?;
+    let user_id = session.session.user_id;
+    let character_id = path.into_inner();
+    let req = body.into_inner();
+    let globals: Arc<ServerGlobal> = app_state.get_ref().clone();
+    let mut conn = app_state.db_pool.get().await?;
+
+    conn.transaction(move |mut conn| {
+        async move {
+            let mut entry = load_town_economy(&mut conn, character_id, user_id).await?;
+            let mut town = take_town(&mut entry, &globals)?;
+
+            // Set the town name
+            if let Some(obj) = town.as_object_mut() {
+                obj.insert("name".to_string(), json!(req.name));
+            }
+
+            // Persist the changes
+            use crate::schema::characters;
+            let town_col = town.clone();
+            let mut changeset = entry;
+            changeset.town = Some(JsonDbWrapper(town_col.clone()));
+            diesel::update(characters::table)
+                .filter(characters::id.eq(character_id))
+                .set(changeset)
+                .execute(&mut conn)
+                .await?;
+
+            Ok(Json(TownNameResponse { town: town_col }))
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Cost model (parsed out of the raw `building_upgrades.json` `Value`).
 // ─────────────────────────────────────────────────────────────────────────────
@@ -147,6 +208,7 @@ struct LevelCost {
     materials: Vec<(Uuid, u64)>,
     require_town_level: u64,
     max_level: u64,
+    prestige: u64,
 }
 
 /// Errors from resolving/validating a building operation against the cost table.
@@ -211,13 +273,17 @@ fn lookup_level_cost(
         .and_then(|l| l.get(target_level.to_string()))
         .ok_or(CostError::NoSuchLevel)?;
 
-    let gold = level.get("goldCost").and_then(Value::as_u64).unwrap_or(0);
+    let mut gold = level.get("goldCost").and_then(Value::as_u64).unwrap_or(0);
     let construction_time_ms = level
         .get("constructionTimeMs")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    let require_town_level = level
+    let mut require_town_level = level
         .get("requireTownLevel")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let mut prestige = level
+        .get("prestigeForLevel")
         .and_then(Value::as_u64)
         .unwrap_or(0);
 
@@ -229,15 +295,43 @@ fn lookup_level_cost(
             }
         }
     }
+    
     // Per-style extra inputs. Only the chosen style's row is charged; an unknown /
     // absent style just adds nothing.
     if let (Some(style), Some(style_inputs)) =
         (style_id, level.get("styleInputs").and_then(Value::as_object))
     {
-        if let Some(row) = style_inputs.get(&style.to_string()).and_then(Value::as_object) {
-            for (k, v) in row {
-                if let (Ok(id), Some(q)) = (Uuid::parse_str(k), v.as_u64()) {
-                    *materials.entry(id).or_insert(0) += q;
+        // Get the style data
+        if let Some(style_data) = style_inputs.get(&style.to_string()) {
+            // A style row is a *surcharge* on top of the level, not a replacement for
+            // it: the level carries the build's own price and the style adds the cost
+            // of finishing it in Timber / Stone / Castle. Taking the style value
+            // instead would price an EnchantersShop level 9 at the 100 gold of its
+            // timber trim rather than 412,290, and would lower a town's total
+            // available prestige below the level 6 threshold.
+            if let Some(style_gold) = style_data.get("goldCost").and_then(Value::as_u64) {
+                gold = gold.saturating_add(style_gold);
+            }
+
+            // Check if the style has a requireTownLevel
+            if let Some(style_require) = style_data.get("requireTownLevel").and_then(Value::as_u64) {
+                require_town_level = std::cmp::max(require_town_level, style_require);
+            }
+
+            if let Some(style_prestige) = style_data.get("prestigeForLevel").and_then(Value::as_u64) {
+                prestige = prestige.saturating_add(style_prestige);
+            }
+
+            // Add style materials (skip special fields)
+            if let Some(row) = style_data.as_object() {
+                for (k, v) in row {
+                    // Skip special fields that we already processed
+                    if k == "goldCost" || k == "requireTownLevel" || k == "prestigeForLevel" {
+                        continue;
+                    }
+                    if let (Ok(id), Some(q)) = (Uuid::parse_str(k), v.as_u64()) {
+                        *materials.entry(id).or_insert(0) += q;
+                    }
                 }
             }
         }
@@ -249,6 +343,7 @@ fn lookup_level_cost(
         materials: materials.into_iter().collect(),
         require_town_level,
         max_level,
+        prestige,
     })
 }
 
@@ -433,7 +528,7 @@ pub async fn upgrade_building(
     conn.transaction(move |mut conn| {
         async move {
             let mut entry = load_town_economy(&mut conn, character_id, user_id).await?;
-            let mut town = take_town(&mut entry)?;
+            let mut town = take_town(&mut entry, &globals)?;
 
             // Resolve the building's current facts, then the cost of the NEXT level.
             let (type_id, style_id, cur_level) = read_building_facts(&town, building_id)
@@ -475,7 +570,7 @@ pub async fn upgrade_building(
             })?;
             apply_upgrade_transition(building, target_level, cost.construction_time_ms, now_ms());
 
-            finish_town_mutation(&mut conn, entry, town, &tracker).await
+            finish_town_mutation(&mut conn, entry, town, &tracker, cost.prestige).await
         }
         .scope_boxed()
     })
@@ -566,12 +661,13 @@ pub async fn complete_building(
     let (character_id, building_id) = path.into_inner();
     let speed_up = body.into_inner().speed_up;
     let globals: Arc<ServerGlobal> = app_state.get_ref().clone();
+    let app_state_clone = globals.clone();
     let mut conn = app_state.db_pool.get().await?;
 
     conn.transaction(move |mut conn| {
         async move {
             let mut entry = load_town_economy(&mut conn, character_id, user_id).await?;
-            let mut town = take_town(&mut entry)?;
+            let mut town = take_town(&mut entry, &app_state_clone)?;
 
             // A 404 before anything is charged: an unknown building must never cost
             // gems. (`find_building` is the read-only pre-scan; the mutation borrows
@@ -731,7 +827,7 @@ pub async fn place_building(
     conn.transaction(move |mut conn| {
         async move {
             let mut entry = load_town_economy(&mut conn, character_id, user_id).await?;
-            let mut town = take_town(&mut entry)?;
+            let mut town = take_town(&mut entry, &globals)?;
 
             // Placement is the level-0 build (initial construction on an empty lot).
             let cost = lookup_level_cost(
@@ -773,7 +869,7 @@ pub async fn place_building(
             )
             .ok_or_else(|| BladeApiError::new(StatusCode::NOT_FOUND, TOWN_SERVICE_ID, 6))?;
 
-            finish_town_mutation(&mut conn, entry, town, &tracker).await
+            finish_town_mutation(&mut conn, entry, town, &tracker, cost.prestige).await
         }
         .scope_boxed()
     })
@@ -850,12 +946,13 @@ pub async fn destroy_building(
     let session = session.get_session_or_error()?;
     let user_id = session.session.user_id;
     let (character_id, building_id) = path.into_inner();
+    let app_state_clone = app_state.clone();
     let mut conn = app_state.db_pool.get().await?;
 
     conn.transaction(move |mut conn| {
         async move {
             let mut entry = load_town_economy(&mut conn, character_id, user_id).await?;
-            let mut town = take_town(&mut entry)?;
+            let mut town = take_town(&mut entry, &app_state_clone)?;
 
             if !remove_building(&mut town, building_id) {
                 return Err(BladeApiError::new(StatusCode::NOT_FOUND, TOWN_SERVICE_ID, 1));
@@ -896,7 +993,7 @@ pub async fn destroy_building(
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 5. STYLE — the reported "stuck loading, can't leave" on a town building.
+// Style endpoints
 // ─────────────────────────────────────────────────────────────────────────────
 
 /// Apply a cosmetic STYLE to a town building.
@@ -928,12 +1025,13 @@ pub async fn set_building_style(
     let session = session.get_session_or_error()?;
     let user_id = session.session.user_id;
     let (character_id, building_id, style_id) = path.into_inner();
+    let app_state_clone = app_state.clone();
     let mut conn = app_state.db_pool.get().await?;
 
     conn.transaction(move |mut conn| {
         async move {
             let mut entry = load_town_economy(&mut conn, character_id, user_id).await?;
-            let mut town = take_town(&mut entry)?;
+            let mut town = take_town(&mut entry, &app_state_clone)?;
 
             // 404 on an unknown building — same as `destroy`. Silently succeeding
             // would tell the client a style was applied that the town does not
@@ -1014,6 +1112,1013 @@ fn remove_building(town: &mut Value, building_id: Uuid) -> bool {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Prop related Endpoints.
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DeletedProp {
+    pub prop_id: Uuid,
+    pub district_id: Uuid,
+}
+
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct RemovePropsRequest {
+    pub deleted_props: Vec<DeletedProp>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemovePropsResponse {
+    pub wallet: CompleteWallet,
+    pub inventory: CompleteInventoryUpdate,
+    pub town: Value,
+    pub validation_flags: u64,
+    pub removed_count: usize,
+    pub failed_props: Vec<String>,
+    pub removed_props: Vec<String>,
+    pub placed_props: Vec<String>,
+    pub success: bool,
+}
+
+#[derive(Deserialize, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacedProp {
+    pub anchor_id: Uuid,
+    pub decoration_id: Uuid,
+    pub district_id: Uuid,
+}
+
+#[derive(Deserialize, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacePropsRequest {
+    pub placed_props: Vec<PlacedProp>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacePropsResponse {
+    pub wallet: CompleteWallet,
+    pub inventory: CompleteInventoryUpdate,
+    pub town: Value,
+    pub validation_flags: u64,
+    pub placed_count: usize,
+    pub failed_props: Vec<String>,
+    pub placed_props: Vec<String>,
+}
+
+/// POST /api/game/v1/public/characters/{character_id}/towns/current/props/remove
+///
+/// Remove one or more props from the character's current town.
+/// Props are located in districts under `town.districts[].props`.
+///
+/// The client sends a list of {propId, districtId} pairs to remove.
+/// Returns updated wallet, inventory, and town state.
+#[post(
+    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/towns/current/props/remove"
+)]
+pub async fn remove_town_props(
+    session: SessionLookedUpMaybe,
+    app_state: web::Data<Arc<ServerGlobal>>,
+    path: web::Path<Uuid>,
+    body: Json<RemovePropsRequest>,
+) -> Result<Json<RemovePropsResponse>, BladeApiError> {
+    use crate::schema::characters;
+    use diesel::update;
+    
+    let session = session.get_session_or_error()?;
+    let user_id = session.session.user_id;
+    let character_id = path.into_inner();
+    let req = body.into_inner();
+    let app_state_clone = app_state.clone();
+    let mut conn = app_state.db_pool.get().await?;
+
+    if req.deleted_props.is_empty() {
+        return Err(BladeApiError::new(
+            StatusCode::BAD_REQUEST,
+            PROPS_SERVICE_ID,
+            1,
+        ));
+    }
+
+    conn.transaction(move |mut conn| {
+        async move {
+            let mut entry = load_town_economy(&mut conn, character_id, user_id).await?;
+            let mut town = take_town(&mut entry, &app_state_clone)?;
+
+            // Process prop removals and get decoration IDs removed
+            let (removed_count, failed_props, removed_decoration_ids, removed_prop_ids) =
+                remove_props_from_town(&mut town, &req.deleted_props);
+
+            // A prop the town doesn't hold refunds nothing, so don't half-apply the
+            // batch either: reject the whole request and let the transaction roll
+            // back. Crediting a "best effort" for a prop we never found is exactly
+            // how a remove endpoint turns into an item printer.
+            if !failed_props.is_empty() {
+                log::warn!(
+                    "character {character_id} asked to remove props not in its town: {failed_props:?}"
+                );
+                return Err(BladeApiError::new(
+                    StatusCode::CONFLICT,
+                    PROPS_SERVICE_ID,
+                    5,
+                ));
+            }
+
+            // CREDIT decorations back to inventory. `removed_decoration_ids` is
+            // read off the stored props, not off the request body.
+            let mut tracker = InventoryChangeTracker::default();
+            credit_removed_decorations(
+                &mut entry.inventory.0,
+                &removed_decoration_ids,
+                &mut tracker,
+            );
+
+            let inventory = entry.inventory.0.generate_client_update(&tracker);
+            let wallet = entry.wallet.0.clone();
+
+            // Add a removedProps marker to the town response (like removedBuilding for buildings)
+            let mut town_col = town.clone();
+            if let Some(obj) = town_col.as_object_mut() {
+                // The client expects the prop IDs that were removed
+                obj.insert("removedProps".to_string(), json!(removed_prop_ids));
+            }
+
+            let mut changeset = entry;
+            changeset.town = Some(JsonDbWrapper(town.clone()));
+            update(characters::table)
+                .filter(characters::id.eq(character_id))
+                .set(changeset)
+                .execute(&mut conn)
+                .await?;
+
+            Ok(Json(RemovePropsResponse {
+                wallet,
+                inventory,
+                town: town_col,
+                validation_flags: 1,
+                removed_count,
+                failed_props,
+                // The ids we actually removed, read off the stored props — not
+                // echoed back from the request.
+                removed_props: removed_prop_ids,
+                placed_props: vec![],
+                success: removed_count > 0,
+            }))
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
+/// Remove props from the town JSON structure and track what was removed.
+///
+/// Returns (removed_count, failed_prop_ids, removed_decoration_ids, removed_prop_ids)
+///
+/// SECURITY: `removed_decoration_ids` is read off the *stored* prop's `propId`,
+/// never off the request. A caller names a prop by its `id` (the placement's own
+/// uuid, which the server minted and handed back in the town) and gets back
+/// whatever decoration that placement actually consumed. This is what retail
+/// does: the captured remove request carries only `{propId, districtId}` and the
+/// credited `itemTemplateId` is a different uuid entirely, so the refund cannot
+/// be steered by naming a template you'd like to be paid in.
+fn remove_props_from_town(
+    town: &mut Value,
+    props_to_remove: &[DeletedProp],
+) -> (usize, Vec<String>, Vec<Uuid>, Vec<String>) {
+    let mut removed_count = 0;
+    let mut failed_props = Vec::new();
+    let mut removed_decoration_ids = Vec::new();
+    let mut removed_prop_ids = Vec::new(); // Track the actual prop IDs (id field) that were removed
+
+    let districts = match town.get_mut("districts").and_then(Value::as_array_mut) {
+        Some(d) => d,
+        None => return (0, props_to_remove.iter().map(|p| p.prop_id.to_string()).collect(), vec![], vec![]),
+    };
+
+    for deleted_prop in props_to_remove {
+        let target_prop_id = deleted_prop.prop_id.to_string();
+        let target_district_id = deleted_prop.district_id.to_string();
+        let mut found = false;
+
+        for district in districts.iter_mut() {
+            let district_id = match district.get("id").and_then(Value::as_str) {
+                Some(id) => id,
+                None => continue,
+            };
+
+            if district_id != target_district_id {
+                continue;
+            }
+
+            let props = match district.get_mut("props").and_then(Value::as_object_mut) {
+                Some(p) => p,
+                None => continue,
+            };
+
+            // Match on the placement's own `id` ONLY. Matching `propId` as well
+            // would let a caller address a placement by the decoration template
+            // it holds, which is not how retail addresses one and which makes
+            // "which prop did you mean" caller-controlled.
+            let prop_key_to_remove = props.iter().find_map(|(key, prop_obj)| {
+                prop_obj
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|&id| id == target_prop_id)
+                    .map(|_| key.clone())
+            });
+
+            if let Some(key) = prop_key_to_remove {
+                // Read the refund off the stored prop BEFORE removing it.
+                if let Some(prop_obj) = props.get(&key) {
+                    // Track the decoration_id (propId field)
+                    match prop_obj.get("propId").and_then(Value::as_str) {
+                        Some(decoration_id) => match Uuid::parse_str(decoration_id) {
+                            Ok(uuid) => removed_decoration_ids.push(uuid),
+                            // A stored prop whose propId isn't a uuid is data we
+                            // can't refund against. Drop the refund rather than
+                            // guess one; losing an item beats minting one.
+                            Err(_) => log::warn!(
+                                "prop {target_prop_id} stores a non-uuid propId; refunding nothing"
+                            ),
+                        },
+                        None => log::warn!(
+                            "prop {target_prop_id} stores no propId; refunding nothing"
+                        ),
+                    }
+                    // Track the actual prop ID (id field) - this is what the client sent
+                    if let Some(prop_id) = prop_obj
+                        .get("id")
+                        .and_then(Value::as_str)
+                    {
+                        removed_prop_ids.push(prop_id.to_string());
+                    }
+                }
+
+                props.remove(&key);
+                removed_count += 1;
+                found = true;
+                break;
+            }
+        }
+
+        if !found {
+            failed_props.push(target_prop_id);
+        }
+    }
+
+    (removed_count, failed_props, removed_decoration_ids, removed_prop_ids)
+}
+
+/// Debit one of every decoration the client just placed.
+///
+/// Decorations are ordinary stackable backpack items and placing one CONSUMES it:
+/// the captured retail place response answers with the placed `decorationId` in
+/// `inventory.backpack.removedStackableItems`, i.e. the stack it came from went to
+/// zero. So a placement by a player who owns none of that decoration is not a
+/// warning to log past — it is a request to reject.
+///
+/// Two-phase like `charge_cost`: verify the whole batch (counting duplicates, so
+/// placing three of a decoration you own two of fails) before touching anything,
+/// so a rejected request leaves the inventory exactly as it found it.
+fn debit_placed_decorations(
+    inventory: &mut CompleteInventory,
+    decoration_ids: &[Uuid],
+    tracker: &mut InventoryChangeTracker,
+) -> Result<(), BladeApiError> {
+    if decoration_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut needed: HashMap<Uuid, u64> = HashMap::new();
+    for id in decoration_ids {
+        *needed.entry(*id).or_insert(0) += 1;
+    }
+
+    // Phase 1: verify ownership (no mutation) so we fail cleanly.
+    for (decoration_id, want) in &needed {
+        if inventory.backpack.stackable_items.count(*decoration_id) < *want {
+            log::warn!("decoration {decoration_id} not owned in sufficient quantity; refusing placement");
+            return Err(BladeApiError::new(
+                StatusCode::BAD_REQUEST,
+                PROPS_SERVICE_ID,
+                4,
+            ));
+        }
+    }
+
+    // Phase 2: commit. Every step was checked above, so these cannot fail.
+    for (decoration_id, want) in &needed {
+        inventory
+            .backpack
+            .stackable_items
+            .remove(*decoration_id, *want)
+            .map_err(|_have| {
+                BladeApiError::new(StatusCode::BAD_REQUEST, PROPS_SERVICE_ID, 4)
+            })?;
+        tracker
+            .modified_backpack
+            .stackable_items
+            .insert(*decoration_id);
+    }
+    inventory.backpack_version += 1;
+    Ok(())
+}
+
+/// Credit back the decorations the removed props were actually holding.
+///
+/// `decoration_ids` must come from the stored props (see `remove_props_from_town`),
+/// never from the request body.
+fn credit_removed_decorations(
+    inventory: &mut CompleteInventory,
+    decoration_ids: &[Uuid],
+    tracker: &mut InventoryChangeTracker,
+) {
+    if decoration_ids.is_empty() {
+        return;
+    }
+    for decoration_id in decoration_ids {
+        inventory.backpack.stackable_items.add(*decoration_id, 1);
+        tracker
+            .modified_backpack
+            .stackable_items
+            .insert(*decoration_id);
+    }
+    inventory.backpack_version += 1;
+}
+
+#[post(
+    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/towns/current/props"
+)]
+pub async fn place_town_props(
+    session: SessionLookedUpMaybe,
+    app_state: web::Data<Arc<ServerGlobal>>,
+    path: web::Path<Uuid>,
+    body: Json<PlacePropsRequest>,
+) -> Result<Json<PlacePropsResponse>, BladeApiError> {
+    use crate::schema::characters;
+    use diesel::update;
+    
+    let session = session.get_session_or_error()?;
+    let user_id = session.session.user_id;
+    let character_id = path.into_inner();
+    let req = body.into_inner();
+    let app_state_clone = app_state.clone();
+    let mut conn = app_state.db_pool.get().await?;
+
+    if req.placed_props.is_empty() {
+        return Err(BladeApiError::new(
+            StatusCode::BAD_REQUEST,
+            PROPS_SERVICE_ID,
+            2,
+        ));
+    }
+
+    conn.transaction(move |mut conn| {
+        async move {
+            let mut entry = load_town_economy(&mut conn, character_id, user_id).await?;
+            let mut town = take_town(&mut entry, &app_state_clone)?;
+
+            // Process prop placements and get decoration IDs placed
+            let (placed_count, failed_props, placed_decoration_ids) =
+                place_props_in_town(&mut town, &req.placed_props);
+
+            // DEBIT the decorations from inventory (placing one consumes it).
+            // Fails closed: if the player doesn't own them, the `?` aborts the
+            // transaction and neither the town nor the inventory is written.
+            let mut tracker = InventoryChangeTracker::default();
+            debit_placed_decorations(
+                &mut entry.inventory.0,
+                &placed_decoration_ids,
+                &mut tracker,
+            )?;
+
+            let inventory = entry.inventory.0.generate_client_update(&tracker);
+            let wallet = entry.wallet.0.clone();
+
+            let town_col = town.clone();
+            let mut changeset = entry;
+            changeset.town = Some(JsonDbWrapper(town_col.clone()));
+            update(characters::table)
+                .filter(characters::id.eq(character_id))
+                .set(changeset)
+                .execute(&mut conn)
+                .await?;
+
+            Ok(Json(PlacePropsResponse {
+                wallet,
+                inventory,
+                town: town_col,
+                validation_flags: 1,
+                placed_count,
+                failed_props,
+                // Send back what was placed
+                placed_props: placed_decoration_ids
+                    .iter()
+                    .map(Uuid::to_string)
+                    .collect(),
+            }))
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
+/// Place props into the town JSON structure.
+/// 
+/// Returns (placed_count, failed_prop_anchor_ids_as_strings, placed_decoration_ids)
+/// 
+/// Props are stored in `town.districts[].props` as an object/dictionary.
+fn place_props_in_town(
+    town: &mut Value,
+    props_to_place: &[PlacedProp],
+) -> (usize, Vec<String>, Vec<Uuid>) {
+    let mut placed_count = 0;
+    let mut failed_props = Vec::new();
+    let mut placed_decoration_ids = Vec::new(); // Track decoration IDs placed
+
+    let districts = match town.get_mut("districts").and_then(Value::as_array_mut) {
+        Some(d) => d,
+        None => return (0, props_to_place.iter().map(|p| p.anchor_id.to_string()).collect(), vec![]),
+    };
+
+    for placed_prop in props_to_place {
+        let anchor_id = placed_prop.anchor_id;
+        let decoration_id = placed_prop.decoration_id;
+        let district_id = placed_prop.district_id;
+        let anchor_id_str = anchor_id.to_string();
+        let decoration_id_str = decoration_id.to_string();
+        let mut found_district = false;
+
+        for district in districts.iter_mut() {
+            let district_id_field = match district.get("id").and_then(Value::as_str) {
+                Some(id) => id,
+                None => continue,
+            };
+
+            if district_id_field != district_id.to_string() {
+                continue;
+            }
+
+            found_district = true;
+
+            let props = match district.get_mut("props") {
+                Some(Value::Object(obj)) => obj,
+                _ => {
+                    let new_props = serde_json::Map::new();
+                    district.as_object_mut()
+                        .expect("district must be an object")
+                        .insert("props".to_string(), Value::Object(new_props));
+                    
+                    district.get_mut("props")
+                        .and_then(Value::as_object_mut)
+                        .expect("props should exist now")
+                }
+            };
+
+            if props.contains_key(&anchor_id_str) {
+                log::warn!("Prop with anchor_id {} already exists, overwriting", anchor_id_str);
+            }
+
+            let prop_id = Uuid::new_v4();
+            let prop_type = "2a529107-9561-4d23-91a8-becfd7fe76fa";
+
+            let prop_obj = json!({
+                "anchorId": anchor_id_str,
+                "id": prop_id.to_string(),
+                "propId": decoration_id_str,
+                "type": prop_type,
+            });
+
+            props.insert(anchor_id_str.clone(), prop_obj);
+            placed_count += 1;
+
+            // Track the decoration ID that was placed
+            placed_decoration_ids.push(decoration_id);
+            break;
+        }
+
+        if !found_district {
+            failed_props.push(anchor_id_str);
+        }
+    }
+
+    (placed_count, failed_props, placed_decoration_ids)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tests
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+
+    /// A placement's own `id` and the decoration template it holds (`propId`) are
+    /// DIFFERENT uuids — that is how `deploy/static/default_town.json` stores them
+    /// and how the captured retail remove pair reads: the request names
+    /// `propId: 56ae4e9f-…` (the placement) and the response credits
+    /// `itemTemplateId: 3fc190cd-…` (the decoration). A fixture that sets the two
+    /// equal cannot tell a stored-state refund from a request-echo refund.
+    const DECORATION_A: &str = "fa792ef4-4ef2-4f7b-80a9-8e6b6e205374";
+    const DECORATION_B: &str = "3fc190cd-c244-43b9-9a78-fcecb0d6860c";
+    const DECORATION_C: &str = "7666963f-5769-4c41-aa2d-474c05bd717e";
+
+    fn sample_town_with_props() -> Value {
+        json!({
+            "levelInfo": { "level": 6 },
+            "districts": [
+                {
+                    "id": "9a12c0d3-218c-4ef2-b78c-b6e3bca60719",
+                    "props": {
+                        "key1": {
+                            "id": "e915e0f4-3f86-41cb-b9e2-1ead10025c06",
+                            "propId": DECORATION_A,
+                            "districtId": "9a12c0d3-218c-4ef2-b78c-b6e3bca60719",
+                            "typeId": "some-prop-type",
+                            "x": 10.0,
+                            "y": 20.0,
+                            "rotation": 45.0
+                        },
+                        "key2": {
+                            "id": "f1234567-89ab-cdef-0123-456789abcdef",
+                            "propId": DECORATION_B,
+                            "districtId": "9a12c0d3-218c-4ef2-b78c-b6e3bca60719",
+                            "typeId": "another-prop",
+                            "x": 30.0,
+                            "y": 40.0,
+                            "rotation": 90.0
+                        }
+                    }
+                },
+                {
+                    "id": "b2c3d4e5-6789-4abc-8def-0123456789ab",
+                    "props": {
+                        "key3": {
+                            "id": "a9876543-21ab-4def-8123-456789abcdef",
+                            "propId": DECORATION_C,
+                            "districtId": "b2c3d4e5-6789-4abc-8def-0123456789ab",
+                            "typeId": "prop-in-other-district",
+                            "x": 50.0,
+                            "y": 60.0,
+                            "rotation": 0.0
+                        }
+                    }
+                }
+            ]
+        })
+    }
+
+    fn inventory_with(stack: &[(&str, u64)]) -> CompleteInventory {
+        use blades_lib::user_data::*;
+        let mut inventory = CompleteInventory {
+            backpack: Backpack::default(),
+            loadout: Loadout::default(),
+            treasury: Treasury::default(),
+            overflow_treasury: Treasury::default(),
+            backpack_version: 41,
+            treasury_version: 4,
+        };
+        for (template, count) in stack {
+            inventory
+                .backpack
+                .stackable_items
+                .add(Uuid::parse_str(template).unwrap(), *count);
+        }
+        inventory
+    }
+
+    fn uuid(s: &str) -> Uuid {
+        Uuid::parse_str(s).unwrap()
+    }
+
+    #[test]
+    fn remove_props_removes_specified_props() {
+        let mut town = sample_town_with_props();
+        let prop_id = Uuid::parse_str("e915e0f4-3f86-41cb-b9e2-1ead10025c06").unwrap();
+        let district_id = Uuid::parse_str("9a12c0d3-218c-4ef2-b78c-b6e3bca60719").unwrap();
+        
+        let props_to_remove = vec![
+            DeletedProp { prop_id, district_id }
+        ];
+
+        let (removed_count, failed, ..) = remove_props_from_town(&mut town, &props_to_remove);
+        
+        assert_eq!(removed_count, 1);
+        assert!(failed.is_empty());
+        
+        // Verify the prop was removed
+        let district = &town["districts"][0];
+        let props = district["props"].as_object().unwrap();
+        assert_eq!(props.len(), 1);
+        assert_eq!(props["key2"]["id"], "f1234567-89ab-cdef-0123-456789abcdef");
+    }
+
+    #[test]
+    fn remove_props_handles_multiple_props() {
+        let mut town = sample_town_with_props();
+        let prop1 = Uuid::parse_str("e915e0f4-3f86-41cb-b9e2-1ead10025c06").unwrap();
+        let prop2 = Uuid::parse_str("f1234567-89ab-cdef-0123-456789abcdef").unwrap();
+        let district_id = Uuid::parse_str("9a12c0d3-218c-4ef2-b78c-b6e3bca60719").unwrap();
+        
+        let props_to_remove = vec![
+            DeletedProp { prop_id: prop1, district_id },
+            DeletedProp { prop_id: prop2, district_id },
+        ];
+
+        let (removed_count, failed, ..) = remove_props_from_town(&mut town, &props_to_remove);
+        
+        assert_eq!(removed_count, 2);
+        assert!(failed.is_empty());
+        
+        // Verify all props were removed from the district
+        let district = &town["districts"][0];
+        let props = district["props"].as_object().unwrap();
+        assert_eq!(props.len(), 0);
+    }
+
+    #[test]
+    fn remove_props_reports_failed_removals() {
+        let mut town = sample_town_with_props();
+        let existing_prop = Uuid::parse_str("e915e0f4-3f86-41cb-b9e2-1ead10025c06").unwrap();
+        let non_existing_prop = Uuid::parse_str("00000000-0000-0000-0000-000000000000").unwrap();
+        let district_id = Uuid::parse_str("9a12c0d3-218c-4ef2-b78c-b6e3bca60719").unwrap();
+        
+        let props_to_remove = vec![
+            DeletedProp { prop_id: existing_prop, district_id },
+            DeletedProp { prop_id: non_existing_prop, district_id },
+        ];
+
+        let (removed_count, failed, ..) = remove_props_from_town(&mut town, &props_to_remove);
+        
+        assert_eq!(removed_count, 1);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0], "00000000-0000-0000-0000-000000000000");
+        
+        // Verify the existing prop was removed
+        let district = &town["districts"][0];
+        let props = district["props"].as_object().unwrap();
+        assert_eq!(props.len(), 1);
+    }
+
+    #[test]
+    fn remove_props_handles_district_without_props() {
+        let mut town = json!({
+            "levelInfo": { "level": 6 },
+            "districts": [
+                {
+                    "id": "9a12c0d3-218c-4ef2-b78c-b6e3bca60719",
+                    // No props array
+                }
+            ]
+        });
+
+        let prop_id = Uuid::parse_str("e915e0f4-3f86-41cb-b9e2-1ead10025c06").unwrap();
+        let district_id = Uuid::parse_str("9a12c0d3-218c-4ef2-b78c-b6e3bca60719").unwrap();
+        
+        let props_to_remove = vec![
+            DeletedProp { prop_id, district_id }
+        ];
+
+        let (removed_count, failed, ..) = remove_props_from_town(&mut town, &props_to_remove);
+        
+        assert_eq!(removed_count, 0);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0], "e915e0f4-3f86-41cb-b9e2-1ead10025c06");
+    }
+
+    #[test]
+    fn remove_props_handles_wrong_district() {
+        let mut town = sample_town_with_props();
+        let prop_id = Uuid::parse_str("e915e0f4-3f86-41cb-b9e2-1ead10025c06").unwrap();
+        let wrong_district_id = Uuid::parse_str("ffffffff-ffff-ffff-ffff-ffffffffffff").unwrap();
+        
+        let props_to_remove = vec![
+            DeletedProp { prop_id, district_id: wrong_district_id }
+        ];
+
+        let (removed_count, failed, ..) = remove_props_from_town(&mut town, &props_to_remove);
+        
+        assert_eq!(removed_count, 0);
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0], "e915e0f4-3f86-41cb-b9e2-1ead10025c06");
+        
+        // Verify the prop is still there (unchanged)
+        let district = &town["districts"][0];
+        let props = district["props"].as_object().unwrap();
+        assert_eq!(props.len(), 2);
+    }
+
+    #[test]
+    fn remove_props_handles_empty_request() {
+        let mut town = sample_town_with_props();
+        let props_to_remove: Vec<DeletedProp> = vec![];
+
+        let (removed_count, failed, ..) = remove_props_from_town(&mut town, &props_to_remove);
+        
+        assert_eq!(removed_count, 0);
+        assert!(failed.is_empty());
+        
+        // Town should be unchanged
+        let district = &town["districts"][0];
+        let props = district["props"].as_object().unwrap();
+        assert_eq!(props.len(), 2);
+    }
+
+    #[test]
+    fn remove_props_handles_props_in_multiple_districts() {
+        let mut town = sample_town_with_props();
+        let prop1 = Uuid::parse_str("e915e0f4-3f86-41cb-b9e2-1ead10025c06").unwrap();
+        let district1 = Uuid::parse_str("9a12c0d3-218c-4ef2-b78c-b6e3bca60719").unwrap();
+        let prop2 = Uuid::parse_str("a9876543-21ab-4def-8123-456789abcdef").unwrap();
+        let district2 = Uuid::parse_str("b2c3d4e5-6789-4abc-8def-0123456789ab").unwrap();
+        
+        let props_to_remove = vec![
+            DeletedProp { prop_id: prop1, district_id: district1 },
+            DeletedProp { prop_id: prop2, district_id: district2 },
+        ];
+
+        let (removed_count, failed, ..) = remove_props_from_town(&mut town, &props_to_remove);
+        
+        assert_eq!(removed_count, 2);
+        assert!(failed.is_empty());
+        
+        // Verify first district props
+        let district = &town["districts"][0];
+        let props = district["props"].as_object().unwrap();
+        assert_eq!(props.len(), 1); // Only prop2 remains
+        assert_eq!(props["key2"]["id"], "f1234567-89ab-cdef-0123-456789abcdef");
+        
+        // Verify second district props
+        let district2 = &town["districts"][1];
+        let props2 = district2["props"].as_object().unwrap();
+        assert_eq!(props2.len(), 0);
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Placing DEBITS the decoration, and it fails closed.
+    //
+    // Captured retail place request/response:
+    //   REQ  {"placedProps":[{"anchorId":…,"decorationId":"fa792ef4-…","districtId":…}]}
+    //   RESP {"inventory":{"backpack":{"removedStackableItems":["fa792ef4-…"]}}, …}
+    // The placed decorationId comes back as a REMOVED stackable, i.e. the stack it
+    // was taken from hit zero. Decorations are stackable inventory and placing one
+    // spends it.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn placing_a_decoration_you_own_debits_exactly_one() {
+        let mut inventory = inventory_with(&[(DECORATION_A, 3)]);
+        let mut tracker = InventoryChangeTracker::default();
+
+        debit_placed_decorations(&mut inventory, &[uuid(DECORATION_A)], &mut tracker).unwrap();
+
+        assert_eq!(
+            inventory.backpack.stackable_items.count(uuid(DECORATION_A)),
+            2
+        );
+        assert_eq!(inventory.backpack_version, 42);
+    }
+
+    #[test]
+    fn placing_a_decoration_you_do_not_own_fails_and_debits_nothing() {
+        // Owns B, tries to place A. Before the fix this logged a warning and
+        // returned Ok, so the placement stuck and the later remove credited a
+        // decoration that had never been paid for.
+        let mut inventory = inventory_with(&[(DECORATION_B, 5)]);
+        let mut tracker = InventoryChangeTracker::default();
+
+        use actix_web::ResponseError;
+        let err = debit_placed_decorations(&mut inventory, &[uuid(DECORATION_A)], &mut tracker)
+            .expect_err("placing an unowned decoration must fail");
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+
+        assert_eq!(
+            inventory.backpack.stackable_items.count(uuid(DECORATION_A)),
+            0
+        );
+        assert_eq!(
+            inventory.backpack.stackable_items.count(uuid(DECORATION_B)),
+            5,
+            "a rejected placement must not touch the rest of the backpack"
+        );
+        assert_eq!(inventory.backpack_version, 41, "version must not move");
+        assert!(tracker.modified_backpack.stackable_items.is_empty());
+    }
+
+    #[test]
+    fn placing_more_copies_than_you_own_fails_and_debits_nothing() {
+        // Two of A owned, three placed in one batch. Verifying per-item as we go
+        // would debit the first two before failing on the third.
+        let mut inventory = inventory_with(&[(DECORATION_A, 2)]);
+        let mut tracker = InventoryChangeTracker::default();
+
+        debit_placed_decorations(
+            &mut inventory,
+            &[uuid(DECORATION_A), uuid(DECORATION_A), uuid(DECORATION_A)],
+            &mut tracker,
+        )
+        .expect_err("placing three of a decoration you own two of must fail");
+
+        assert_eq!(
+            inventory.backpack.stackable_items.count(uuid(DECORATION_A)),
+            2,
+            "the whole batch must roll back, not just the unaffordable tail"
+        );
+        assert_eq!(inventory.backpack_version, 41);
+    }
+
+    #[test]
+    fn a_placed_decoration_spent_to_zero_is_reported_as_a_removed_stackable() {
+        // Retail response shape: inventory.backpack.removedStackableItems carries
+        // the placed decorationId.
+        let mut inventory = inventory_with(&[(DECORATION_A, 1)]);
+        let mut tracker = InventoryChangeTracker::default();
+        debit_placed_decorations(&mut inventory, &[uuid(DECORATION_A)], &mut tracker).unwrap();
+
+        let update = serde_json::to_value(inventory.generate_client_update(&tracker)).unwrap();
+        assert_eq!(
+            update["backpack"]["removedStackableItems"],
+            json!([DECORATION_A])
+        );
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Removing REFUNDS from stored state — the anti-mint property.
+    //
+    // Captured retail remove request/response:
+    //   REQ  {"deletedProps":[{"propId":"56ae4e9f-…","districtId":…}]}
+    //   RESP {"inventory":{"backpack":{"stackableItems":[
+    //           {"itemTemplateId":"3fc190cd-…","count":1}]}},
+    //         "town":{"removedProps":["56ae4e9f-…"], …}}
+    // The request names a PLACEMENT; the credited itemTemplateId is a different
+    // uuid. Retail therefore resolves what to refund from the stored prop. The
+    // request body carries no refundable id at all, so it cannot name one.
+    // ─────────────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn the_refund_is_read_off_the_stored_prop_not_the_request() {
+        let mut town = sample_town_with_props();
+        // The caller names the placement's own id. It is not a decoration id, and
+        // it is not what gets credited.
+        let placement_id = uuid("e915e0f4-3f86-41cb-b9e2-1ead10025c06");
+        let district_id = uuid("9a12c0d3-218c-4ef2-b78c-b6e3bca60719");
+
+        let (removed_count, failed, refunds, removed_prop_ids) = remove_props_from_town(
+            &mut town,
+            &[DeletedProp {
+                prop_id: placement_id,
+                district_id,
+            }],
+        );
+
+        assert_eq!(removed_count, 1);
+        assert!(failed.is_empty());
+        assert_eq!(
+            refunds,
+            vec![uuid(DECORATION_A)],
+            "the refund must be the stored propId, not the id the caller sent"
+        );
+        assert_ne!(
+            refunds[0], placement_id,
+            "fixture is degenerate if these are equal"
+        );
+        assert_eq!(removed_prop_ids, vec![placement_id.to_string()]);
+    }
+
+    #[test]
+    fn naming_a_decoration_template_removes_nothing_and_refunds_nothing() {
+        // The mint: ask to remove a "prop" by naming the stackable template you
+        // want to be paid in. DECORATION_B really is stored on a prop in this
+        // district — as its propId, never as its id — so a lookup that also
+        // matched propId would remove that prop and hand back a template the
+        // caller chose.
+        let mut town = sample_town_with_props();
+        let district_id = uuid("9a12c0d3-218c-4ef2-b78c-b6e3bca60719");
+
+        let (removed_count, failed, refunds, removed_prop_ids) = remove_props_from_town(
+            &mut town,
+            &[DeletedProp {
+                prop_id: uuid(DECORATION_B),
+                district_id,
+            }],
+        );
+
+        assert_eq!(removed_count, 0);
+        assert_eq!(failed, vec![DECORATION_B.to_string()]);
+        assert!(refunds.is_empty(), "a template id must not name a placement");
+        assert!(removed_prop_ids.is_empty());
+        // And nothing left the town.
+        assert_eq!(town["districts"][0]["props"].as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn removing_a_prop_the_town_does_not_hold_credits_nothing() {
+        let mut town = sample_town_with_props();
+        let district_id = uuid("9a12c0d3-218c-4ef2-b78c-b6e3bca60719");
+
+        let (removed_count, failed, refunds, _) = remove_props_from_town(
+            &mut town,
+            &[DeletedProp {
+                prop_id: uuid("00000000-0000-0000-0000-0000000000ff"),
+                district_id,
+            }],
+        );
+
+        assert_eq!(removed_count, 0);
+        assert_eq!(failed.len(), 1);
+        assert!(refunds.is_empty());
+
+        // And with nothing to refund, the credit path is a no-op on the wallet-side
+        // inventory: no item, no version bump.
+        let mut inventory = inventory_with(&[(DECORATION_A, 1)]);
+        let mut tracker = InventoryChangeTracker::default();
+        credit_removed_decorations(&mut inventory, &refunds, &mut tracker);
+        assert_eq!(
+            inventory.backpack.stackable_items.count(uuid(DECORATION_A)),
+            1
+        );
+        assert_eq!(inventory.backpack_version, 41);
+        assert!(tracker.modified_backpack.stackable_items.is_empty());
+    }
+
+    #[test]
+    fn a_refund_is_reported_with_item_template_id_and_count() {
+        // Retail response shape: inventory.backpack.stackableItems carries
+        // [{itemTemplateId, count}].
+        let mut inventory = inventory_with(&[]);
+        let mut tracker = InventoryChangeTracker::default();
+        credit_removed_decorations(&mut inventory, &[uuid(DECORATION_B)], &mut tracker);
+
+        assert_eq!(
+            inventory.backpack.stackable_items.count(uuid(DECORATION_B)),
+            1
+        );
+        assert_eq!(inventory.backpack_version, 42);
+
+        let update = serde_json::to_value(inventory.generate_client_update(&tracker)).unwrap();
+        assert_eq!(
+            update["backpack"]["stackableItems"],
+            json!([{ "itemTemplateId": DECORATION_B, "count": 1 }])
+        );
+    }
+
+    #[test]
+    fn place_then_remove_is_a_round_trip_not_a_profit() {
+        // The end-to-end property: whatever a place/remove cycle names, the player
+        // ends with what they started with — never a template they picked.
+        let district_id = uuid("9a12c0d3-218c-4ef2-b78c-b6e3bca60719");
+        let anchor_id = uuid("5facb057-1c1e-4ae0-9d2a-6f0d3c4b8a11");
+        let mut town = sample_town_with_props();
+        let mut inventory = inventory_with(&[(DECORATION_A, 1)]);
+        let mut tracker = InventoryChangeTracker::default();
+
+        let (_, _, placed) = place_props_in_town(
+            &mut town,
+            &[PlacedProp {
+                anchor_id,
+                decoration_id: uuid(DECORATION_A),
+                district_id,
+            }],
+        );
+        debit_placed_decorations(&mut inventory, &placed, &mut tracker).unwrap();
+        assert_eq!(
+            inventory.backpack.stackable_items.count(uuid(DECORATION_A)),
+            0
+        );
+
+        // Read the server-minted placement id back out of the town, as the client
+        // would, and remove it.
+        let placement_id = town["districts"][0]["props"][&anchor_id.to_string()]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let (removed_count, failed, refunds, _) = remove_props_from_town(
+            &mut town,
+            &[DeletedProp {
+                prop_id: uuid(&placement_id),
+                district_id,
+            }],
+        );
+        assert_eq!(removed_count, 1);
+        assert!(failed.is_empty());
+        credit_removed_decorations(&mut inventory, &refunds, &mut tracker);
+
+        assert_eq!(
+            inventory.backpack.stackable_items.count(uuid(DECORATION_A)),
+            1,
+            "back to where we started"
+        );
+        assert_eq!(
+            inventory.backpack.stackable_items.count(uuid(DECORATION_B)),
+            0,
+            "and nothing else was minted along the way"
+        );
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Shared db plumbing.
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -1038,13 +2143,106 @@ async fn load_town_economy(
 }
 
 /// Take the character's town JSON out of the loaded row for in-place mutation.
-/// A character with no captured town (or a null town) can't have buildings modified
-/// — 409 rather than fabricate one.
-fn take_town(entry: &mut CharacterDbEntryTownEconomy) -> Result<Value, BladeApiError> {
+/// If the character has no captured town (or a null town), create one from the default.
+fn take_town(
+    entry: &mut CharacterDbEntryTownEconomy,
+    app_state: &ServerGlobal,
+) -> Result<Value, BladeApiError> {
     match entry.town.take() {
         Some(JsonDbWrapper(v)) if !v.is_null() => Ok(v),
-        _ => Err(BladeApiError::new(StatusCode::CONFLICT, TOWN_SERVICE_ID, 7)),
+        _ => {
+            // No town exists - load from default template
+            let path = app_state.static_data_path.join("default_town.json");
+            let content = std::fs::read_to_string(&path).map_err(|_e| {
+                BladeApiError::new(StatusCode::INTERNAL_SERVER_ERROR, 3, 0)
+            })?;
+            let town: Value = serde_json::from_str(&content).map_err(|_e| {
+                BladeApiError::new(StatusCode::INTERNAL_SERVER_ERROR, 3, 0)
+            })?;
+            
+            // Store it back in the entry so it gets saved
+            entry.town = Some(JsonDbWrapper(town.clone()));
+            Ok(town)
+        }
     }
+}
+
+/// Apply prestige and check for town level up
+fn apply_prestige_and_level_up(
+    town: &mut Value,
+    prestige_to_add: u64,
+) -> u64 {
+    // Get or initialize levelInfo
+    let level_info_exists = town
+        .get("levelInfo")
+        .and_then(Value::as_object)
+        .is_some();
+    
+    if !level_info_exists {
+        // Create levelInfo if it doesn't exist
+        if let Some(obj) = town.as_object_mut() {
+            obj.insert("levelInfo".to_string(), json!({
+                "level": 0,
+                "experiencePoints": 0
+            }));
+        }
+    }
+    
+    // Now get mutable access to levelInfo
+    let level_info = town
+        .get_mut("levelInfo")
+        .and_then(Value::as_object_mut)
+        .unwrap();
+    
+    let current_xp = level_info
+        .get("experiencePoints")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    
+    let new_xp = current_xp + prestige_to_add;
+    level_info.insert("experiencePoints".to_string(), json!(new_xp));
+    
+    // Get current level and calculate new level
+    let current_level = level_info
+        .get("level")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let new_level = calculate_town_level(new_xp);
+    
+    // Update level if it changed
+    if new_level > current_level {
+        level_info.insert("level".to_string(), json!(new_level));
+    }
+
+    new_level
+}
+
+/// Prestige thresholds for town levels
+const PRESTIGE_THRESHOLDS: &[u64] = &[
+    0,      // Level 0
+    500,    // Level 1
+    2500,   // Level 2
+    5000,   // Level 3
+    8500,   // Level 4
+    13000,  // Level 5
+    19000,  // Level 6
+    26500,  // Level 7
+    35500,  // Level 8
+    46000,  // Level 9
+    69500,  // Level 10
+];
+
+/// Get the maximum town level based on current prestige
+fn calculate_town_level(prestige: u64) -> u64 {
+    let mut level = 0;
+    for (i, &threshold) in PRESTIGE_THRESHOLDS.iter().enumerate() {
+        if prestige >= threshold {
+            level = i as u64;
+        } else {
+            break;
+        }
+    }
+    level
 }
 
 /// Persist the mutated town + charged wallet/inventory back to the row and build the
@@ -1053,10 +2251,28 @@ fn take_town(entry: &mut CharacterDbEntryTownEconomy) -> Result<Value, BladeApiE
 /// materials. Consumes the entry (moved into the diesel changeset).
 async fn finish_town_mutation(
     conn: &mut diesel_async::AsyncPgConnection,
-    entry: CharacterDbEntryTownEconomy,
-    town: Value,
+    mut entry: CharacterDbEntryTownEconomy,  // Make mut
+    mut town: Value,
     tracker: &InventoryChangeTracker,
+    prestige: u64,
 ) -> Result<Json<TownMutationResponse>, BladeApiError> {
+    if prestige > 0 {
+        let new_level = apply_prestige_and_level_up(&mut town, prestige);
+
+        // Update character root townLevel
+        // Convert the character to a Value to modify it
+        let mut character_value = serde_json::to_value(&entry.character.0)
+            .map_err(|_| BladeApiError::new(StatusCode::INTERNAL_SERVER_ERROR, 3, 0))?;
+        
+        if let Some(obj) = character_value.as_object_mut() {
+            obj.insert("townLevel".to_string(), json!(new_level));
+        }
+        
+        // Deserialize back to CompleteCharacter
+        entry.character.0 = serde_json::from_value(character_value)
+            .map_err(|_| BladeApiError::new(StatusCode::INTERNAL_SERVER_ERROR, 3, 0))?;
+    }
+
     let inventory = entry.inventory.0.generate_client_update(tracker);
     let wallet = entry.wallet.0.clone();
     let character_id = entry.id;
@@ -1138,6 +2354,65 @@ mod tests {
         let bronze = Uuid::parse_str(BRONZE).unwrap();
         assert_eq!(cost.materials.iter().find(|(m, _)| *m == lumber).unwrap().1, 43);
         assert_eq!(cost.materials.iter().find(|(m, _)| *m == bronze).unwrap().1, 5);
+    }
+
+    /// A style row is a surcharge on top of the level, not a replacement for it.
+    ///
+    /// The shipped table is authored that way: `building_upgrades.json` carries the
+    /// build's own price on the level and a flat per-style trim beside it (Timber
+    /// 100 / Stone 1500 / Castle 5000), and for 40 of the 41 levels that have both,
+    /// `level + timber` reproduces the gold cost observed in the retail captures
+    /// exactly. Taking the style value instead would charge 100 gold for an
+    /// EnchantersShop level 9 that really costs 412,290.
+    fn styled_upgrades() -> Value {
+        json!({
+            "buildings": {
+                (FORGE): {
+                    "editorName": "EnchantersShop",
+                    "maxLevel": 9,
+                    "styleIds": [STYLE],
+                    "levels": {
+                        "9": {
+                            "goldCost": 412_190,
+                            "constructionTimeMs": 1_200_000,
+                            "prestigeForLevel": 300,
+                            "buildInputs": {(LUMBER): 43},
+                            "styleInputs": {
+                                (STYLE): {
+                                    "goldCost": 100,
+                                    "prestigeForLevel": 68,
+                                    (BRONZE): 5
+                                }
+                            },
+                            "requireTownLevel": 8
+                        }
+                    }
+                }
+            }
+        })
+    }
+
+    #[test]
+    fn style_gold_and_prestige_add_to_the_level_rather_than_replacing_it() {
+        let cost = lookup_level_cost(
+            &styled_upgrades(),
+            Uuid::parse_str(FORGE).unwrap(),
+            9,
+            Some(Uuid::parse_str(STYLE).unwrap()),
+        )
+        .unwrap();
+
+        // 412,190 + 100 == the 412,290 the captures show, not the bare 100.
+        assert_eq!(cost.gold, 412_290, "style gold must add to the level's gold");
+        assert_eq!(cost.prestige, 368, "style prestige must add to the level's prestige");
+    }
+
+    #[test]
+    fn a_level_with_no_style_chosen_charges_neither_surcharge() {
+        let cost =
+            lookup_level_cost(&styled_upgrades(), Uuid::parse_str(FORGE).unwrap(), 9, None).unwrap();
+        assert_eq!(cost.gold, 412_190);
+        assert_eq!(cost.prestige, 300);
     }
 
     /// A town with one building, in the nested districts/segments shape the real
@@ -1281,6 +2556,7 @@ mod tests {
             construction_time_ms: 100,
             materials: vec![(lumber, 10)],
             require_town_level: 0,
+            prestige: 0,
             max_level: 9,
         };
         let mut wallet = CompleteWallet::default();
@@ -1304,6 +2580,7 @@ mod tests {
             construction_time_ms: 0,
             materials: vec![],
             require_town_level: 0,
+            prestige: 0,
             max_level: 9,
         };
         let mut wallet = CompleteWallet::default();
@@ -1324,6 +2601,7 @@ mod tests {
             construction_time_ms: 0,
             materials: vec![(lumber, 50)],
             require_town_level: 0,
+            prestige: 0,
             max_level: 9,
         };
         let mut wallet = CompleteWallet::default();
