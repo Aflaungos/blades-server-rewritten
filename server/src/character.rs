@@ -108,7 +108,7 @@ pub(crate) struct CharacterCreationResponse {
     inventory: CompleteInventory,
 }
 
-#[post("/blades.bgs.services/api/game/v1/public/characters")]
+#[post("/api/game/v1/public/characters")]
 async fn create_characters(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
