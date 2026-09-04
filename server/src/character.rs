@@ -114,40 +114,6 @@ struct CharacterCreationResponse {
     inventory: CompleteInventory,
 }
 
-/// Build a brand-new character with retail's starter loadout.
-///
-/// Extracted from `create_characters` so the FTUE route and the auto-provision
-/// path below cannot drift: a starter character made for a new player must be
-/// byte-identical to one the real first-time flow would have produced.
-/// The appearance a brand-new player starts with.
-///
-/// NOT `CompleteCharacterData::default()`, which is `customization: {}`. An empty
-/// customization is the "stub character" shape that leaves the client on the
-/// loading screen forever — the same failure this auto-provisioning exists to
-/// prevent, so seeding an empty one would have swapped one hang for another.
-///
-/// This blob is a real 48-key appearance produced by retail's own FTUE (lifted
-/// from a level-1 character that loads), so it is the shape the client expects
-/// rather than one we invented. The embedded `Name` is base64 of the character
-/// name and is rewritten per player below.
-const STARTER_CUSTOMIZATION: &str = include_str!("../assets/starter_customization.json");
-
-/// The name a new player gets before they rename themselves. Retail's own
-/// default, and what every FTUE-created character in the capture set carries.
-const STARTER_NAME: &str = "Adventurer";
-
-/// `STARTER_CUSTOMIZATION` with the embedded name replaced by `name`.
-fn starter_customization(name: &str) -> serde_json::Value {
-    let mut v: serde_json::Value = serde_json::from_str(STARTER_CUSTOMIZATION)
-        .expect("starter_customization.json is committed and valid");
-    // customization.Name is `{"_t":"String","_v":"<base64>"}`; leaving the donor
-    // name in would give every new player the same in-fiction name.
-    if let Some(slot) = v.pointer_mut("/Name/_v") {
-        *slot = serde_json::Value::String(b64(name.as_bytes()));
-    }
-    v
-}
-
 /// Standard base64, no padding omitted. Twelve lines rather than a new
 /// dependency for one call site — every added crate is supply-chain surface.
 fn b64(input: &[u8]) -> String {
@@ -164,69 +130,19 @@ fn b64(input: &[u8]) -> String {
     out
 }
 
-/// Give `owner` a starter character if they have none.
-///
-/// WHY THIS EXISTS
-///
-/// A brand-new player installs the APK, logs in anonymously, asks for their
-/// characters and gets `{"characters":[]}` — then sits on the loading screen
-/// forever. The thing that would have created a character is the FTUE, and the
-/// distributed APK has FTUE patched out so it can boot straight to our server.
-/// So the shipped client can only play as a character that already exists,
-/// which means the game was unplayable for anyone who had never played before.
-///
-/// Reproduced on a clean rig running the byte-identical distributed APK against
-/// an unclaimed device: `auth/anon` 200, `sync` 200, `characters` 200 with a
-/// 17-byte body, then nothing ever again.
-///
-/// Returns Ok(true) if it created one. Idempotent: a user who already has any
-/// character is left completely alone, so this cannot touch a returning player.
-pub async fn ensure_starter_character(
-    app_state: &ServerGlobal,
-    owner: Uuid,
-) -> Result<bool, diesel::result::Error> {
-    let mut conn = match app_state.db_pool.get().await {
-        Ok(c) => c,
-        Err(_) => return Ok(false),
-    };
-    let existing: i64 = {
-        use schema::characters::dsl::*;
-        characters
-            .filter(user_id.eq(owner))
-            .count()
-            .get_result(&mut conn)
-            .await?
-    };
-    if existing > 0 {
-        return Ok(false);
-    }
+#[post("/api/game/v1/public/characters")]
+async fn create_characters(
+    session: SessionLookedUpMaybe,
+    app_state: web::Data<Arc<ServerGlobal>>,
+    body: web::Json<CharacterCreationRequest>,
+) -> Result<web::Json<CharacterCreationResponse>, BladeApiError> {
+    let session = session.get_session_or_error()?;
 
-    let (_uuid, to_insert, _inv) =
-        build_new_character(owner, STARTER_NAME.to_string(), starter_customization(STARTER_NAME));
-
-    // ON CONFLICT DO NOTHING is not enough on its own (the id is fresh every
-    // call), so the count above is the guard. Two racing logins for the same
-    // brand-new user could still both insert; that is a cosmetic duplicate on a
-    // first login, not a lost character, and it is preferable to holding a
-    // transaction open across the whole build.
-    insert_into(characters::table)
-        .values(&to_insert)
-        .execute(&mut conn)
-        .await?;
-    Ok(true)
-}
-
-fn build_new_character(
-    owner: Uuid,
-    name: String,
-    customization: serde_json::Value,
-) -> (Uuid, CharacterDbEntry, CompleteInventory) {
-    //TODO: make sure the user name, or at least the tag id, is unique. Good luck getting it to work with the current (lack of) transaction model. An extra unique key in the table?
     let mut new_character = CompleteCharacter::default();
-    new_character.name = name;
+    new_character.name = body.name.clone();
 
     let mut new_data = CompleteCharacterData::default();
-    new_data.customization = customization;
+    new_data.customization = body.0.data.customization;
 
     let character_uuid = Uuid::new_v4();
 
@@ -321,7 +237,7 @@ fn build_new_character(
 
     let to_insert = CharacterDbEntry {
         id: character_uuid,
-        user_id: owner,
+        user_id: session.session.user_id,
         character: JsonDbWrapper(new_character),
         data: JsonDbWrapper(new_data),
         wallet: JsonDbWrapper(CompleteWallet::default()),
@@ -329,22 +245,6 @@ fn build_new_character(
         // Fresh character → no captured town; get_town serves default_town.json.
         town: None,
     };
-    (character_uuid, to_insert, inventory)
-}
-
-#[post("/api/game/v1/public/characters")]
-async fn create_characters(
-    session: SessionLookedUpMaybe,
-    app_state: web::Data<Arc<ServerGlobal>>,
-    body: web::Json<CharacterCreationRequest>,
-) -> Result<web::Json<CharacterCreationResponse>, BladeApiError> {
-    let session = session.get_session_or_error()?;
-    let (character_uuid, to_insert, inventory) = build_new_character(
-        session.session.user_id,
-        body.name.clone(),
-        body.0.data.customization.clone(),
-    );
-
 
     let mut conn = app_state.db_pool.get().await.unwrap();
     //TODO: convert error
@@ -363,70 +263,4 @@ async fn create_characters(
         },
         inventory,
     }))
-}
-
-
-#[cfg(test)]
-mod starter_tests {
-    use super::*;
-
-    /// The whole point of the embedded blob: `CompleteCharacterData::default()`
-    /// is `customization: {}`, and an empty customization is the stub-character
-    /// shape that leaves the client on the loading screen — the exact failure
-    /// auto-provisioning exists to remove. Seeding an empty one would have
-    /// swapped one hang for another, silently.
-    #[test]
-    fn starter_customization_is_not_the_empty_stub() {
-        let c = starter_customization("Adventurer");
-        let obj = c.as_object().expect("customization must be an object");
-        assert!(
-            obj.len() >= 40,
-            "expected a real ~48-key appearance, got {} keys — an empty or thin \
-             customization is the stub-character shape that hangs the client",
-            obj.len()
-        );
-        assert!(obj.contains_key("CharacterUID"), "race/gender live in CharacterUID");
-    }
-
-    /// The donor blob carries the donor's name, base64 in `Name._v`. Shipping it
-    /// unchanged would give every new player the same in-fiction name.
-    #[test]
-    fn starter_customization_carries_the_requested_name() {
-        let c = starter_customization("Adventurer");
-        let got = c.pointer("/Name/_v").and_then(|v| v.as_str()).expect("Name/_v");
-        assert_eq!(got, "QWR2ZW50dXJlcg==", "Name must be base64 of the new name");
-        let other = starter_customization("Bob");
-        assert_ne!(
-            other.pointer("/Name/_v"),
-            c.pointer("/Name/_v"),
-            "two different names must not produce the same embedded name"
-        );
-    }
-
-    #[test]
-    fn b64_matches_known_vectors() {
-        assert_eq!(b64(b"Adventurer"), "QWR2ZW50dXJlcg==");
-        assert_eq!(b64(b"StormLord"), "U3Rvcm1Mb3Jk");
-        assert_eq!(b64(b""), "");
-        assert_eq!(b64(b"a"), "YQ==");
-        assert_eq!(b64(b"ab"), "YWI=");
-        assert_eq!(b64(b"abc"), "YWJj");
-    }
-
-    /// A starter character must be a playable one: the auto-provision path and
-    /// the FTUE route go through the same builder precisely so this holds.
-    #[test]
-    fn a_starter_character_has_starter_gear_and_the_right_owner() {
-        let owner = Uuid::new_v4();
-        let (id, entry, inv) =
-            build_new_character(owner, STARTER_NAME.to_string(), starter_customization(STARTER_NAME));
-        assert_eq!(entry.user_id, owner, "character must belong to the caller");
-        assert_eq!(entry.id, id);
-        assert_eq!(entry.character.0.name, STARTER_NAME);
-        assert!(
-            !inv.loadout.equipped_items.0.is_empty(),
-            "a starter character with no equipped items cannot fight in the arena"
-        );
-        assert!(entry.town.is_none(), "fresh character serves the default town");
-    }
 }

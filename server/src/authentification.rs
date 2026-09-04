@@ -229,13 +229,7 @@ async fn anon_log_in(
         ));
         let session_id = app_state.session_store.store_new_session(session.clone());
         crate::session::persist_session(&app_state.db_pool, session_id, session.as_ref()).await;
-        // A brand-new anon user has no character, and the shipped APK has FTUE
-        // patched out — so without this it would ask for its characters, get an
-        // empty list and sit on the loading screen forever. Best-effort: a
-        // failure here must not break the login itself.
-        if let Err(e) = crate::character::ensure_starter_character(&app_state, session.user_id).await {
-            log::warn!("could not provision a starter character for {}: {}", session.user_id, e);
-        }
+
         return Ok(web::Json(SessionResponse {
             session: SessionResponseInner::from_session(session_id, session.as_ref()),
         }));
@@ -270,13 +264,7 @@ async fn anon_log_in(
         ));
         let session_id = app_state.session_store.store_new_session(session.clone());
         crate::session::persist_session(&app_state.db_pool, session_id, session.as_ref()).await;
-        // A brand-new anon user has no character, and the shipped APK has FTUE
-        // patched out — so without this it would ask for its characters, get an
-        // empty list and sit on the loading screen forever. Best-effort: a
-        // failure here must not break the login itself.
-        if let Err(e) = crate::character::ensure_starter_character(&app_state, session.user_id).await {
-            log::warn!("could not provision a starter character for {}: {}", session.user_id, e);
-        }
+
         return Ok(web::Json(SessionResponse {
             session: SessionResponseInner::from_session(session_id, session.as_ref()),
         }));
@@ -310,13 +298,7 @@ async fn anon_log_in(
         ));
         let session_id = app_state.session_store.store_new_session(session.clone());
         crate::session::persist_session(&app_state.db_pool, session_id, session.as_ref()).await;
-        // A brand-new anon user has no character, and the shipped APK has FTUE
-        // patched out — so without this it would ask for its characters, get an
-        // empty list and sit on the loading screen forever. Best-effort: a
-        // failure here must not break the login itself.
-        if let Err(e) = crate::character::ensure_starter_character(&app_state, session.user_id).await {
-            log::warn!("could not provision a starter character for {}: {}", session.user_id, e);
-        }
+
         return Ok(web::Json(SessionResponse {
             session: SessionResponseInner::from_session(session_id, session.as_ref()),
         }));
