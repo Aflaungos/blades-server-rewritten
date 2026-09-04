@@ -57,15 +57,31 @@ struct CombatCompletedUpdate {
 /// ```
 ///
 /// so `loot` is deserialized straight into [`RewardGrant`], whose camelCase wire form
-/// is already exactly `{currencies, stackableItems, items}`. Retail trusted the client
-/// here — there is no second request where the server states the contents — and the
-/// spawn-group loot tables are not something we generate, so trusting it is also the
-/// only option that credits anything at all.
+/// is already exactly `{currencies, stackableItems, items}`.
+///
+/// This is used ONLY for floor loot and plants, where the contents genuinely exist
+/// nowhere but the request — we do not generate loose-item spawns, so the client is the
+/// only source. Corpse loot is different and must not use this: see
+/// [`EnemyLootCollectedUpdate`].
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct LootCollectedUpdate {
     #[serde(default)]
     loot: RewardGrant,
+}
+
+/// An `enemy_loot_collected` action — the player looted a corpse.
+///
+/// Only the enemy's IDENTITY is read. The contents were rolled server-side the moment
+/// the enemy died (`EnemyStatus.loot`, from `merged_loot_table()`), so the client is
+/// told what it got rather than asked. Reading `loot` from the request here would let a
+/// caller name its own payout off any corpse it had killed.
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct EnemyLootCollectedUpdate {
+    pub spawn_group_id: Uuid,
+    pub spawner_index: usize,
+    pub enemy_index: usize,
 }
 
 #[derive(Deserialize, Debug)]
@@ -76,8 +92,10 @@ enum DungeonUpdateAction {
     /// previously an unknown variant made serde reject the whole POST (→400), which is
     /// PaganBlueNose's "network error … with a quest".
     CombatCompleted(CombatCompletedUpdate),
-    /// Loot off a corpse.
-    EnemyLootCollected(LootCollectedUpdate),
+    /// Loot off a corpse. The `loot` the client sends here is IGNORED — the authoritative
+    /// contents were generated server-side when the enemy died and are stored on
+    /// `EnemyStatus.loot`, so the client only identifies WHICH corpse.
+    EnemyLootCollected(EnemyLootCollectedUpdate),
     /// Loot off the dungeon floor — loose items and harvested plants. This is the one
     /// tracker #95 is about.
     ItemLootCollected(LootCollectedUpdate),
@@ -203,13 +221,47 @@ pub async fn dungeon_update(
                     // in this batch and the dungeon current_state blob is persisted below;
                     // no extra reward to apply here.
                     DungeonUpdateAction::CombatCompleted(_) => {}
-                    // Floor loot, harvested plants, corpse loot. Before this these fell
-                    // into `Unknown` and were logged and dropped, so picking anything up
-                    // in a dungeon gave the player nothing (tracker #95).
-                    DungeonUpdateAction::ItemLootCollected(collected)
-                    | DungeonUpdateAction::EnemyLootCollected(collected) => {
+                    // Floor loot and harvested plants. We do not generate loose-item
+                    // spawns, so the request is the only place these contents exist.
+                    DungeonUpdateAction::ItemLootCollected(collected) => {
                         blades_lib::economy::apply_reward(
                             &collected.loot,
+                            &mut character_data.wallet.0,
+                            &mut character_data.inventory.0,
+                            &mut character_data.character.0,
+                            &mut inventory_modification_tracker,
+                        );
+                    }
+                    // Corpse loot. The contents were rolled server-side when the enemy
+                    // died, so read them off the stored `EnemyStatus` and ignore whatever
+                    // the request claims.
+                    DungeonUpdateAction::EnemyLootCollected(looted) => {
+                        let enemy_index = EnemyIndex::new(
+                            looted.spawn_group_id,
+                            looted.spawner_index,
+                            looted.enemy_index,
+                        );
+                        let Some(status) =
+                            dungeon_state.dungeon_status.enemy_status.get_mut(&enemy_index)
+                        else {
+                            // Looting a corpse we have no record of killing credits
+                            // nothing — that is the whole point of not trusting the body.
+                            log::warn!(
+                                "dungeon_update: enemy_loot_collected for unknown enemy {:?} — crediting nothing",
+                                enemy_index
+                            );
+                            continue;
+                        };
+                        // Looting the same corpse twice must not pay twice; taking the
+                        // stored loot empties it.
+                        let loot = std::mem::take(&mut status.loot);
+                        let grant = RewardGrant {
+                            currencies: loot.currencies,
+                            stackable_items: loot.stackable_items,
+                            ..Default::default()
+                        };
+                        blades_lib::economy::apply_reward(
+                            &grant,
                             &mut character_data.wallet.0,
                             &mut character_data.inventory.0,
                             &mut character_data.character.0,
@@ -331,10 +383,13 @@ mod tests {
         }
         match &req.actions[1] {
             DungeonUpdateAction::EnemyLootCollected(c) => {
-                assert_eq!(c.loot.currencies.get(&gold), Some(&4));
+                // Only the identity is read; the payout comes from stored state.
+                assert_eq!(c.spawner_index, 0);
+                assert_eq!(c.enemy_index, 0);
             }
             other => panic!("corpse loot must not be dropped, got {other:?}"),
         }
+        let _ = gold;
     }
 
     /// A loot action with no `loot` block at all must still parse — the client omits it
@@ -389,9 +444,7 @@ mod tests {
         let mut tracker = InventoryChangeTracker::default();
 
         for action in &req.actions {
-            if let DungeonUpdateAction::ItemLootCollected(c)
-            | DungeonUpdateAction::EnemyLootCollected(c) = action
-            {
+            if let DungeonUpdateAction::ItemLootCollected(c) = action {
                 blades_lib::economy::apply_reward(
                     &c.loot,
                     &mut wallet,
@@ -407,7 +460,9 @@ mod tests {
             1,
             "floor loot must reach the backpack"
         );
-        assert_eq!(wallet.balance(gold), 4, "corpse gold must reach the wallet");
+        // Corpse gold is credited from stored state in the handler, not from this
+        // payload, so it must NOT appear here.
+        assert_eq!(wallet.balance(gold), 0, "the request's corpse loot must be ignored");
         assert!(
             tracker.modified_backpack.stackable_items.contains(&lumber),
             "the pickup must be reported to the client, or the bag looks unchanged"
