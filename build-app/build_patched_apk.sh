@@ -6,6 +6,7 @@ apktool d source-package.apk -o tmp --no-src
 mkdir tmp/res/xml
 cp network_security_config.xml tmp/res/xml/network_security_config.xml
 sed -i -e 's/com.bethsoft.blade/fr.mariusdavid.blade/g' tmp/AndroidManifest.xml
+sed -i -e 's/"\\ 976915845338"/"976915845338"/g' tmp/AndroidManifest.xml
 sed -i -e 's#android:theme="@style/UnityThemeSelector"#android:theme="@style/UnityThemeSelector" android:networkSecurityConfig="@xml/network_security_config"#g' tmp/AndroidManifest.xml
 sed -i -e 's#<string name="app_name">Blades</string>#<string name="app_name">custom Blades</string>#g' tmp/res/values/strings.xml
 apktool b tmp/ -o patched.apk --use-aapt1
