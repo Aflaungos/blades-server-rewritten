@@ -132,14 +132,6 @@ struct CharacterCreationResponse {
 /// name and is rewritten per player below.
 const STARTER_CUSTOMIZATION: &str = include_str!("../assets/starter_customization.json");
 
-#[post("/api/game/v1/public/characters")]
-async fn create_characters(
-    session: SessionLookedUpMaybe,
-    app_state: web::Data<Arc<ServerGlobal>>,
-    body: web::Json<CharacterCreationRequest>,
-) -> Result<web::Json<CharacterCreationResponse>, BladeApiError> {
-    let session = session.get_session_or_error()?;
-
 /// The name a new player gets before they rename themselves. Retail's own
 /// default, and what every FTUE-created character in the capture set carries.
 const STARTER_NAME: &str = "Adventurer";
@@ -340,7 +332,7 @@ fn build_new_character(
     (character_uuid, to_insert, inventory)
 }
 
-#[post("/blades.bgs.services/api/game/v1/public/characters")]
+#[post("/api/game/v1/public/characters")]
 async fn create_characters(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
