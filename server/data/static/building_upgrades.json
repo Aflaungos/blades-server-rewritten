@@ -2181,6 +2181,30 @@
           "prestigeForLevel": 0,
           "_capture_gold_samples": 0,
           "_capture_time_samples": 0
+        },
+        "10": {
+          "goldCost": null,
+          "constructionTimeMs": null,
+          "buildInputs": {},
+          "styleInputs": {
+            "aa133662-053d-434e-8779-3f2a41d1271e": {
+              "e7193116-d761-479b-8a20-5633737977f5": 272,
+              "fd67bbc6-20f4-44a3-9614-28265ebb8c67": 128,
+              "42d91529-c88b-4c5b-815b-b55508b4e7ef": 128
+            },
+            "1d6696b3-963b-48d4-8924-d43505cb2807": {
+              "fd67bbc6-20f4-44a3-9614-28265ebb8c67": 224,
+              "42d91529-c88b-4c5b-815b-b55508b4e7ef": 208,
+              "38d32048-ce01-4390-a4f0-cdb94ef3ce72": 96
+            },
+            "c462a43a-0547-4cd0-a755-5c0aff0f74f8": {
+              "42d91529-c88b-4c5b-815b-b55508b4e7ef": 416,
+              "38d32048-ce01-4390-a4f0-cdb94ef3ce72": 160,
+              "61d5e5c7-78b8-4fc3-ba6a-5b7c2a15866d": 208
+            }
+          },
+          "requireTownLevel": 0,
+          "prestigeForLevel": 0
         }
       }
     },
