@@ -9,6 +9,7 @@ use actix_web::{
     post,
     web::{self, Json},
 };
+use blades_lib::economy::RewardGrant;
 use blades_lib::user_data::{
     B64EncodedData, CompleteCharacterWithIdWithoutData, CompleteInventoryUpdate, DungeonStatus,
     EnemyIndex, EnemyStatus, InventoryChangeTracker,
@@ -45,6 +46,28 @@ struct CombatCompletedUpdate {
     time: Option<u64>,
 }
 
+/// A `*_loot_collected` action: the player picked something up inside the dungeon.
+///
+/// The client reports WHAT it collected — the captured payload carries the contents
+/// inline, e.g.
+///
+/// ```json
+/// {"type":"item_loot_collected","spawnGroupId":"e7edb276-…","spawnGroupIndex":0,
+///  "loot":{"stackableItems":{"e7193116-…":1}},"time":1777808410209}
+/// ```
+///
+/// so `loot` is deserialized straight into [`RewardGrant`], whose camelCase wire form
+/// is already exactly `{currencies, stackableItems, items}`. Retail trusted the client
+/// here — there is no second request where the server states the contents — and the
+/// spawn-group loot tables are not something we generate, so trusting it is also the
+/// only option that credits anything at all.
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct LootCollectedUpdate {
+    #[serde(default)]
+    loot: RewardGrant,
+}
+
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DungeonUpdateAction {
@@ -53,6 +76,11 @@ enum DungeonUpdateAction {
     /// previously an unknown variant made serde reject the whole POST (→400), which is
     /// PaganBlueNose's "network error … with a quest".
     CombatCompleted(CombatCompletedUpdate),
+    /// Loot off a corpse.
+    EnemyLootCollected(LootCollectedUpdate),
+    /// Loot off the dungeon floor — loose items and harvested plants. This is the one
+    /// tracker #95 is about.
+    ItemLootCollected(LootCollectedUpdate),
     /// Forward-compat: any OTHER action type the client emits is accepted and ignored
     /// rather than 400-ing the whole batch.
     #[serde(other)]
@@ -123,7 +151,7 @@ pub async fn dungeon_update(
                 .ok_or_else(|| BladeApiError::new(StatusCode::BAD_REQUEST, 20001, 2))?
                 .0;
 
-            let inventory_modification_tracker = InventoryChangeTracker::default();
+            let mut inventory_modification_tracker = InventoryChangeTracker::default();
 
             dungeon_state.dungeon_status.current_state = body.current_state.clone();
 
@@ -175,6 +203,19 @@ pub async fn dungeon_update(
                     // in this batch and the dungeon current_state blob is persisted below;
                     // no extra reward to apply here.
                     DungeonUpdateAction::CombatCompleted(_) => {}
+                    // Floor loot, harvested plants, corpse loot. Before this these fell
+                    // into `Unknown` and were logged and dropped, so picking anything up
+                    // in a dungeon gave the player nothing (tracker #95).
+                    DungeonUpdateAction::ItemLootCollected(collected)
+                    | DungeonUpdateAction::EnemyLootCollected(collected) => {
+                        blades_lib::economy::apply_reward(
+                            &collected.loot,
+                            &mut character_data.wallet.0,
+                            &mut character_data.inventory.0,
+                            &mut character_data.character.0,
+                            &mut inventory_modification_tracker,
+                        );
+                    }
                     DungeonUpdateAction::Unknown => {
                         log::warn!(
                             "dungeon_update: ignoring unknown action type in quest {}",
@@ -257,5 +298,119 @@ mod tests {
         assert!(matches!(req.actions[1], DungeonUpdateAction::CombatCompleted(_)));
         // Unknown action type tolerated (not a 400).
         assert!(matches!(req.actions[2], DungeonUpdateAction::Unknown));
+    }
+
+    /// Floor loot and harvested plants must parse as their own action and carry their
+    /// contents — not fall into `Unknown`, which is what silently dropped them
+    /// (tracker #95: "items placed on the dungeon floor or plants can't be picked up,
+    /// they don't give anything to the player").
+    ///
+    /// The bodies here are copied from captured retail requests.
+    #[test]
+    fn floor_and_corpse_loot_parse_with_their_contents() {
+        let raw = r#"{
+            "currentState": {"b64": "AAAA"},
+            "actions": [
+                {"type":"item_loot_collected","spawnGroupId":"e7edb276-a04c-413f-80ab-69ffe304874f","spawnGroupIndex":0,
+                 "loot":{"stackableItems":{"e7193116-d761-479b-8a20-5633737977f5":1}},"time":1777808410209},
+                {"type":"enemy_loot_collected","spawnGroupId":"4295c814-e5e7-4a8a-939a-d3238471c906","spawnerIndex":0,"enemyIndex":0,
+                 "loot":{"currencies":{"f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2":4}},"time":1777808407519}
+            ]
+        }"#;
+        let req: DungeonUpdateRequest =
+            serde_json::from_str(raw).expect("captured loot batch must deserialize");
+
+        let lumber: Uuid = "e7193116-d761-479b-8a20-5633737977f5".parse().unwrap();
+        let gold: Uuid = "f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2".parse().unwrap();
+
+        match &req.actions[0] {
+            DungeonUpdateAction::ItemLootCollected(c) => {
+                assert_eq!(c.loot.stackable_items.get(&lumber), Some(&1));
+            }
+            other => panic!("floor loot must not be dropped, got {other:?}"),
+        }
+        match &req.actions[1] {
+            DungeonUpdateAction::EnemyLootCollected(c) => {
+                assert_eq!(c.loot.currencies.get(&gold), Some(&4));
+            }
+            other => panic!("corpse loot must not be dropped, got {other:?}"),
+        }
+    }
+
+    /// A loot action with no `loot` block at all must still parse — the client omits it
+    /// for an empty pickup, and a hard `loot` field would 400 the whole batch, which is
+    /// the same class of bug as the old single-variant enum.
+    #[test]
+    fn a_loot_action_without_contents_still_parses() {
+        let raw = r#"{
+            "currentState": {"b64": "AAAA"},
+            "actions": [{"type":"item_loot_collected","spawnGroupId":"e7edb276-a04c-413f-80ab-69ffe304874f","time":1}]
+        }"#;
+        let req: DungeonUpdateRequest = serde_json::from_str(raw).expect("must deserialize");
+        match &req.actions[0] {
+            DungeonUpdateAction::ItemLootCollected(c) => assert!(c.loot.is_empty()),
+            other => panic!("expected ItemLootCollected(_), got {other:?}"),
+        }
+    }
+
+    /// Parsing the action is only half of it — the loot has to land in the player's
+    /// inventory and wallet. This drives the same `apply_reward` call the handler makes,
+    /// so it fails if the credit is dropped rather than only if the parse is.
+    #[test]
+    fn collected_loot_is_credited_to_the_player() {
+        use blades_lib::user_data::{
+            Backpack, CompleteCharacter, CompleteInventory, CompleteWallet, Loadout, Treasury,
+        };
+
+        let raw = r#"{
+            "currentState": {"b64": "AAAA"},
+            "actions": [
+                {"type":"item_loot_collected","spawnGroupId":"e7edb276-a04c-413f-80ab-69ffe304874f","spawnGroupIndex":0,
+                 "loot":{"stackableItems":{"e7193116-d761-479b-8a20-5633737977f5":1}},"time":1},
+                {"type":"enemy_loot_collected","spawnGroupId":"4295c814-e5e7-4a8a-939a-d3238471c906","spawnerIndex":0,"enemyIndex":0,
+                 "loot":{"currencies":{"f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2":4}},"time":2}
+            ]
+        }"#;
+        let req: DungeonUpdateRequest = serde_json::from_str(raw).unwrap();
+
+        let lumber: Uuid = "e7193116-d761-479b-8a20-5633737977f5".parse().unwrap();
+        let gold: Uuid = "f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2".parse().unwrap();
+
+        let mut wallet = CompleteWallet::default();
+        let mut inventory = CompleteInventory {
+            backpack: Backpack::default(),
+            loadout: Loadout::default(),
+            treasury: Treasury::default(),
+            overflow_treasury: Treasury::default(),
+            backpack_version: 1,
+            treasury_version: 0,
+        };
+        let mut character = CompleteCharacter::default();
+        let mut tracker = InventoryChangeTracker::default();
+
+        for action in &req.actions {
+            if let DungeonUpdateAction::ItemLootCollected(c)
+            | DungeonUpdateAction::EnemyLootCollected(c) = action
+            {
+                blades_lib::economy::apply_reward(
+                    &c.loot,
+                    &mut wallet,
+                    &mut inventory,
+                    &mut character,
+                    &mut tracker,
+                );
+            }
+        }
+
+        assert_eq!(
+            inventory.backpack.stackable_items.count(lumber),
+            1,
+            "floor loot must reach the backpack"
+        );
+        assert_eq!(wallet.balance(gold), 4, "corpse gold must reach the wallet");
+        assert!(
+            tracker.modified_backpack.stackable_items.contains(&lumber),
+            "the pickup must be reported to the client, or the bag looks unchanged"
+        );
     }
 }
