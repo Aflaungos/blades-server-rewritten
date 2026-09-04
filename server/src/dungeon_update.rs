@@ -7,7 +7,6 @@ use actix_web::{
     post,
     web::{self, Json},
 };
-use blades_lib::economy::RewardGrant;
 use blades_lib::user_data::{
     B64EncodedData, CompleteCharacterWithIdWithoutData, CompleteInventoryUpdate, DungeonStatus,
     EnemyIndex, EnemyStatus, InventoryChangeTracker, CompleteWallet, DungeonGeneratedData,
@@ -92,41 +91,16 @@ struct EnemyLootCollectedUpdate {
 
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
-struct EnemyLootCollectedUpdate {
-    pub spawn_group_id: Uuid,
-    pub spawner_index: usize,
-    pub enemy_index: usize,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
-struct ItemLootCollectedUpdate {
-    pub loot: LootData,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "camelCase")]
 struct ChestCollectedUpdate {
     pub spawn_group_id: Uuid,
     pub spawn_group_index: usize,
     pub tier: u32,
 }
 
-#[derive(Deserialize, Debug, Default)]
-#[serde(rename_all = "camelCase")]
-struct LootData {
-    #[serde(default)]
-    pub stackable_items: HashMap<Uuid, u32>,
-    #[serde(default)]
-    pub currencies: HashMap<Uuid, u32>,
-}
-
 #[derive(Deserialize, Debug)]
 #[serde(tag = "type", rename_all = "snake_case")]
 enum DungeonUpdateAction {
     EnemyKilled(EnemyKilledUpdate),
-    EnemyLootCollected(EnemyLootCollectedUpdate),
-    ItemLootCollected(ItemLootCollectedUpdate),
     ChestCollected(ChestCollectedUpdate),
     /// Accepted so a mixed `enemy_killed` + `combat_completed` batch deserializes —
     /// previously an unknown variant made serde reject the whole POST (→400), which is

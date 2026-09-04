@@ -60,9 +60,6 @@ const TOWN_SERVICE_ID: u64 = 9005;
 /// Service id reported on prop place/remove errors.
 const PROPS_SERVICE_ID: u64 = 9006;
 
-/// Service ID for props-related errors
-const PROPS_SERVICE_ID: u64 = 9006;
-
 /// Wall-clock milliseconds since the unix epoch. This is a real server — no
 /// determinism requirement — so `SystemTime` is fine (a pre-1970 clock, which can't
 /// happen, would saturate to 0 rather than panic).
@@ -1274,12 +1271,6 @@ pub async fn remove_town_props(
                 .execute(&mut conn)
                 .await?;
 
-            // The client needs the prop IDs that were removed
-            let client_prop_ids: Vec<String> = req.deleted_props
-                .iter()
-                .map(|p| p.prop_id.to_string())
-                .collect();
-
             Ok(Json(RemovePropsResponse {
                 wallet,
                 inventory,
@@ -1477,38 +1468,6 @@ fn credit_removed_decorations(
 
 #[post(
     "/api/game/v1/public/characters/{character_id}/towns/current/props"
-/// Remove props from inventory after they're removed from the town.
-fn remove_decoration_from_inventory(
-    inventory: &mut CompleteInventory,
-    decoration_id: Uuid,
-    tracker: &mut InventoryChangeTracker,
-) -> Result<(), BladeApiError> {
-    // Remove 1 of the decoration item from stackable items
-    // The decoration is stored as a stackable item in the backpack
-    let count = inventory.backpack.stackable_items.count(decoration_id);
-    if count > 0 {
-        inventory
-            .backpack
-            .stackable_items
-            .remove(decoration_id, 1)
-            .map_err(|_| {
-                BladeApiError::new(
-                    StatusCode::BAD_REQUEST,
-                    PROPS_SERVICE_ID,
-                    3,
-                )
-            })?;
-        tracker.modified_backpack.stackable_items.insert(decoration_id);
-        inventory.backpack_version += 1;
-        Ok(())
-    } else {
-        // The decoration might be in the treasury or elsewhere
-        // For now, just log and continue
-        log::warn!("Decoration {} not found in inventory", decoration_id);
-        Ok(())
-    }
-}
-
 )]
 pub async fn place_town_props(
     session: SessionLookedUpMaybe,

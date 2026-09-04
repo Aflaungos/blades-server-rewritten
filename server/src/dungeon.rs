@@ -493,14 +493,14 @@ pub async fn enter_quest_dungeon(
     let mut conn = app_state.db_pool.get().await.unwrap();
 
     let _ =
-        check_permission_for_character_and_get_it(&mut conn, &session.session, character_id_normal)
+        check_permission_for_character_and_get_it(&mut conn, &validated_session, character_id_normal)
             .await?;
 
     // First, get the quest row to know what type it is
     // Load as tuple and construct manually:
     let row_info: JsonDbWrapper<serde_json::Value> = match crate::schema::quests::table
         .filter(crate::schema::quests::id.eq(quest_id))
-        .filter(crate::schema::quests::character_id.eq(character_id))  // Use character_id here
+        .filter(crate::schema::quests::character_id.eq(character_id_normal))  // Use character_id here
         .select(crate::schema::quests::info)
         .first(&mut *conn)
         .await
@@ -524,7 +524,7 @@ pub async fn enter_quest_dungeon(
         return handle_event_dungeon_entry(
             &mut conn,
             &app_state,
-            character_id,
+            character_id_normal,
             gld_quest_id,
             body,
             validated_session,
@@ -544,7 +544,7 @@ pub async fn enter_quest_dungeon(
         None => return Err(BladeApiError::new(StatusCode::BAD_REQUEST, 20001, 2)),
     };
 
-    let _ = check_permission_for_character_and_get_it(&mut conn, validated_session, character_id)
+    let _ = check_permission_for_character_and_get_it(&mut conn, validated_session, character_id_normal)
         .await?;
 
     let app_state_clone = app_state.clone();
