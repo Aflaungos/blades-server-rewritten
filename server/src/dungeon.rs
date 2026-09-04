@@ -356,6 +356,7 @@ fn resolve_dungeon_settings_id(
         // A dialogue-only quest has no dungeon to enter.
         None => Err(BladeApiError::new(StatusCode::BAD_REQUEST, 20001, 2)),
     }
+}
 
 async fn handle_event_dungeon_exit(
     conn: &mut AsyncPgConnection,

@@ -277,140 +277,26 @@ async fn handle_quest_dungeon_update(
 
             let mut wallet = std::mem::take(&mut character_data.wallet.0);
 
-            let result = { 
-                process_dungeon_actions(
-                    &body.actions,
-                    &generated_data,
-                    &mut dungeon_state,
-                    &mut character_data,
-                    &mut wallet,
-                    &mut inventory_modification_tracker,
-                );
+            // Process all actions
+            process_dungeon_actions(
+                &body.actions,
+                &generated_data,
+                &mut dungeon_state,
+                &mut character_data,
+                &mut wallet,
+                &mut inventory_modification_tracker,
+            );
 
-                character_data.wallet.0 = wallet;
+            character_data.wallet.0 = wallet;
 
-                        // Get the enemy status to retrieve the loot
-                        if let Some(enemy_status) = dungeon_state.dungeon_status.enemy_status.get(&enemy_index)
-                        {
-                            let mut reward = RewardGrant::default();
-
-                            for (item_id, quantity) in &enemy_status.loot.stackable_items {
-                                reward.stackable_items.insert(*item_id, *quantity);
-                            }
-
-                            for (currency_id, amount) in &enemy_status.loot.currencies {
-                                reward.currencies.insert(*currency_id, *amount);
-                            }
-
-                            apply_reward(
-                                &reward,
-                                &mut wallet,
-                                &mut character_data.inventory.0,
-                                &mut character_data.character.0,
-                                &mut inventory_modification_tracker,
-                            );
-                        }
-                    }
-
-                    DungeonUpdateAction::ItemLootCollected(item_loot) => {
-                        let mut reward = RewardGrant::default();
-
-                        for (item_id, quantity) in &item_loot.loot.stackable_items {
-                            reward.stackable_items.insert(*item_id, (*quantity).into());
-                        }
-
-                        for (currency_id, amount) in &item_loot.loot.currencies {
-                            reward.currencies.insert(*currency_id, (*amount).into());
-                        }
-
-                        apply_reward(
-                            &reward,
-                            &mut wallet,
-                            &mut character_data.inventory.0,
-                            &mut character_data.character.0,
-                            &mut inventory_modification_tracker,
-                        );
-                    }
-
-                    DungeonUpdateAction::ChestCollected(chest) => {
-                        if let Some(chest_data) = generated_data.get_chest(&chest.spawn_group_id, chest.spawn_group_index) {
-                            let tier = if chest_data.tier > 0 { 
-                                chest_data.tier as u32 
-                            } else { 
-                                chest.tier
-                            };
-
-                            let chest_id = character_data.inventory.0.treasury.add_chest(
-                                tier as u64, 
-                                dungeon_state.dungeon_status.level
-                            );
-
-                            // Track the added chest so it appears in the response
-                            inventory_modification_tracker.modified_treasury.added.push(chest_id);
-
-                            // Mark as collected
-                            dungeon_state.dungeon_status.collected_chests.insert(chest.spawn_group_id);
-                        }
-                    }
-
-                    // Room/combat finished — the kills (XP) arrived as EnemyKilled actions
-                    // in this batch and the dungeon current_state blob is persisted below;
-                    // no extra reward to apply here.
-                    DungeonUpdateAction::CombatCompleted(_) => {}
-                    // Floor loot and harvested plants. We do not generate loose-item
-                    // spawns, so the request is the only place these contents exist.
-                    DungeonUpdateAction::ItemLootCollected(collected) => {
-                        blades_lib::economy::apply_reward(
-                            &collected.loot,
-                            &mut character_data.wallet.0,
-                            &mut character_data.inventory.0,
-                            &mut character_data.character.0,
-                            &mut inventory_modification_tracker,
-                        );
-                    }
-                    // Corpse loot. The contents were rolled server-side when the enemy
-                    // died, so read them off the stored `EnemyStatus` and ignore whatever
-                    // the request claims.
-                    DungeonUpdateAction::EnemyLootCollected(looted) => {
-                        let enemy_index = EnemyIndex::new(
-                            looted.spawn_group_id,
-                            looted.spawner_index,
-                            looted.enemy_index,
-                        );
-                        let Some(status) =
-                            dungeon_state.dungeon_status.enemy_status.get_mut(&enemy_index)
-                        else {
-                            // Looting a corpse we have no record of killing credits
-                            // nothing — that is the whole point of not trusting the body.
-                            log::warn!(
-                                "dungeon_update: enemy_loot_collected for unknown enemy {:?} — crediting nothing",
-                                enemy_index
-                            );
-                            continue;
-                        };
-                        // Looting the same corpse twice must not pay twice; taking the
-                        // stored loot empties it.
-                        let loot = std::mem::take(&mut status.loot);
-                        let grant = RewardGrant {
-                            currencies: loot.currencies,
-                            stackable_items: loot.stackable_items,
-                            ..Default::default()
-                        };
-                        blades_lib::economy::apply_reward(
-                            &grant,
-                            &mut character_data.wallet.0,
-                            &mut character_data.inventory.0,
-                            &mut character_data.character.0,
-                            &mut inventory_modification_tracker,
-                        );
-                    }
-                    DungeonUpdateAction::Unknown => {
-                        log::warn!(
-                            "dungeon_update: ignoring unknown action type in quest {}",
-                            quest_id
-                        );
-                    }
-                }
+            let result = DungeonUpdateResponse {
+                dungeon_status: dungeon_state.dungeon_status.clone(),
+                character: CompleteCharacterWithIdWithoutData {
+                    id: character_id,
+                    character: character_data.character.0.clone(),
+                },
+                inventory: character_data.inventory.0.generate_client_update(&inventory_modification_tracker),
+                wallet: character_data.wallet.0.clone(),
             };
 
             let quest_data_rebuilt = QuestDbEntryDungeonStateAndGeneratedData {
@@ -422,12 +308,6 @@ async fn handle_quest_dungeon_update(
             {
                 use crate::schema::quests;
                 diesel::update(quests::table)
-                    // BOTH halves of the primary key. `quests.id` alone is NOT unique:
-                    // an ordinary story quest is stored under the template id, so every
-                    // character on that quest has a row with the same `id`, and an
-                    // update filtered on `id` writes one player's dungeon state into
-                    // all of them. The SELECT above is already scoped to this
-                    // character; the write has to be too.
                     .filter(quests::id.eq(quest_id))
                     .filter(quests::character_id.eq(character_id))
                     .set(quest_data_rebuilt)
