@@ -35,7 +35,8 @@ use actix_web::{
 };
 use blades_lib::economy::{GEMS, GOLD};
 use blades_lib::user_data::{
-    CompleteInventory, CompleteInventoryUpdate, CompleteWallet, InventoryChangeTracker,
+    CompleteCharacterWithIdWithoutData, CompleteInventory, CompleteInventoryUpdate, CompleteWallet,
+    InventoryChangeTracker,
 };
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt};
@@ -644,10 +645,18 @@ struct CompleteResponse {
     /// but retail sends the key and the client's parser expects the quartet).
     #[serde(skip_serializing_if = "Option::is_none")]
     inventory: Option<CompleteInventoryUpdate>,
-    /// Full character JSONB (verbatim) so the client re-reads town xp/level etc.
-    /// Speed-up only.
+    /// The updated character, id + fields, so the client re-reads town xp/level
+    /// etc. Speed-up only.
+    ///
+    /// The id is REQUIRED: this is the one place a character-bearing response
+    /// used to echo the JSONB bare, and every other endpoint (quests, dungeons,
+    /// and the sibling gem speed-up `crafts/{id}/finish`) ships
+    /// `{id, ...fields}` via [`CompleteCharacterWithIdWithoutData`]. The client
+    /// reconciles a returned character against its own store BY id, so a bare
+    /// character made the paid flow hang until a reload (the reload re-syncs the
+    /// character list, which is why the building then looked completed).
     #[serde(skip_serializing_if = "Option::is_none")]
-    character: Option<Value>,
+    character: Option<CompleteCharacterWithIdWithoutData>,
 }
 
 #[post(
@@ -703,7 +712,14 @@ pub async fn complete_building(
             let tracker = InventoryChangeTracker::default();
             let inventory = entry.inventory.0.generate_client_update(&tracker);
             let wallet = entry.wallet.0.clone();
-            let character = entry.character.0.clone();
+            // Ship the character WITH its id, like every other character-bearing
+            // endpoint — a bare JSONB character is not a shape retail sent and the
+            // client cannot reconcile it (it keys characters by id), which left the
+            // paid flow hanging until reload.
+            let character = CompleteCharacterWithIdWithoutData {
+                id: character_id,
+                character: entry.character.0.clone(),
+            };
 
             {
                 use crate::schema::characters;
@@ -721,7 +737,7 @@ pub async fn complete_building(
                     town_col,
                     wallet,
                     inventory,
-                    serde_json::to_value(&character).unwrap_or_else(|_| json!(null)),
+                    character,
                 )))
             }
         }
@@ -765,7 +781,7 @@ fn complete_response(
     town: Value,
     wallet: CompleteWallet,
     inventory: CompleteInventoryUpdate,
-    character: Value,
+    character: CompleteCharacterWithIdWithoutData,
 ) -> CompleteResponse {
     if speed_up {
         CompleteResponse {
@@ -2959,7 +2975,7 @@ mod tests {
     /// has nothing to sell.
     #[test]
     fn complete_response_matches_the_captured_retail_shape() {
-        use blades_lib::user_data::{Backpack, CompleteInventory, Loadout, Treasury};
+        use blades_lib::user_data::{Backpack, CompleteCharacter, CompleteInventory, Loadout, Treasury};
         let inv = CompleteInventory {
             backpack: Backpack::default(),
             loadout: Loadout::default(),
@@ -2969,12 +2985,21 @@ mod tests {
             treasury_version: 0,
         }
         .generate_client_update(&InventoryChangeTracker::default());
+
+        let character = || CompleteCharacterWithIdWithoutData {
+            id: Uuid::parse_str("8c6f4962-6522-42fb-bfcb-f653da832d04").unwrap(),
+            character: CompleteCharacter {
+                name: "Swanne".to_string(),
+                ..CompleteCharacter::default()
+            },
+        };
+
         let plain = serde_json::to_value(complete_response(
             false,
             json!({"levelInfo": {"level": 6}}),
             wallet_with(848),
             inv.clone(),
-            json!({"name": "Swanne"}),
+            character(),
         ))
         .unwrap();
         let keys: Vec<&str> = plain
@@ -2990,7 +3015,7 @@ mod tests {
             json!({"levelInfo": {"level": 6}}),
             wallet_with(848),
             inv,
-            json!({"name": "Swanne"}),
+            character(),
         ))
         .unwrap();
         let obj = sped.as_object().unwrap();
@@ -2998,6 +3023,15 @@ mod tests {
         keys.sort_unstable();
         assert_eq!(keys, vec!["character", "inventory", "town", "wallet"]);
         assert!(!obj.contains_key("shop"), "retail sends no shop here");
+        // The character rides WITH its id — the shape every other character-bearing
+        // endpoint ships and the shape the client can reconcile by. A bare JSONB
+        // character (no id) is what left the paid flow hanging until reload.
+        assert_eq!(
+            sped["character"]["id"],
+            json!("8c6f4962-6522-42fb-bfcb-f653da832d04"),
+            "the returned character carries its id"
+        );
+        assert_eq!(sped["character"]["name"], json!("Swanne"));
         // The post-deduction balance is the point of returning the wallet at all.
         // The wire wallet is an array of `{currencyId, balance}`.
         let gem_line = sped["wallet"]
