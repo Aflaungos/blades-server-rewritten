@@ -2742,6 +2742,42 @@ mod tests {
         );
     }
 
+    /// A building may not advertise a level its cost table cannot price.
+    ///
+    /// `maxLevel` and the `levels` map are edited independently, and they have
+    /// already drifted apart once: #130 lowered TownHall's `maxLevel` to 9 and
+    /// deleted its level-10 entry (coherent), then #139 restored the `maxLevel`
+    /// without the entry (not). That advertises level 10 while `lookup_level_cost`
+    /// returns `NoSuchLevel` for it, so the last upgrade fails with an error rather
+    /// than a price — and nothing in the suite noticed.
+    #[test]
+    fn every_building_can_price_every_level_it_advertises() {
+        for (label, doc) in [
+            ("deploy/static", shipped_prod_static()),
+            ("server/data/static", shipped_dev_static()),
+        ] {
+            let buildings = doc["buildings"]
+                .as_object()
+                .expect("static carries a buildings map");
+            for (type_id, entry) in buildings {
+                let Some(max_level) = entry["maxLevel"].as_u64() else {
+                    continue;
+                };
+                let levels = entry["levels"]
+                    .as_object()
+                    .unwrap_or_else(|| panic!("{label}: {type_id} has no levels map"));
+                let name = entry["editorName"].as_str().unwrap_or(type_id);
+                for lv in 0..=max_level {
+                    assert!(
+                        levels.contains_key(&lv.to_string()),
+                        "{label}: {name} advertises maxLevel {max_level} but has no \
+                         entry for level {lv} — that upgrade cannot be priced"
+                    );
+                }
+            }
+        }
+    }
+
     /// The billed path: a timer with 47 994 s left costs 152 gems, exactly the
     /// captured retail debit, and the wallet ends 152 lighter.
     #[test]
