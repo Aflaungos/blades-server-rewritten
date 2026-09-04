@@ -4867,6 +4867,9 @@
 				"dungeon_uuid": "51470ac0-46eb-4790-8de1-d51d7c36908c"
 			}
 		},
+		"3b478dfa-73bb-42df-a420-05cf83d015bc": {
+			"dungeon_info": null
+		},
 		"e53a430b-35f4-4848-8b4e-c1f0089e098a": {
 			"dungeon_info": {
 				"objectives": {
@@ -4896,6 +4899,9 @@
 				"version": 2,
 				"dungeon_uuid": "32b5e43c-9a08-473d-af5c-05f7584865c5"
 			}
+		},
+		"1709a8bc-79dd-4a7f-b7f8-3a6022646dda": {
+			"dungeon_info": null
 		},
 		"d4a88399-0518-4b72-872c-de8cbb191dae": {
 			"dungeon_info": {
@@ -5053,6 +5059,9 @@
 				"dungeon_uuid": "3ef2b1f9-9dc9-44ba-b18b-93dac3f2f3d3"
 			}
 		},
+		"b7f4d378-566b-45eb-9bda-206911901821": {
+			"dungeon_info": null
+		},
 		"378307c6-0a23-41f8-b721-5282fa0a8a2b": {
 			"dungeon_info": {
 				"objectives": {
@@ -5161,6 +5170,12 @@
 				"version": 1,
 				"dungeon_uuid": "9f7f0c2d-ebc2-494c-be2d-3fc9dc5c19fb"
 			}
+		},
+		"49e0b072-ffd7-44e7-8d72-8f001d1a079f": {
+			"dungeon_info": null
+		},
+		"7db39937-ad5d-49ab-9d43-0379f14848de": {
+			"dungeon_info": null
 		},
 		"585137fa-5a78-48a7-99f7-f744a5f6cfdc": {
 			"dungeon_info": {
@@ -5313,6 +5328,9 @@
 				"dungeon_uuid": "50f0e783-32a4-4487-a61a-bc2d4e890b87"
 			}
 		},
+		"51e41844-7c98-44a6-802c-05b7e0bed137": {
+			"dungeon_info": null
+		},
 		"4f552ec2-83d7-4b13-b290-c78ef6816939": {
 			"dungeon_info": {
 				"objectives": {
@@ -5377,6 +5395,9 @@
 				"version": 2,
 				"dungeon_uuid": "1be8e0b3-a7a3-4ec6-ad16-4a7353374899"
 			}
+		},
+		"e46ddb4e-6d61-498b-bff7-ed83c4053e71": {
+			"dungeon_info": null
 		},
 		"0c9fc46d-9cb3-41b9-9e73-70c331533131": {
 			"dungeon_info": {
@@ -5695,6 +5716,9 @@
 				"version": 1,
 				"dungeon_uuid": "3635d747-98ff-44e1-b64a-19f458006661"
 			}
+		},
+		"cca4a80b-96f1-4b5c-82b8-9d4964c7f44a": {
+			"dungeon_info": null
 		},
 		"898d2182-da65-4003-90c0-b986c5ad52a8": {
 			"dungeon_info": {
@@ -7178,6 +7202,9 @@
 				"dungeon_uuid": "7f3ca11c-bfc7-40ec-bf72-7fb5c45ddbd0"
 			}
 		},
+		"6e9e8b45-20ce-4004-bc49-7ba81de18b0e": {
+			"dungeon_info": null
+		},
 		"334e582f-95ba-4263-b381-ac6d91eabe92": {
 			"dungeon_info": {
 				"objectives": {
@@ -7190,6 +7217,9 @@
 				"version": 3,
 				"dungeon_uuid": "108a7290-cea1-4af2-b58d-9c592af7d9d8"
 			}
+		},
+		"095b8109-0e57-400d-bcf4-70e10df8cdbf": {
+			"dungeon_info": null
 		},
 		"45c042e1-538b-4079-8b92-06f1d7677b6f": {
 			"dungeon_info": {
@@ -7231,6 +7261,9 @@
 				"version": 2,
 				"dungeon_uuid": "91890529-00c0-437a-9b36-1dffb7505561"
 			}
+		},
+		"77c752cb-c7cb-4ad9-b8d6-dae7064540d0": {
+			"dungeon_info": null
 		},
 		"3c5ada24-8706-4e65-af90-675a00756c29": {
 			"dungeon_info": {
@@ -7457,6 +7490,9 @@
 				"dungeon_uuid": "bc928826-67c4-4cca-b7ea-9799383ff790"
 			}
 		},
+		"11bbd032-4451-48fd-9c00-ec6438f14f04": {
+			"dungeon_info": null
+		},
 		"909431a2-177c-4719-8326-7523fdf104e2": {
 			"dungeon_info": {
 				"objectives": {
@@ -7482,6 +7518,9 @@
 				"version": 2,
 				"dungeon_uuid": "55411362-7c35-41ab-a84d-ff96e820e417"
 			}
+		},
+		"60f1aaae-2ac1-4fa9-ad17-78a24452ffc6": {
+			"dungeon_info": null
 		},
 		"b2f3ffa8-8d5f-41d5-9b3e-ae97f3f519a1": {
 			"dungeon_info": {
