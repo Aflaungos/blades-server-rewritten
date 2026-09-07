@@ -1730,6 +1730,11 @@ mod tests {
         serde_json::from_str(&raw).expect("valid parsed.json")
     }
 
+    fn static_data() -> blades_lib::static_data::StaticData {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy/static");
+        crate::static_loader::load(&dir)
+    }
+
     fn slice_for(dungeon: &str, difficulty: u32, floor: u32) -> AbyssSliceEntry {
         AbyssSliceEntry {
             dungeon_settings_id: Uuid::parse_str(dungeon).unwrap(),
@@ -1781,6 +1786,7 @@ mod tests {
 
             let data = blades_lib::util::dungeon::generate_for_dungeon(
                 &gd,
+                &static_data(),
                 &uuid,
                 difficulty as i64,
                 0,
@@ -1857,8 +1863,9 @@ mod tests {
     #[test]
     fn a_floor_whose_dungeon_is_unknown_serves_an_empty_body() {
         let gd = game_data();
+        let sd = static_data();
         assert!(
-            blades_lib::util::dungeon::generate_for_dungeon(&gd, &Uuid::nil(), 1, 0).is_none(),
+            blades_lib::util::dungeon::generate_for_dungeon(&gd, &sd, &Uuid::nil(), 1, 0).is_none(),
             "an unknown dungeon must yield None, never another dungeon's ids"
         );
         let empty = empty_generated_data();

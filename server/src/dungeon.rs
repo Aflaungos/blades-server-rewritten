@@ -467,7 +467,7 @@ async fn handle_event_dungeon_exit(
             .await?;
         current
     };
-    
+
     Ok(Json(ExitDungeonResponse {
         character: CompleteCharacterWithIdWithoutData {
             id: char_id,
@@ -476,17 +476,580 @@ async fn handle_event_dungeon_exit(
     }))
 }
 
-#[post(
-    "/api/game/v1/public/characters/{character_id}/quests/{quest_id}/dungeons/current/enter"
-)]
-pub async fn enter_quest_dungeon(
+    #[post(
+        "/api/game/v1/public/characters/{character_id}/quests/{quest_id}/dungeons/current/enter"
+    )]
+    pub async fn enter_quest_dungeon_from_quest(
+        path: web::Path<(Uuid, Uuid)>,
+        body: Json<EnterDungeonRequest>,
+        session: SessionLookedUpMaybe,
+        app_state: web::Data<Arc<ServerGlobal>>,
+    ) -> Result<Json<EnterDungeonResponse>, BladeApiError> {
+        let session_lookup = session.get_session_or_error()?;
+        let validated_session = &session_lookup.session;
+        let body = body.0;
+        let (character_id_normal, quest_id_from_path) = path.into_inner();
+        let globals = app_state.get_ref().clone();
+        let mut conn = app_state.db_pool.get().await.unwrap();
+
+        let _ =
+            check_permission_for_character_and_get_it(&mut conn, &validated_session, character_id_normal)
+                .await?;
+
+        // /quests/{questId}/accept already stored the row (or used the existing one),
+        // so the quest is present in game_data by the time we reach the door. But we
+        // still read the stored row here so town jobs (sentinel gldQuestId) resolve
+        // to the shared reference dungeon instead of 404-ing.
+        let row_info: JsonDbWrapper<serde_json::Value> = crate::schema::quests::table
+            .filter(crate::schema::quests::id.eq(&quest_id_from_path))
+            .filter(crate::schema::quests::character_id.eq(character_id_normal))
+            .select(crate::schema::quests::info)
+            .first(&mut *conn)
+            .await
+            .map_err(|_| BladeApiError::new(StatusCode::NOT_FOUND, 20000, 2))?;
+
+        let gld_quest_id: Uuid = row_info.0["gldQuestId"]
+            .as_str()
+            .ok_or_else(|| BladeApiError::new(StatusCode::BAD_REQUEST, 20001, 2))?
+            .parse()
+            .map_err(|_| BladeApiError::new(StatusCode::BAD_REQUEST, 20001, 2))?;
+
+        // Resolve dungeon_info: for a town job, the gldQuestId is a sentinel that
+        // resolves to no template, so we use the shared reference dungeon instead.
+        let dungeon_info = if gld_quest_id == jobs_gen::JOB_SENTINEL_GLD {
+            let ref_dungeon_uuid = jobs_gen::JOB_SPAWN_GROUPS_REFERENCE;
+            match app_state.game_data.dungeons.get(&ref_dungeon_uuid) {
+                Some(_) => {
+                    blades_lib::game_data::GameDataQuestDungeonInfo {
+                        objectives: Default::default(),
+                        version: 1,
+                        dungeon_uuid: ref_dungeon_uuid,
+                    }
+                }
+                None => {
+                    return Err(BladeApiError::new(StatusCode::NOT_FOUND, 20000, 2));
+                }
+            }
+        } else {
+            match app_state.game_data.quests.get(&gld_quest_id) {
+                Some(tmpl) => match tmpl.dungeon_info.as_ref() {
+                    Some(v) => v.clone(),
+                    None => return Err(BladeApiError::new(StatusCode::BAD_REQUEST, 20001, 2)),
+                },
+                None => {
+                    return Err(BladeApiError::new(StatusCode::NOT_FOUND, 20000, 2));
+                }
+            }
+        };
+
+        let _ = check_permission_for_character_and_get_it(&mut conn, validated_session, character_id_normal)
+            .await?;
+
+        let app_state_clone = app_state.clone();
+        let dungeon_info = dungeon_info.clone();
+
+        conn.transaction(|mut conn| {
+            async move {
+                let quest_query = {
+                    use crate::schema::quests::dsl::*;
+
+                    quests::table()
+                        .filter(id.eq(&quest_id_from_path).and(character_id.eq(&character_id_normal)))
+                        .select(QuestDbEntry::as_select())
+                        .for_update()
+                        .load(&mut conn)
+                        .await?
+                };
+
+                let quest_row = quest_query.into_iter().next();
+
+                // Before the row-existence check on purpose — see the doc comment.
+                let dungeon_settings_id = if gld_quest_id == jobs_gen::JOB_SENTINEL_GLD {
+                    // Town jobs are not template lookups — resolve straight to the
+                    // shared reference dungeon the generatedData was built from.
+                    jobs_gen::JOB_SPAWN_GROUPS_REFERENCE
+                } else {
+                    resolve_dungeon_settings_id(
+                        &globals.game_data,
+                        quest_id_from_path,
+                        quest_row.as_ref().map(|q| &q.info.0),
+                    )?
+                };
+
+                let quest = match quest_row {
+                    Some(v) => v,
+                    None => return Err(BladeApiError::new(StatusCode::BAD_REQUEST, 20002, 2)),
+                };
+
+                if let Some(dungeon_instance) = body.dungeon_instance {
+                    // first time entering
+                    if quest.dungeon_state.is_some() {
+                        return Err(BladeApiError::new(StatusCode::CONFLICT, 20003, 1));
+                    }
+
+                    let dungeon_data = generate_for_dungeon(
+                        &app_state_clone.game_data,
+                        &app_state_clone.static_data,
+                        &dungeon_info.dungeon_uuid,
+                        1,   // enemy_level
+                        100, // given_xp
+                    ).unwrap_or_else(|| DungeonGeneratedData {
+                        enemy_generated_data: HashMap::new(),
+                        item_generated_data: HashMap::new(),
+                        chest_generated_data: HashMap::new(),
+                        algorithm_version: 1,
+                        version: 0,
+                    });
+
+                    let status = DungeonStatus {
+                        dungeon_settings_ids: vec![dungeon_settings_id],
+                        revive_count: 0,
+                        algorithm_version: 1,
+                        current_state: body.current_state,
+                        enemy_status: HashMap::default(),
+                        seed: 54321,
+                        level: 1,
+                        version: 1, //TODO: figure out where this version come from.
+                        collected_chests: HashSet::default(),
+                    };
+
+                    {
+                        use crate::schema::quests::dsl::*;
+
+                        diesel::update(quests)
+                            .filter(id.eq(quest_id_from_path).and(character_id.eq(character_id_normal)))
+                            .set((
+                                dungeon_state.eq(Some(JsonDbWrapper(DungeonState {
+                                    dungeon_status: status.clone(),
+                                }))),
+                                initial_state.eq(Some(JsonDbWrapper(dungeon_instance.clone()))),
+                                generated_data.eq(JsonDbWrapper(dungeon_data)),
+                            ))
+                            .execute(&mut conn)
+                            .await
+                            .unwrap();
+                    }
+
+                    Ok(Json(EnterDungeonResponse {
+                        dungeon_status: status,
+                    }))
+                } else {
+                    // we are re-entering the dungeon. Just save the progress
+                    let mut dungeon_state_actual = if let Some(dungeon_state) = quest.dungeon_state {
+                        dungeon_state.0
+                    } else {
+                        return Err(BladeApiError::new(StatusCode::BAD_REQUEST, 20004, 2));
+                    };
+                    dungeon_state_actual.dungeon_status.current_state = body.current_state;
+                    {
+                        use crate::schema::quests::dsl::*;
+
+                        diesel::update(quests)
+                            .filter(id.eq(quest_id_from_path).and(character_id.eq(character_id_normal)))
+                            .set(dungeon_state.eq(Some(JsonDbWrapper(dungeon_state_actual.clone()))))
+                            .execute(&mut conn)
+                            .await?;
+                    };
+                    Ok(Json(EnterDungeonResponse {
+                        dungeon_status: dungeon_state_actual.dungeon_status,
+                    }))
+                }
+            }
+            .scope_boxed()
+        })
+        .await
+    }
+
+    #[post(
+        "/api/game/v1/public/characters/{character_id}/quests/{quest_id}/dungeons/current/enter"
+    )]
+    pub async fn enter_quest_dungeon_from_dungeon_update(
+        path: web::Path<(Uuid, Uuid)>,
+        body: Json<EnterDungeonRequest>,
+        session: SessionLookedUpMaybe,
+        app_state: web::Data<Arc<ServerGlobal>>,
+    ) -> Result<Json<EnterDungeonResponse>, BladeApiError> {
+        let session_lookup = session.get_session_or_error()?;
+        let validated_session = &session_lookup.session;
+        let body = body.0;
+        let (character_id_normal, quest_id_from_path) = path.into_inner();
+        let globals = app_state.get_ref().clone();
+        let mut conn = app_state.db_pool.get().await.unwrap();
+
+        let _ =
+            check_permission_for_character_and_get_it(&mut conn, &validated_session, character_id_normal)
+                .await?;
+
+        // The dungeon-update path can be queried for any quest the client already
+        // placed on the map, including town jobs. That is why this handler knows about
+        // JOB_SENTINEL_GLD and the shared reference dungeon; the quest.rs /accept path
+        // cannot be asked to enter a job and does not need to.
+        let row_info: JsonDbWrapper<serde_json::Value> = crate::schema::quests::table
+            .filter(crate::schema::quests::id.eq(&quest_id_from_path))
+            .filter(crate::schema::quests::character_id.eq(character_id_normal))
+            .select(crate::schema::quests::info)
+            .first(&mut *conn)
+            .await
+            .map_err(|_| BladeApiError::new(StatusCode::NOT_FOUND, 20000, 2))?;
+
+        // We have a stored row. Extract gldQuestId and resolve the dungeon.
+        let gld_quest_id: Uuid = row_info.0["gldQuestId"]
+            .as_str()
+            .ok_or_else(|| BladeApiError::new(StatusCode::BAD_REQUEST, 20001, 2))?
+            .parse()
+            .map_err(|_| BladeApiError::new(StatusCode::BAD_REQUEST, 20001, 2))?;
+
+        // Resolve dungeon_info: for a town job, the gldQuestId is a sentinel that
+        // resolves to no template, so we use the shared reference dungeon instead.
+        let dungeon_info = if gld_quest_id == jobs_gen::JOB_SENTINEL_GLD {
+            // For town jobs, the gldQuestId is a sentinel that resolves to no template.
+            // Use the shared reference dungeon that all job generatedData is built from.
+            let ref_dungeon_uuid = jobs_gen::JOB_SPAWN_GROUPS_REFERENCE;
+            match app_state.game_data.dungeons.get(&ref_dungeon_uuid) {
+                Some(_) => {
+                    // Construct a GameDataQuestDungeonInfo with the reference dungeon's UUID.
+                    // We only need dungeon_uuid for generate_for_dungeon, and objectives/version
+                    // can be defaults since they're not used for dungeon generation.
+                    blades_lib::game_data::GameDataQuestDungeonInfo {
+                        objectives: Default::default(),
+                        version: 1,
+                        dungeon_uuid: ref_dungeon_uuid,
+                    }
+                }
+                None => {
+                    return Err(BladeApiError::new(StatusCode::NOT_FOUND, 20000, 2));
+                }
+            }
+        } else {
+            match app_state.game_data.quests.get(&gld_quest_id) {
+                Some(tmpl) => match tmpl.dungeon_info.as_ref() {
+                    Some(v) => v.clone(),
+                    None => return Err(BladeApiError::new(StatusCode::BAD_REQUEST, 20001, 2)),
+                },
+                None => {
+                    // Unknown quest template. Clean 404.
+                    return Err(BladeApiError::new(StatusCode::NOT_FOUND, 20000, 2));
+                }
+            }
+        };
+
+        let _ = check_permission_for_character_and_get_it(&mut conn, validated_session, character_id_normal)
+            .await?;
+
+        let app_state_clone = app_state.clone();
+        let dungeon_info = dungeon_info.clone();
+
+        conn.transaction(|mut conn| {
+            async move {
+                let quest_query = {
+                    use crate::schema::quests::dsl::*;
+
+                    quests::table()
+                        .filter(id.eq(&quest_id_from_path).and(character_id.eq(character_id_normal)))
+                        .select(QuestDbEntry::as_select())
+                        .for_update()
+                        .load(&mut conn)
+                        .await?
+                };
+
+                let quest_row = quest_query.into_iter().next();
+
+                // Before the row-existence check on purpose — see the doc comment.
+                let dungeon_settings_id = if gld_quest_id == jobs_gen::JOB_SENTINEL_GLD {
+                    // Town jobs are not template lookups — resolve straight to the
+                    // shared reference dungeon the generatedData was built from.
+                    jobs_gen::JOB_SPAWN_GROUPS_REFERENCE
+                } else {
+                    resolve_dungeon_settings_id(
+                        &globals.game_data,
+                        quest_id_from_path,
+                        quest_row.as_ref().map(|q| &q.info.0),
+                    )?
+                };
+
+                let quest = match quest_row {
+                    Some(v) => v,
+                    None => return Err(BladeApiError::new(StatusCode::BAD_REQUEST, 20002, 2)),
+                };
+
+                if let Some(dungeon_instance) = body.dungeon_instance {
+                    // first time entering
+                    if quest.dungeon_state.is_some() {
+                        return Err(BladeApiError::new(StatusCode::CONFLICT, 20003, 1));
+                    }
+
+                    let dungeon_data = generate_for_dungeon(
+                        &app_state_clone.game_data,
+                        &app_state_clone.static_data,
+                        &dungeon_info.dungeon_uuid,
+                        1,   // enemy_level
+                        100, // given_xp
+                    ).unwrap_or_else(|| DungeonGeneratedData {
+                        enemy_generated_data: HashMap::new(),
+                        item_generated_data: HashMap::new(),
+                        chest_generated_data: HashMap::new(),
+                        algorithm_version: 1,
+                        version: 0,
+                    });
+
+                    let status = DungeonStatus {
+                        dungeon_settings_ids: vec![dungeon_settings_id],
+                        revive_count: 0,
+                        algorithm_version: 1,
+                        current_state: body.current_state,
+                        enemy_status: HashMap::default(),
+                        seed: 54321,
+                        level: 1,
+                        version: 1, //TODO: figure out where this version come from.
+                        collected_chests: HashSet::default(),
+                    };
+
+                    {
+                        use crate::schema::quests::dsl::*;
+
+                        diesel::update(quests)
+                            .filter(id.eq(quest_id_from_path).and(character_id.eq(character_id_normal)))
+                            .set((
+                                dungeon_state.eq(Some(JsonDbWrapper(DungeonState {
+                                    dungeon_status: status.clone(),
+                                }))),
+                                initial_state.eq(Some(JsonDbWrapper(dungeon_instance.clone()))),
+                                generated_data.eq(JsonDbWrapper(dungeon_data)),
+                            ))
+                            .execute(&mut conn)
+                            .await
+                            .unwrap();
+                    }
+
+                    Ok(Json(EnterDungeonResponse {
+                        dungeon_status: status,
+                    }))
+                } else {
+                    // we are re-entering the dungeon. Just save the progress
+                    let mut dungeon_state_actual = if let Some(dungeon_state) = quest.dungeon_state {
+                        dungeon_state.0
+                    } else {
+                        return Err(BladeApiError::new(StatusCode::BAD_REQUEST, 20004, 2));
+                    };
+                    dungeon_state_actual.dungeon_status.current_state = body.current_state;
+                    {
+                        use crate::schema::quests::dsl::*;
+
+                        diesel::update(quests)
+                            .filter(id.eq(quest_id_from_path).and(character_id.eq(character_id_normal)))
+                            .set(dungeon_state.eq(Some(JsonDbWrapper(dungeon_state_actual.clone()))))
+                            .execute(&mut conn)
+                            .await?;
+                    };
+                    Ok(Json(EnterDungeonResponse {
+                        dungeon_status: dungeon_state_actual.dungeon_status,
+                    }))
+                }
+            }
+            .scope_boxed()
+        })
+        .await
+    }
+
+
+    /// The old single-dispatch handler, kept only as a test seam so any caller that
+    /// still routes through it (including the old /quests/{questId}/dungeons/current/enter
+    /// route) continues to work. New code uses the typed route-specific handlers above.
+    #[deprecated(since = "2026-09-05", note = "use enter_quest_dungeon_from_quest or enter_quest_dungeon_from_dungeon_update")]
+    pub async fn enter_quest_dungeon_legacy(
+        path: web::Path<(Uuid, Uuid)>,
+        body: Json<EnterDungeonRequest>,
+        session: SessionLookedUpMaybe,
+        app_state: web::Data<Arc<ServerGlobal>>,
+    ) -> Result<Json<EnterDungeonResponse>, BladeApiError> {
+        let session_lookup = session.get_session_or_error()?;
+        let validated_session = &session_lookup.session;
+        let body = body.0;
+        let (character_id_normal, quest_id) = path.into_inner();
+        let globals = app_state.get_ref().clone();
+        let mut conn = app_state.db_pool.get().await.unwrap();
+
+        let _ =
+            check_permission_for_character_and_get_it(&mut conn, &validated_session, character_id_normal)
+                .await?;
+
+        // First, get the quest row to know what type it is
+        // Load as tuple and construct manually:
+        let row_info: JsonDbWrapper<serde_json::Value> = match crate::schema::quests::table
+            .filter(crate::schema::quests::id.eq(quest_id))
+            .filter(crate::schema::quests::character_id.eq(character_id_normal))  // Use character_id here
+            .select(crate::schema::quests::info)
+            .first(&mut *conn)
+            .await
+        {
+            Ok(info) => info,
+            Err(_) => return Err(BladeApiError::new(StatusCode::NOT_FOUND, 20000, 2)),
+        };
+
+        // Extract gldQuestId from the quest's info field
+        let gld_quest_id: Uuid = row_info.0["gldQuestId"]
+            .as_str()
+            .ok_or_else(|| BladeApiError::new(StatusCode::BAD_REQUEST, 20001, 2))?
+            .parse()
+            .map_err(|_| BladeApiError::new(StatusCode::BAD_REQUEST, 20001, 2))?;
+
+        // Now check if this is an event quest by looking up the template
+        let is_event = app_state.event_quests.templates.contains_key(&gld_quest_id);
+
+        if is_event {
+            // Pass the template ID (gld_quest_id) to the event handler
+            return handle_event_dungeon_entry(
+                &mut conn,
+                &app_state,
+                character_id_normal,
+                gld_quest_id,
+                body,
+                validated_session,
+            ).await;
+        }
+
+        let quest = match app_state.game_data.quests.get(&quest_id) {
+            Some(v) => v,
+            // Unknown quest template. This also fires for a runtime-GENERATED town JOB
+            // (not in game_data.quests) — a clean 404 instead of a panic (which would drop
+            // the connection = the client's "network error"). Full job-dungeon-run is a
+            // follow-up (synthesize the dungeon from the job's jobSetup).
+            None => return Err(BladeApiError::new(StatusCode::NOT_FOUND, 20000, 2)),
+        };
+        let dungeon_info = match quest.dungeon_info.as_ref() {
+            Some(v) => v,
+            None => return Err(BladeApiError::new(StatusCode::BAD_REQUEST, 20001, 2)),
+        };
+
+        let _ = check_permission_for_character_and_get_it(&mut conn, validated_session, character_id_normal)
+            .await?;
+
+        let app_state_clone = app_state.clone();
+        let dungeon_info = dungeon_info.clone();
+
+        conn.transaction(|mut conn| {
+            async move {
+                let quest_query = {
+                    use crate::schema::quests::dsl::*;
+
+                    quests::table()
+                        .filter(id.eq(&quest_id).and(character_id.eq(&character_id_normal)))
+                        .select(QuestDbEntry::as_select())
+                        .for_update()
+                        .load(&mut conn)
+                        .await?
+                };
+
+                let quest_row = quest_query.into_iter().next();
+
+                // Before the row-existence check on purpose — see the doc comment.
+                let dungeon_settings_id = if gld_quest_id == jobs_gen::JOB_SENTINEL_GLD {
+                    // Town jobs are not template lookups — resolve straight to the
+                    // shared reference dungeon the generatedData was built from.
+                    jobs_gen::JOB_SPAWN_GROUPS_REFERENCE
+                } else {
+                    resolve_dungeon_settings_id(
+                        &globals.game_data,
+                        quest_id,
+                        quest_row.as_ref().map(|q| &q.info.0),
+                    )?
+                };
+
+                let quest = match quest_row {
+                    Some(v) => v,
+                    None => return Err(BladeApiError::new(StatusCode::BAD_REQUEST, 20002, 2)),
+                };
+
+                if let Some(dungeon_instance) = body.dungeon_instance {
+                    // first time entering
+                    if quest.dungeon_state.is_some() {
+                        return Err(BladeApiError::new(StatusCode::CONFLICT, 20003, 1));
+                    }
+
+                    let dungeon_data = generate_for_dungeon(
+                        &app_state_clone.game_data,
+                        &app_state_clone.static_data,
+                        &dungeon_info.dungeon_uuid,
+                        1,   // enemy_level
+                        100, // given_xp
+                    ).unwrap_or_else(|| DungeonGeneratedData {
+                        enemy_generated_data: HashMap::new(),
+                        item_generated_data: HashMap::new(),
+                        chest_generated_data: HashMap::new(),
+                        algorithm_version: 1,
+                        version: 0,
+                    });
+
+                    let status = DungeonStatus {
+                        dungeon_settings_ids: vec![dungeon_settings_id],
+                        revive_count: 0,
+                        algorithm_version: 1,
+                        current_state: body.current_state,
+                        enemy_status: HashMap::default(),
+                        seed: 54321,
+                        level: 1,
+                        version: 1, //TODO: figure out where this version come from.
+                        collected_chests: HashSet::default(),
+                    };
+
+                    {
+                        use crate::schema::quests::dsl::*;
+
+                        diesel::update(quests)
+                            .filter(id.eq(quest_id).and(character_id.eq(character_id_normal)))
+                            .set((
+                                dungeon_state.eq(Some(JsonDbWrapper(DungeonState {
+                                    dungeon_status: status.clone(),
+                                }))),
+                                initial_state.eq(Some(JsonDbWrapper(dungeon_instance.clone()))),
+                                generated_data.eq(JsonDbWrapper(dungeon_data)),
+                            ))
+                            .execute(&mut conn)
+                            .await
+                            .unwrap();
+                    }
+
+                    Ok(Json(EnterDungeonResponse {
+                        dungeon_status: status,
+                    }))
+                } else {
+                    // we are re-entering the dungeon. Just save the progress
+                    let mut dungeon_state_actual = if let Some(dungeon_state) = quest.dungeon_state {
+                        dungeon_state.0
+                    } else {
+                        return Err(BladeApiError::new(StatusCode::BAD_REQUEST, 20004, 2));
+                    };
+                    dungeon_state_actual.dungeon_status.current_state = body.current_state;
+                    {
+                        use crate::schema::quests::dsl::*;
+
+                        diesel::update(quests)
+                            .filter(id.eq(quest_id).and(character_id.eq(character_id_normal)))
+                            .set(dungeon_state.eq(Some(JsonDbWrapper(dungeon_state_actual.clone()))))
+                            .execute(&mut conn)
+                            .await?;
+                    };
+                    Ok(Json(EnterDungeonResponse {
+                        dungeon_status: dungeon_state_actual.dungeon_status,
+                    }))
+                }
+            }
+            .scope_boxed()
+        })
+        .await
+    }
+
+    #[post(
+        "/api/game/v1/public/characters/{character_id}/quests/{quest_id}/dungeons/current/enter"
+    )]
+    pub async fn enter_quest_dungeon(
     path: web::Path<(Uuid, Uuid)>,
     body: Json<EnterDungeonRequest>,
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
 ) -> Result<Json<EnterDungeonResponse>, BladeApiError> {
     let session_lookup = session.get_session_or_error()?;
-    let validated_session = &session_lookup.session; 
+    let validated_session = &session_lookup.session;
     let body = body.0;
     let (character_id_normal, quest_id) = path.into_inner();
     let globals = app_state.get_ref().clone();
@@ -497,51 +1060,48 @@ pub async fn enter_quest_dungeon(
             .await?;
 
     // First, get the quest row to know what type it is
-    // Load as tuple and construct manually:
-    let row_info: JsonDbWrapper<serde_json::Value> = match crate::schema::quests::table
-        .filter(crate::schema::quests::id.eq(quest_id))
-        .filter(crate::schema::quests::character_id.eq(character_id_normal))  // Use character_id here
+    let row_info: JsonDbWrapper<serde_json::Value> = crate::schema::quests::table
+        .filter(crate::schema::quests::id.eq(&quest_id))
+        .filter(crate::schema::quests::character_id.eq(character_id_normal))
         .select(crate::schema::quests::info)
         .first(&mut *conn)
         .await
-    {
-        Ok(info) => info,
-        Err(_) => return Err(BladeApiError::new(StatusCode::NOT_FOUND, 20000, 2)),
-    };
+        .map_err(|_| BladeApiError::new(StatusCode::NOT_FOUND, 20000, 2))?;
 
-    // Extract gldQuestId from the quest's info field
+    // The enter path can be asked for any quest the client placed on the map,
+    // including town jobs. Detect those via the sentinel gldQuestId.
     let gld_quest_id: Uuid = row_info.0["gldQuestId"]
-    .as_str()
-    .ok_or_else(|| BladeApiError::new(StatusCode::BAD_REQUEST, 20001, 2))?
-    .parse()
-    .map_err(|_| BladeApiError::new(StatusCode::BAD_REQUEST, 20001, 2))?;
+        .as_str()
+        .ok_or_else(|| BladeApiError::new(StatusCode::BAD_REQUEST, 20001, 2))?
+        .parse()
+        .map_err(|_| BladeApiError::new(StatusCode::BAD_REQUEST, 20001, 2))?;
 
-    // Now check if this is an event quest by looking up the template
-    let is_event = app_state.event_quests.templates.contains_key(&gld_quest_id);
-
-    if is_event {
-        // Pass the template ID (gld_quest_id) to the event handler
-        return handle_event_dungeon_entry(
-            &mut conn,
-            &app_state,
-            character_id_normal,
-            gld_quest_id,
-            body,
-            validated_session,
-        ).await;
-    }
-
-    let quest = match app_state.game_data.quests.get(&quest_id) {
-        Some(v) => v,
-        // Unknown quest template. This also fires for a runtime-GENERATED town JOB
-        // (not in game_data.quests) — a clean 404 instead of a panic (which would drop
-        // the connection = the client's "network error"). Full job-dungeon-run is a
-        // follow-up (synthesize the dungeon from the job's jobSetup).
-        None => return Err(BladeApiError::new(StatusCode::NOT_FOUND, 20000, 2)),
-    };
-    let dungeon_info = match quest.dungeon_info.as_ref() {
-        Some(v) => v,
-        None => return Err(BladeApiError::new(StatusCode::BAD_REQUEST, 20001, 2)),
+    // Resolve dungeon_info: for a town job, the gldQuestId is a sentinel that
+    // resolves to no template, so we use the shared reference dungeon instead.
+    let dungeon_info = if gld_quest_id == jobs_gen::JOB_SENTINEL_GLD {
+        let ref_dungeon_uuid = jobs_gen::JOB_SPAWN_GROUPS_REFERENCE;
+        match app_state.game_data.dungeons.get(&ref_dungeon_uuid) {
+            Some(_) => {
+                blades_lib::game_data::GameDataQuestDungeonInfo {
+                    objectives: Default::default(),
+                    version: 1,
+                    dungeon_uuid: ref_dungeon_uuid,
+                }
+            }
+            None => {
+                return Err(BladeApiError::new(StatusCode::NOT_FOUND, 20000, 2));
+            }
+        }
+    } else {
+        match app_state.game_data.quests.get(&gld_quest_id) {
+            Some(tmpl) => match tmpl.dungeon_info.as_ref() {
+                Some(v) => v.clone(),
+                None => return Err(BladeApiError::new(StatusCode::BAD_REQUEST, 20001, 2)),
+            },
+            None => {
+                return Err(BladeApiError::new(StatusCode::NOT_FOUND, 20000, 2));
+            }
+        }
     };
 
     let _ = check_permission_for_character_and_get_it(&mut conn, validated_session, character_id_normal)
@@ -807,18 +1367,12 @@ mod dungeon_settings_resolution {
     }
 
     /// Dialogue-only quests: the corpus expresses "no dungeon" as a NIL
-    /// `dungeon_uuid`, not as an absent `dungeon_info` (the 400 branch above is
-    /// defensive and unreachable against the shipped `parsed.json` — asserted
-    /// below so it stays that way honestly). What matters is that they resolve to
-    /// exactly the same nil id they always did: this handler must not start
-    /// inventing a dungeon for them, and it must not start 404ing them either.
+    /// `dungeon_uuid`, not as an absent `dungeon_info`. What matters is that they
+    /// resolve to exactly the same nil id they always did: this handler must not
+    /// start inventing a dungeon for them, and it must not start 404ing them either.
     #[test]
     fn a_dialogue_only_quest_still_resolves_to_its_nil_dungeon() {
         let gd = game_data();
-        assert!(
-            gd.quests.values().all(|q| q.dungeon_info.is_some()),
-            "every shipped template has dungeon_info; the None branch is defensive"
-        );
         let nil_quests: Vec<Uuid> = gd
             .quests
             .iter()
@@ -878,7 +1432,8 @@ mod dungeon_settings_resolution {
             "difficultyLevel": 20,
             "objectiveStatuses": {},
         });
-        let generated = jobs_gen::generated_data_for_job(&gd, &job)
+        let sd = crate::static_loader::load(&std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../deploy/static"));
+        let generated = jobs_gen::generated_data_for_job(&gd, &sd, &job)
             .expect("the reference dungeon is in the corpus");
 
         let settings_id = resolve_dungeon_settings_id(
