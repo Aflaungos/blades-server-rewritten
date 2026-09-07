@@ -311,12 +311,29 @@
    "89ece62c-9ff6-470a-a152-d45ef4e0c222": 3
   },
   "townXp": 0
- },
- "1275d959-bbe5-460d-8f6a-1c31106a8eb2": {
+ },  "1275d959-bbe5-460d-8f6a-1c31106a8eb2": {
   "chests": [
    {
     "level": 42,
     "tier": 5
+   }
+  ],
+  "townXp": 0
+ },
+  "7bf00a9c-6a08-4b55-a60d-53915baa38a3": {
+  "chests": [
+   {
+    "level": 42,
+    "tier": 4
+   }
+  ],
+  "townXp": 0
+ },
+  "0e224ca0-1506-490f-884a-8871ffe6399b": {
+  "chests": [
+   {
+    "level": 42,
+    "tier": 3
    }
   ],
   "townXp": 0

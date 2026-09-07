@@ -1,3 +1,60 @@
 {
- "globalShopOverrides": {}
+ "globalShopOverrides": {
+  "1275d959-bbe5-460d-8f6a-1c31106a8eb2": {
+   "activeStartDate": 1782532800,
+   "activeEndDate": 1800000000,
+   "isActive": true,
+   "maxPurchaseLimits": [],
+   "maxPurchases": 0,
+   "prices": [
+    {
+     "currencyId": "470c8f58-a8dd-4c07-8c92-843b785e1139",
+     "quantity": 1
+    }
+   ],
+   "purchaseTrackingId": null
+  },
+  "7bf00a9c-6a08-4b55-a60d-53915baa38a3": {
+   "activeStartDate": 1782532800,
+   "activeEndDate": 1800000000,
+   "isActive": true,
+   "maxPurchaseLimits": [],
+   "maxPurchases": 0,
+   "prices": [
+    {
+     "currencyId": "470c8f58-a8dd-4c07-8c92-843b785e1139",
+     "quantity": 1
+    }
+   ],
+   "purchaseTrackingId": null
+  },
+  "0e224ca0-1506-490f-884a-8871ffe6399b": {
+   "activeStartDate": 1782532800,
+   "activeEndDate": 1800000000,
+   "isActive": true,
+   "maxPurchaseLimits": [],
+   "maxPurchases": 0,
+   "prices": [
+    {
+     "currencyId": "470c8f58-a8dd-4c07-8c92-843b785e1139",
+     "quantity": 1
+    }
+   ],
+   "purchaseTrackingId": null
+  },
+  "11102495-fde7-4e77-b6c4-d13b9303f1f5": {
+   "activeStartDate": 1700802000,
+   "activeEndDate": 1800000000,
+   "isActive": true,
+   "maxPurchaseLimits": [],
+   "maxPurchases": 0,
+   "prices": [
+    {
+     "currencyId": "470c8f58-a8dd-4c07-8c92-843b785e1139",
+     "quantity": 1
+    }
+   ],
+   "purchaseTrackingId": null
+  }
+ }
 }
