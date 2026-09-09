@@ -312,7 +312,7 @@ fn detached_building_id(real: Uuid) -> Uuid {
 
 /// `GET /crafts` — returns the character's active craft jobs.
 /// The repair gate reads this list; an empty list unblocks repair.
-#[get("/blades.bgs.services/api/game/v1/public/characters/{character_id}/crafts")]
+#[get("api/game/v1/public/characters/{character_id}/crafts")]
 pub async fn get_crafts(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -512,7 +512,7 @@ struct CreateCraftResponse {
 ///   [`charge_enchant_inputs`]). `/finish` re-adds the stored item.
 ///
 /// TODO: plain-craft and temper inputs are not charged yet (lenient).
-#[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/crafts")]
+#[post("/api/game/v1/public/characters/{character_id}/crafts")]
 pub async fn create_craft(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -820,7 +820,7 @@ struct FinishCraftResponse {
 /// cannot afford it gets an error and keeps the job; the alternative (collect early
 /// for free) is what this endpoint used to do.
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/crafts/{craft_id}/finish"
+    "/api/game/v1/public/characters/{character_id}/crafts/{craft_id}/finish"
 )]
 pub async fn finish_craft(
     session: SessionLookedUpMaybe,

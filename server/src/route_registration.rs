@@ -163,7 +163,7 @@ mod tests {
     fn host_prefixed_routes_start_with_a_slash() {
         let bad: Vec<_> = attributed_route_literals()
             .into_iter()
-            .filter(|(_, route)| route.starts_with("blades.bgs.services/"))
+            .filter(|(_, route)| route.starts_with("/"))
             .collect();
         assert!(
             bad.is_empty(),
@@ -248,7 +248,7 @@ mod retail_coverage {
         out
     }
 
-    /// `"/blades.bgs.services/api/game/v1/public/characters/{character_id}/levelup"`
+    /// `"/api/game/v1/public/characters/{character_id}/levelup"`
     /// → `"/characters/{id}/levelup"`. Returns `None` for a route on another host
     /// or service, which the inventory does not cover.
     fn normalise(raw: &str) -> Option<String> {
