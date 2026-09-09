@@ -26,7 +26,7 @@ struct AnnouncementsResponse {
     announcements: Vec<Announcement>,
 }
 
-#[get("/blades.bgs.services/api/game/v1/public/characters/{character_id}/announcements")]
+#[get("/api/game/v1/public/characters/{character_id}/announcements")]
 pub async fn get_announcements(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
