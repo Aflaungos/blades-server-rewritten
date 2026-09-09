@@ -144,7 +144,7 @@ pub struct GetChallengesResult {
 }
 
 /// List the active challenges, generating a fresh set on first call.
-#[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/challenges")]
+#[post("/api/game/v1/public/characters/{character_id}/challenges")]
 pub async fn get_challenges(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -194,7 +194,7 @@ struct ProgressResponse {
 
 /// Update a challenge's progress (client reports an absolute value).
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/challenges/{challenge_id}"
+    "/api/game/v1/public/characters/{character_id}/challenges/{challenge_id}"
 )]
 pub async fn update_challenge(
     session: SessionLookedUpMaybe,
@@ -252,7 +252,7 @@ struct ResolveResponse {
 
 /// Complete a challenge: grant the reward, bump season points, rotate in a fresh one.
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/challenges/{challenge_id}/complete"
+    "/api/game/v1/public/characters/{character_id}/challenges/{challenge_id}/complete"
 )]
 pub async fn complete_challenge(
     session: SessionLookedUpMaybe,
@@ -264,7 +264,7 @@ pub async fn complete_challenge(
 
 /// Abandon a challenge: no reward, just rotate in a fresh one.
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/challenges/{challenge_id}/abandon"
+    "/api/game/v1/public/characters/{character_id}/challenges/{challenge_id}/abandon"
 )]
 pub async fn abandon_challenge(
     session: SessionLookedUpMaybe,

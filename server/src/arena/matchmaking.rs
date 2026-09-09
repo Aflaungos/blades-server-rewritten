@@ -30,7 +30,7 @@ fn ends_socket(item: &Option<Result<AggregatedMessage, actix_ws::ProtocolError>>
     )
 }
 
-#[get("/blades.bgs.services/api/rms/v1/public/")]
+#[get("/api/rms/v1/public/")]
 async fn matchmaking_ws(
     req: HttpRequest,
     stream: web::Payload,

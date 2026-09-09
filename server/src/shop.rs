@@ -492,7 +492,7 @@ pub(crate) fn restock_on_build_complete(
 }
 
 /// `POST /shops/{id}` — open a vendor (returns its current catalog).
-#[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/shops/{shop_id}")]
+#[post("/api/game/v1/public/characters/{character_id}/shops/{shop_id}")]
 pub async fn open_shop(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -514,7 +514,7 @@ pub async fn open_shop(
 /// `POST /shops/{id}/auth/refreshloot` — the client's explicit restock: re-roll the
 /// catalog and the merchant's budget, starting a fresh window.
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/shops/{shop_id}/auth/refreshloot"
+    "/api/game/v1/public/characters/{character_id}/shops/{shop_id}/auth/refreshloot"
 )]
 pub async fn refresh_loot(
     session: SessionLookedUpMaybe,
@@ -729,7 +729,7 @@ fn buy_bundles(
 /// down `remaining_stock` while pushing `revenue` positive — which is what lets the
 /// merchant afford to buy from the player again.
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/shops/{shop_id}/purchase"
+    "/api/game/v1/public/characters/{character_id}/shops/{shop_id}/purchase"
 )]
 pub async fn buy_from_shop(
     session: SessionLookedUpMaybe,
@@ -981,7 +981,7 @@ async fn write_server_state(
 /// `POST /characters/{visitor}/social/users/{u}/characters/{c}/shops/{s}` — open a
 /// merchant in someone else's town.
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{visitor_character_id}/social/users/{owner_user_id}/characters/{owner_character_id}/shops/{shop_id}"
+    "/api/game/v1/public/characters/{visitor_character_id}/social/users/{owner_user_id}/characters/{owner_character_id}/shops/{shop_id}"
 )]
 pub async fn open_social_shop(
     session: SessionLookedUpMaybe,
@@ -1030,7 +1030,7 @@ pub async fn open_social_shop(
 /// `POST …/social/users/{u}/characters/{c}/shops/{s}/purchase` — buy from someone
 /// else's merchant, out of the visitor's own window on it.
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{visitor_character_id}/social/users/{owner_user_id}/characters/{owner_character_id}/shops/{shop_id}/purchase"
+    "/api/game/v1/public/characters/{visitor_character_id}/social/users/{owner_user_id}/characters/{owner_character_id}/shops/{shop_id}/purchase"
 )]
 pub async fn buy_from_social_shop(
     session: SessionLookedUpMaybe,
@@ -1147,7 +1147,7 @@ struct BuybackResponse {
 /// the merchant paid them (`price`, often 0 once the merchant's budget is spent),
 /// the merchant's revenue is restored, and the item returns to the backpack.
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/shops/{shop_id}/buybacks/{buyback_id}"
+    "/api/game/v1/public/characters/{character_id}/shops/{shop_id}/buybacks/{buyback_id}"
 )]
 pub async fn buy_back_from_shop(
     session: SessionLookedUpMaybe,
@@ -1228,7 +1228,7 @@ pub async fn buy_back_from_shop(
 /// Price is the item's APK `sellValue` scaled by its temper multiplier plus its
 /// enchantment values, clamped to what the merchant can still afford. A drained
 /// merchant still takes the item and pays 0, which is what retail did.
-#[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/shops/{shop_id}/sell")]
+#[post("/api/game/v1/public/characters/{character_id}/shops/{shop_id}/sell")]
 pub async fn sell_to_shop(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,

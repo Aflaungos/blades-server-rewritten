@@ -35,7 +35,7 @@ struct CollectResponse {
 }
 
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/chests/{chest_id}/collect"
+    "/api/game/v1/public/characters/{character_id}/chests/{chest_id}/collect"
 )]
 pub async fn collect_chest(
     session: SessionLookedUpMaybe,

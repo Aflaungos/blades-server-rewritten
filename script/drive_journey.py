@@ -20,7 +20,7 @@ Run it:
     DATABASE_URL=postgres://$USER@localhost/blades_drive diesel migration run
     cargo run --release -p server -- run \
         --connection-string postgres://$USER@localhost/blades_drive \
-        --host 127.0.0.1 --port 18087 --static-data ./deploy/static &
+        --host 127.0.0.1 --port 8000 --static-data ./deploy/static &
     python3 script/drive_journey.py blades_drive
 
 It writes to the database through `psql` to bank experience and stock build
@@ -30,8 +30,8 @@ throwaway database, never a real one.
 
 import json, subprocess, sys, urllib.request, urllib.error, uuid
 
-BASE = "http://127.0.0.1:18087/blades.bgs.services/api/game/v1/public"
-AUTH = "http://127.0.0.1:18087/blades.bgs.services/api/authentication/v1/public"
+BASE = "http://127.0.0.1:8000/api/game/v1/public"
+AUTH = "http://127.0.0.1:8000/api/authentication/v1/public"
 GOLD = "f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2"
 GEMS = "470c8f58-a8dd-4c07-8c92-843b785e1139"
 DB = sys.argv[1] if len(sys.argv) > 1 else "blades_journey_58324"

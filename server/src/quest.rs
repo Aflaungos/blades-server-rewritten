@@ -1511,7 +1511,7 @@ async fn rotate_job_board_in_tx(
     Ok((jobs, job_pools, deleted_quest_ids))
 }
 
-#[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/quests")]
+#[post("/api/game/v1/public/characters/{character_id}/quests")]
 pub async fn get_quests(
     session: SessionLookedUpMaybe,
     request: Json<Option<()>>,
@@ -1981,7 +1981,7 @@ fn map_quest_generation_error(error: GenerateQuestDataError) -> BladeApiError {
 }
 
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/quests/{quest_id}/accept"
+    "/api/game/v1/public/characters/{character_id}/quests/{quest_id}/accept"
 )]
 async fn accept_quest(
     session: SessionLookedUpMaybe,
@@ -2575,7 +2575,7 @@ fn mark_quest_completed_once(info: &mut blades_lib::user_data::Quest) -> bool {
 }
 
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/quests/{quest_id}/complete"
+    "/api/game/v1/public/characters/{character_id}/quests/{quest_id}/complete"
 )]
 pub async fn complete_quest(
     session: SessionLookedUpMaybe,
@@ -3108,7 +3108,7 @@ fn objective_reward(
 }
 
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/quests/{quest_id}/objectives"
+    "/api/game/v1/public/characters/{character_id}/quests/{quest_id}/objectives"
 )]
 pub async fn update_quest_objectives(
     session: SessionLookedUpMaybe,

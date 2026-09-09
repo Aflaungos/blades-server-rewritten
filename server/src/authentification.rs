@@ -178,7 +178,7 @@ struct BnetLoginRequest {
     platform: Option<String>,
 }
 
-#[post("/blades.bgs.services/api/authentication/v1/public/auth/bnet/login")]
+#[post("/api/authentication/v1/public/auth/bnet/login")]
 async fn bnet_log_in(
     req: HttpRequest,
     current_session: SessionLookedUpMaybe,
@@ -570,7 +570,7 @@ async fn bind_linked_devices(
         .await
 }
 
-#[post("/blades.bgs.services/api/authentication/v1/public/auth/bnet/link")]
+#[post("/api/authentication/v1/public/auth/bnet/link")]
 async fn bnet_link(
     app_state: web::Data<Arc<ServerGlobal>>,
     body: web::Json<BnetLinkRequest>,
@@ -936,7 +936,7 @@ async fn apply_forced_link_changes(
 /// recoverable, and a character here cannot be re-captured). If they kept the
 /// linked account's character, nothing moves, which is what this endpoint did
 /// for every answer before #185.
-#[post("/blades.bgs.services/api/authentication/v1/public/auth/bnet/link/force")]
+#[post("/api/authentication/v1/public/auth/bnet/link/force")]
 async fn bnet_link_force(
     req: HttpRequest,
     current_session: SessionLookedUpMaybe,
@@ -1032,7 +1032,7 @@ fn refreshed_session(
 /// through the one-device claim like every other minting path, sparing the
 /// caller's own session; in practice there is nothing else to evict, since a
 /// device displaced by another login has no live token to refresh with.
-#[post("/blades.bgs.services/api/authentication/v1/public/auth/refresh")]
+#[post("/api/authentication/v1/public/auth/refresh")]
 async fn refresh_token(
     app_state: web::Data<Arc<ServerGlobal>>,
     current_session: SessionLookedUpMaybe,
@@ -1065,7 +1065,7 @@ async fn refresh_token(
     }))
 }
 
-#[post("/blades.bgs.services/api/authentication/v1/public/auth/anon")]
+#[post("/api/authentication/v1/public/auth/anon")]
 async fn anon_log_in(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,

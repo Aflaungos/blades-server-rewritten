@@ -18,7 +18,7 @@ psql -U blades -d blades -t -A -v cid='<character-uuid>' \
 ## Import
 
 ```bash
-curl -X POST http://<host>/blades.bgs.services/api/dev/v1/import-character \
+curl -X POST http://<host>/api/dev/v1/import-character \
   -H 'Content-Type: application/json' \
   -H "X-Import-Token: $ARENA_IMPORT_TOKEN" \
   --data-binary @character.json

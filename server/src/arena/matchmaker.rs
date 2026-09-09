@@ -5339,7 +5339,7 @@ async fn load_skill(
         .max_by_key(|s| (s.trophies, s.level))
 }
 
-#[post("/blades.bgs.services/api/matchmaking/v1/public/matches/create")]
+#[post("/api/matchmaking/v1/public/matches/create")]
 pub async fn create_match(
     req: actix_web::HttpRequest,
     session: SessionLookedUpMaybe,
@@ -5481,7 +5481,7 @@ pub async fn create_match(
     }))
 }
 
-#[post("/blades.bgs.services/api/matchmaking/v1/public/matches/{ticket_id}/cancel")]
+#[post("/api/matchmaking/v1/public/matches/{ticket_id}/cancel")]
 pub async fn cancel_match(
     path: web::Path<Uuid>,
     session: SessionLookedUpMaybe,

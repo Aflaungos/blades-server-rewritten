@@ -987,7 +987,7 @@ pub(crate) fn served_catalog(static_data: &blades_lib::static_data::StaticData, 
 /// `GET /catalogoverrides/globalshop` — retail's calendar replayed so it covers the
 /// present, overlaid with anything an admin authored, cut to what is live now. See
 /// [`served_catalog`].
-#[get("/blades.bgs.services/api/game/v1/public/catalogoverrides/globalshop")]
+#[get("/api/game/v1/public/catalogoverrides/globalshop")]
 pub async fn get_override(app_state: web::Data<Arc<ServerGlobal>>) -> Json<Value> {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -998,7 +998,7 @@ pub async fn get_override(app_state: web::Data<Arc<ServerGlobal>>) -> Json<Value
 
 /// `GET /catalogoverrides/iap` — real-money SKU catalogue, served verbatim (priced
 /// placeholders, all inactive; no purchase flow exists).
-#[get("/blades.bgs.services/api/game/v1/public/catalogoverrides/iap")]
+#[get("/api/game/v1/public/catalogoverrides/iap")]
 pub async fn get_iap(app_state: web::Data<Arc<ServerGlobal>>) -> Json<Value> {
     Json(app_state.static_data.iap.clone())
 }
@@ -1107,7 +1107,7 @@ fn purchases_list_with_tracking_counts(
 }
 
 /// `GET /…/globalshops/current` — this character's per-product purchase counts.
-#[get("/blades.bgs.services/api/game/v1/public/characters/{character_id}/globalshops/current")]
+#[get("/api/game/v1/public/characters/{character_id}/globalshops/current")]
 pub async fn get_global_shop_for_character(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -1830,7 +1830,7 @@ fn record_purchase(
 /// `POST /…/globalshops/current/purchase` — buy a global-shop product: validate the
 /// client price, debit it, grant the product, bump the purchase count.
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/globalshops/current/purchase"
+    "/api/game/v1/public/characters/{character_id}/globalshops/current/purchase"
 )]
 pub async fn purchase_global_shop(
     session: SessionLookedUpMaybe,

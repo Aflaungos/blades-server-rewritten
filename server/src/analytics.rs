@@ -9,7 +9,7 @@ use uuid::Uuid;
 
 use crate::session::SessionLookedUpMaybe;
 
-#[post("/blades.bgs.services/api/analytics/v1/public/stats/client")]
+#[post("/api/analytics/v1/public/stats/client")]
 pub async fn blades_bgs_stat_analytics() -> Json<Option<()>> {
     return Json(None);
 }
@@ -59,7 +59,7 @@ fn latest_gear_rating(body: &[u8]) -> Option<(Uuid, u32)> {
 /// `initialPlayerLevel` (10, 11 and 75 beside the captured `/start`s).
 ///
 /// Stored on the caller's own session only, so no one can set another player's.
-#[post("/blades.bgs.services/api/analytics/v1/public/events")]
+#[post("/api/analytics/v1/public/events")]
 pub async fn blades_bgs_event_analytics(
     session: SessionLookedUpMaybe,
     body: Option<web::Bytes>,

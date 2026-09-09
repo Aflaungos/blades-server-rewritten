@@ -75,7 +75,7 @@ struct GetTownResponse {
     town: Value,
 }
 
-#[get("/blades.bgs.services/api/game/v1/public/characters/{character_id}/towns/current")]
+#[get("/api/game/v1/public/characters/{character_id}/towns/current")]
 pub async fn get_town(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -157,7 +157,7 @@ struct TownNameResponse {
     town: Value,
 }
 
-#[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/towns/current/name")]
+#[post("/api/game/v1/public/characters/{character_id}/towns/current/name")]
 pub async fn set_town_name(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -815,7 +815,7 @@ struct UpgradeRequest {
 }
 
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/towns/current/buildings/{building_id}/upgrade"
+    "/api/game/v1/public/characters/{character_id}/towns/current/buildings/{building_id}/upgrade"
 )]
 pub async fn upgrade_building(
     session: SessionLookedUpMaybe,
@@ -951,7 +951,7 @@ struct CompleteResponse {
 }
 
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/towns/current/buildings/{building_id}/complete"
+    "/api/game/v1/public/characters/{character_id}/towns/current/buildings/{building_id}/complete"
 )]
 pub async fn complete_building(
     session: SessionLookedUpMaybe,
@@ -1286,7 +1286,7 @@ struct PlaceRequest {
     gems_payment: bool,
 }
 
-#[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/towns/current/buildings")]
+#[post("/api/game/v1/public/characters/{character_id}/towns/current/buildings")]
 pub async fn place_building(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -1422,7 +1422,7 @@ struct DestroyRequest {
 }
 
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/towns/current/buildings/{building_id}/destroy"
+    "/api/game/v1/public/characters/{character_id}/towns/current/buildings/{building_id}/destroy"
 )]
 pub async fn destroy_building(
     session: SessionLookedUpMaybe,
@@ -1503,7 +1503,7 @@ pub async fn destroy_building(
 /// price would be worse than charging nothing, and the client is authoritative
 /// for what it offers the player.
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/towns/current/buildings/{building_id}/styles/{style_id}"
+    "/api/game/v1/public/characters/{character_id}/towns/current/buildings/{building_id}/styles/{style_id}"
 )]
 pub async fn set_building_style(
     session: SessionLookedUpMaybe,
@@ -1718,7 +1718,7 @@ pub struct PlacePropsResponse {
 /// The client sends a list of {propId, districtId} pairs to remove.
 /// Returns updated wallet, inventory, and town state.
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/towns/current/props/remove"
+    "/api/game/v1/public/characters/{character_id}/towns/current/props/remove"
 )]
 pub async fn remove_town_props(
     session: SessionLookedUpMaybe,
@@ -2002,7 +2002,7 @@ fn credit_removed_decorations(
     inventory.backpack_version += 1;
 }
 
-#[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/towns/current/props")]
+#[post("/api/game/v1/public/characters/{character_id}/towns/current/props")]
 pub async fn place_town_props(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,

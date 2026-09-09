@@ -138,7 +138,7 @@ struct GetAbyssResponse {
     abyss: Option<AbyssWire>,
 }
 
-#[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/abysses/current")]
+#[post("/api/game/v1/public/characters/{character_id}/abysses/current")]
 pub async fn get_abyss(
     path: web::Path<Uuid>,
     session: SessionLookedUpMaybe,
@@ -188,7 +188,7 @@ const ABYSS_QUEST_ID: &str = "ab133000-0000-0000-0000-000000000000";
 /// Gold currency UUID (captured from both abyss and quest loot responses).
 const GOLD_CURRENCY_UUID: &str = "f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2";
 
-#[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/abysses/current/start")]
+#[post("/api/game/v1/public/characters/{character_id}/abysses/current/start")]
 pub async fn start_abyss(
     path: web::Path<Uuid>,
     body: Json<StartAbyssRequest>,
@@ -512,7 +512,7 @@ struct UpdateAbyssResponse {
     inventory: CompleteInventoryUpdate,
 }
 
-#[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/abysses/current/update")]
+#[post("/api/game/v1/public/characters/{character_id}/abysses/current/update")]
 pub async fn update_abyss(
     path: web::Path<Uuid>,
     body: Json<UpdateAbyssRequest>,
@@ -666,7 +666,7 @@ struct EndAbyssResponse {
     inventory: CompleteInventoryUpdate,
 }
 
-#[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/abysses/current/end")]
+#[post("/api/game/v1/public/characters/{character_id}/abysses/current/end")]
 pub async fn end_abyss(
     path: web::Path<Uuid>,
     _body: Json<EndAbyssRequest>,
