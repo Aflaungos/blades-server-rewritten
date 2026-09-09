@@ -31,7 +31,7 @@ struct CharacterListResponse {
     characters: Vec<CompleteCharacterWithIdAndData>,
 }
 
-#[get("/blades.bgs.services/api/game/v1/public/characters")]
+#[get("/api/game/v1/public/characters")]
 async fn list_characters(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -64,7 +64,7 @@ struct CompleteCharacterWithIdAndDataContainer {
     character: CompleteCharacterWithIdAndData,
 }
 
-#[get("/blades.bgs.services/api/game/v1/public/characters/{character_id}")]
+#[get("/api/game/v1/public/characters/{character_id}")]
 async fn get_character(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -786,7 +786,7 @@ mod creation_route_tests {
         let src = include_str!("character.rs");
         assert!(
             src.contains(
-                "#[post(\"/blades.bgs.services/api/game/v1/public/characters\")]\nasync fn create_characters",
+                "#[post(\"/api/game/v1/public/characters\")]\nasync fn create_characters",
             ),
             "character creation must be registered at the path the retail client calls"
         );

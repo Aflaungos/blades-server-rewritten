@@ -550,7 +550,7 @@ async fn main() -> Result<()> {
                     .wrap_fn(|mut req, srv| {
                         let start_timestamp = SystemTime::now();
                         let is_from_blades_api =
-                            req.uri().path().starts_with("/blades.bgs.services/");
+                            req.uri().path().starts_with("/api/");
                         let session_fut = req.extract::<SessionLookedUpMaybe>();
                         let res_fut = srv.call(req);
                         async move {
@@ -856,7 +856,7 @@ mod json_rejection_tests {
     fn a_rejected_body_is_still_a_400() {
         let serde_err = serde_json::from_str::<u32>("-1").unwrap_err();
         let req = actix_web::test::TestRequest::post()
-            .uri("/blades.bgs.services/api/game/v1/public/characters/x/quests/y/dungeons/current/update")
+            .uri("/api/game/v1/public/characters/x/quests/y/dungeons/current/update")
             .to_http_request();
         let err = log_rejected_json_body(
             actix_web::error::JsonPayloadError::Deserialize(serde_err),

@@ -220,7 +220,7 @@ fn split_csv(raw: &str) -> impl Iterator<Item = &str> {
     raw.split(',').map(str::trim).filter(|s| !s.is_empty())
 }
 
-#[get("/blades.bgs.services/api/game/v1/public/social/characters")]
+#[get("/api/game/v1/public/social/characters")]
 pub async fn get_social_characters(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -334,7 +334,7 @@ pub struct SocialTownQuery {
 /// districts, so every guildmate's town rendered as a fresh level-1 town with
 /// no buildings and therefore no merchants (tracker report #230).
 #[get(
-    "/blades.bgs.services/api/game/v1/public/social/users/{user_id}/characters/{character_id}/towns/current"
+    "/api/game/v1/public/social/users/{user_id}/characters/{character_id}/towns/current"
 )]
 pub async fn get_social_town(
     session: SessionLookedUpMaybe,
@@ -372,7 +372,7 @@ pub async fn get_social_town(
 /// town projections. Retail answered 200 in all three committed examples; a
 /// missing route leaves the profile loading until the client gives up.
 #[get(
-    "/blades.bgs.services/api/game/v1/public/characters/{requester_character_id}/social/users/{user_id}/characters/{character_id}/loadouts/current"
+    "/api/game/v1/public/characters/{requester_character_id}/social/users/{user_id}/characters/{character_id}/loadouts/current"
 )]
 pub async fn get_social_loadout(
     session: SessionLookedUpMaybe,

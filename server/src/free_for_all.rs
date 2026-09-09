@@ -257,7 +257,7 @@ fn stored_claim_limit(authored: i64) -> i64 {
 ///
 /// The static catalogue stays as the floor: `effective_gift` falls back to it,
 /// so a gift that has never been published behaves exactly as before.
-#[post("/blades.bgs.services/api/dev/v1/gifts")]
+#[post("/api/dev/v1/gifts")]
 pub async fn publish_gifts(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -525,7 +525,7 @@ fn window_from(start_hour_utc: Option<i64>, duration_mins: Option<i64>) -> Windo
 }
 
 /// `GET /…/api/dev/v1/free-for-all` — the ledger and what the next window would be.
-#[get("/blades.bgs.services/api/dev/v1/free-for-all")]
+#[get("/api/dev/v1/free-for-all")]
 pub async fn free_for_all_state(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -616,7 +616,7 @@ pub struct OpenResponse {
 ///
 /// Refuses a second window for the same occurrence, so a race between the console
 /// and a scheduler cannot pay twice.
-#[post("/blades.bgs.services/api/dev/v1/free-for-all/open")]
+#[post("/api/dev/v1/free-for-all/open")]
 pub async fn free_for_all_open(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -714,7 +714,7 @@ pub struct CloseResponse {
     pub earned_by: i64,
 }
 
-#[post("/blades.bgs.services/api/dev/v1/free-for-all/close")]
+#[post("/api/dev/v1/free-for-all/close")]
 pub async fn free_for_all_close(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,

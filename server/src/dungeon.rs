@@ -75,7 +75,7 @@ pub struct EventDungeonDbEntry {
     pub max_entries: i32,
 }
 
-#[get("/blades.bgs.services/api/game/v1/public/characters/{character_id}/dungeons")]
+#[get("/api/game/v1/public/characters/{character_id}/dungeons")]
 pub async fn get_dungeons(
     path: web::Path<Uuid>,
     session: SessionLookedUpMaybe,
@@ -259,7 +259,7 @@ impl ExitDungeonResponse {
 /// character rather than erroring. The client retries this on a dropped connection,
 /// and a second 4xx would strand the very player the retry is meant to rescue.
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/quests/{quest_id}/dungeons/current/exit"
+    "/api/game/v1/public/characters/{character_id}/quests/{quest_id}/dungeons/current/exit"
 )]
 pub async fn exit_quest_dungeon(
     path: web::Path<(Uuid, Uuid)>,
@@ -765,7 +765,7 @@ pub(crate) async fn event_dungeon_exit(
 }
 
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/quests/{quest_id}/dungeons/current/enter"
+    "/api/game/v1/public/characters/{character_id}/quests/{quest_id}/dungeons/current/enter"
 )]
 pub async fn enter_quest_dungeon(
     path: web::Path<(Uuid, Uuid)>,
