@@ -313,7 +313,7 @@ until the season opens.
 
 ## 6. Running the rollover
 
-`POST /blades.bgs.services/api/dev/v1/arena-season-rollover`, dev-token gated like
+`POST /api/dev/v1/arena-season-rollover`, dev-token gated like
 the rest of `admin.rs` (`Authorization: Bearer $ARENA_IMPORT_TOKEN`).
 
 **It defaults to a dry run.** A missing or mistyped `apply` reports what would
@@ -321,7 +321,7 @@ happen and writes nothing.
 
 ```bash
 # 1. See what it would do. Always do this first.
-curl -sS -X POST https://<host>/blades.bgs.services/api/dev/v1/arena-season-rollover \
+curl -sS -X POST https://<host>/api/dev/v1/arena-season-rollover \
      -H "Authorization: Bearer $ARENA_IMPORT_TOKEN" \
      -H 'Content-Type: application/json' -d '{}' | jq
 

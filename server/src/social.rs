@@ -169,7 +169,7 @@ fn split_csv(raw: &str) -> impl Iterator<Item = &str> {
     raw.split(',').map(str::trim).filter(|s| !s.is_empty())
 }
 
-#[get("/blades.bgs.services/api/game/v1/public/social/characters")]
+#[get("/api/game/v1/public/social/characters")]
 pub async fn get_social_characters(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,

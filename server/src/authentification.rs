@@ -113,7 +113,7 @@ struct BnetLoginRequest {
     platform: Option<String>,
 }
 
-#[post("/blades.bgs.services/api/authentication/v1/public/auth/bnet/login")]
+#[post("/api/authentication/v1/public/auth/bnet/login")]
 async fn bnet_log_in(
     app_state: web::Data<Arc<ServerGlobal>>,
     body: web::Json<BnetLoginRequest>,
@@ -296,7 +296,7 @@ fn is_same_account(selected: Option<&str>, secret_id: Uuid) -> bool {
         .is_some_and(|s| s == secret_id)
 }
 
-#[post("/blades.bgs.services/api/authentication/v1/public/auth/bnet/link")]
+#[post("/api/authentication/v1/public/auth/bnet/link")]
 async fn bnet_link(
     app_state: web::Data<Arc<ServerGlobal>>,
     body: web::Json<BnetLinkRequest>,
@@ -389,7 +389,7 @@ async fn bnet_link(
 /// chose the linked account. Same credential check; the anonymous account they
 /// were using is simply left behind (never deleted — it may hold a character
 /// they later want, and deleting on a menu tap is not recoverable).
-#[post("/blades.bgs.services/api/authentication/v1/public/auth/bnet/link/force")]
+#[post("/api/authentication/v1/public/auth/bnet/link/force")]
 async fn bnet_link_force(
     app_state: web::Data<Arc<ServerGlobal>>,
     body: web::Json<BnetLinkRequest>,
@@ -405,7 +405,7 @@ async fn bnet_link_force(
     }))
 }
 
-#[post("/blades.bgs.services/api/authentication/v1/public/auth/anon")]
+#[post("/api/authentication/v1/public/auth/anon")]
 async fn anon_log_in(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,

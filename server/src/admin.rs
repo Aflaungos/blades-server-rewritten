@@ -181,7 +181,7 @@ pub(crate) fn check_import_token(app_state: &ServerGlobal, req: &HttpRequest) ->
     }
 }
 
-#[post("/blades.bgs.services/api/dev/v1/import-character")]
+#[post("/api/dev/v1/import-character")]
 pub async fn import_character(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -335,7 +335,7 @@ pub struct RecentMatchesQuery {
 /// user's match request registered + show recent arena activity. Dev-token
 /// gated. `userId` only sets the per-row `mine` flag (the list is server-wide).
 /// Durable: backed by the `arena_matches` table, so it survives restarts (#NB-3).
-#[get("/blades.bgs.services/api/dev/v1/recent-matches")]
+#[get("/api/dev/v1/recent-matches")]
 pub async fn recent_matches(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -507,7 +507,7 @@ pub(crate) fn map_bind_device_error(e: &diesel::result::Error) -> BladeApiError 
     )
 }
 
-#[post("/blades.bgs.services/api/dev/v1/bind-device")]
+#[post("/api/dev/v1/bind-device")]
 pub async fn bind_device(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -615,7 +615,7 @@ pub struct ReassignDeviceRequest {
 /// recycled peer address now belongs to a different player. See
 /// `REASSIGN_DEVICE_SQL` for why this may override a binding and why it is
 /// restricted to address-keyed rows.
-#[post("/blades.bgs.services/api/dev/v1/reassign-device")]
+#[post("/api/dev/v1/reassign-device")]
 pub async fn reassign_device(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -750,7 +750,7 @@ pub(crate) const RECENT_DEVICES_SQL: &str = "SELECT device_id, user_id, platform
 /// `GET /…/api/dev/v1/recent-devices?userId=<uuid>` — the devices this player
 /// may claim: unclaimed ones, plus the ones already theirs. Never another
 /// player's. See `RECENT_DEVICES_SQL`.
-#[get("/blades.bgs.services/api/dev/v1/recent-devices")]
+#[get("/api/dev/v1/recent-devices")]
 pub async fn recent_devices(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -796,7 +796,7 @@ pub struct SetCredentialResponse {
     pub replaced: bool,
 }
 
-#[post("/blades.bgs.services/api/dev/v1/arena-credentials")]
+#[post("/api/dev/v1/arena-credentials")]
 pub async fn set_arena_credential(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -898,7 +898,7 @@ pub struct CredentialLookupResponse {
     pub username: Option<String>,
 }
 
-#[get("/blades.bgs.services/api/dev/v1/arena-credentials")]
+#[get("/api/dev/v1/arena-credentials")]
 pub async fn get_arena_credential(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -950,7 +950,7 @@ pub struct SeasonListResponse {
 }
 
 /// `GET /…/api/dev/v1/arena-seasons` — every season, newest first.
-#[get("/blades.bgs.services/api/dev/v1/arena-seasons")]
+#[get("/api/dev/v1/arena-seasons")]
 pub async fn list_arena_seasons(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -977,7 +977,7 @@ pub async fn list_arena_seasons(
 /// the key in every character's `pvpSeasonHistory` forever, so letting a UI
 /// choose it invites a collision with one of the 61 retail season ids that
 /// transferred characters already carry.
-#[post("/blades.bgs.services/api/dev/v1/arena-seasons")]
+#[post("/api/dev/v1/arena-seasons")]
 pub async fn create_arena_season(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -1109,7 +1109,7 @@ pub struct StartSeasonResponse {
     pub characters_unreadable: usize,
 }
 
-#[post("/blades.bgs.services/api/dev/v1/arena-seasons/{season_id}/start")]
+#[post("/api/dev/v1/arena-seasons/{season_id}/start")]
 pub async fn start_arena_season(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -1235,7 +1235,7 @@ pub async fn start_arena_season(
     Ok(Json(resp))
 }
 
-#[post("/blades.bgs.services/api/dev/v1/arena-seasons/{season_id}/end")]
+#[post("/api/dev/v1/arena-seasons/{season_id}/end")]
 pub async fn end_arena_season(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -1474,7 +1474,7 @@ struct SeasonRolloverRow {
 /// Idempotent by construction: a character already stamped with the target
 /// season is skipped, so re-running after a partial failure resumes rather than
 /// wiping the players it already moved.
-#[post("/blades.bgs.services/api/dev/v1/arena-season-rollover")]
+#[post("/api/dev/v1/arena-season-rollover")]
 pub async fn arena_season_rollover(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,

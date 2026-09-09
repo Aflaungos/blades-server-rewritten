@@ -443,7 +443,7 @@ struct SyncResponse {
     request_index: u64,
 }
 
-#[get("/blades.bgs.services/api/game/v1/public/sync")]
+#[get("/api/game/v1/public/sync")]
 async fn sync(session: SessionLookedUpMaybe) -> Result<web::Json<SyncResponse>, BladeApiError> {
     let session = session.get_session_or_error()?;
     Ok(web::Json(SyncResponse {
