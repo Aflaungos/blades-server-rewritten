@@ -200,7 +200,7 @@ fn row_to_entry(r: RankedRow) -> LeaderboardEntry {
     }
 }
 
-#[get("/blades.bgs.services/api/game/v1/public/characters/{character_id}/leaderboards/{unk}")]
+#[get("/api/game/v1/public/characters/{character_id}/leaderboards/{unk}")]
 pub async fn get_leaderboard(
     app_state: web::Data<Arc<ServerGlobal>>,
     path: web::Path<(Uuid, Uuid)>,
