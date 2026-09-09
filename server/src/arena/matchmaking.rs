@@ -31,7 +31,7 @@ fn ends_socket(
     matches!(item, None | Some(Err(_)) | Some(Ok(AggregatedMessage::Close(_))))
 }
 
-#[get("/blades.bgs.services/api/rms/v1/public/")]
+#[get("/api/rms/v1/public/")]
 async fn matchmaking_ws(
     req: HttpRequest,
     stream: web::Payload,

@@ -76,7 +76,7 @@ fn remove_owned_item(
     Some((removed.item.item_template_id, removed.item.tempering_level))
 }
 
-#[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/salvages")]
+#[post("/api/game/v1/public/characters/{character_id}/salvages")]
 pub async fn salvage_items(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,

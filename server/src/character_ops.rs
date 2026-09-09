@@ -144,7 +144,7 @@ fn set_level_up_offer(character: &mut CompleteCharacter, offers: &HashMap<u16, U
 /// credited a currency**, and then carrying only that currency (18 of the 30
 /// captured level-ups send no wallet at all). We used to send the whole purse on
 /// every call, which told the client a balance had changed when it had not.
-#[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/levelup")]
+#[post("/api/game/v1/public/characters/{character_id}/levelup")]
 pub async fn levelup(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -267,7 +267,7 @@ struct AbilitiesRequest {
 }
 
 /// `POST /abilities` — learn/upgrade abilities (`{abilities:{id:level}}`).
-#[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/abilities")]
+#[post("/api/game/v1/public/characters/{character_id}/abilities")]
 pub async fn learn_abilities(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -308,7 +308,7 @@ struct RespecRequest {
 }
 
 /// `POST /respec` — reallocate attribute points.
-#[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/respec")]
+#[post("/api/game/v1/public/characters/{character_id}/respec")]
 pub async fn respec(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -393,7 +393,7 @@ struct UpgradeRequest {
 
 /// `POST /inventories/current/upgrade` — raise backpack capacity tier.
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/inventories/current/upgrade"
+    "/api/game/v1/public/characters/{character_id}/inventories/current/upgrade"
 )]
 pub async fn upgrade_inventory(
     session: SessionLookedUpMaybe,
@@ -433,7 +433,7 @@ struct DestroyRequest {
 
 /// `POST /inventories/current/destroy` — destroy instanced backpack items.
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/inventories/current/destroy"
+    "/api/game/v1/public/characters/{character_id}/inventories/current/destroy"
 )]
 pub async fn destroy_items(
     session: SessionLookedUpMaybe,
@@ -464,7 +464,7 @@ pub async fn destroy_items(
 
 /// `POST /loadouts/profiles/{n}` — save a named loadout profile (returns `null`).
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/loadouts/profiles/{index}"
+    "/api/game/v1/public/characters/{character_id}/loadouts/profiles/{index}"
 )]
 pub async fn save_loadout_profile(
     session: SessionLookedUpMaybe,
@@ -614,7 +614,7 @@ fn should_stage_live_match_loadout(body: &LoadoutCurrentRequest) -> bool {
 }
 
 /// `POST /loadouts/current` — equip/unequip gear and/or set equipped-ability slots.
-#[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/loadouts/current")]
+#[post("/api/game/v1/public/characters/{character_id}/loadouts/current")]
 pub async fn update_loadout(
     session: SessionLookedUpMaybe,
     app_state: web::Data<Arc<ServerGlobal>>,
