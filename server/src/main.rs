@@ -504,7 +504,7 @@ async fn main() -> Result<()> {
                     .wrap_fn(|mut req, srv| {
                         let start_timestamp = SystemTime::now();
                         let is_from_blades_api =
-                            req.uri().path().starts_with("/blades.bgs.services/");
+                            req.uri().path().starts_with("/api/");
                         let session_fut = req.extract::<SessionLookedUpMaybe>();
                         let res_fut = srv.call(req);
                         async move {

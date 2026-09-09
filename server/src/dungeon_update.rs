@@ -240,7 +240,7 @@ struct EventDungeonStateAndGeneratedData {
 }
 
 #[post(
-    "blades.bgs.services/api/game/v1/public/characters/{character_id}/quests/{quest_id}/dungeons/current/update"
+    "api/game/v1/public/characters/{character_id}/quests/{quest_id}/dungeons/current/update"
 )]
 pub async fn dungeon_update(
     path: web::Path<(Uuid, Uuid)>,
