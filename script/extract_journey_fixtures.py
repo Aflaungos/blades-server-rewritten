@@ -36,7 +36,7 @@ import sqlite3
 import sys
 from collections import Counter, defaultdict
 
-RETAIL_PREFIX = "https://blades.bgs.services/api/game/v1/public"
+RETAIL_PREFIX = "https://api/game/v1/public"
 GOLD = "f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2"
 SIGIL = "c64bcb53-41f4-41ba-892a-fe2cca423caa"
 GEMS = "470c8f58-a8dd-4c07-8c92-843b785e1139"
@@ -391,7 +391,7 @@ def extract_spawn_levels(conn, archive):
 
     pairs = Counter()
     xp = defaultdict(Counter)
-    for (blob,) in conn.execute(sql, ("https://blades.bgs.services/%",)):
+    for (blob,) in conn.execute(sql, ("https://%",)):
         resp = _json(blob)
         if not isinstance(resp, dict):
             continue
@@ -440,7 +440,7 @@ def extract_endpoint_coverage(conn, archive):
     and buying from it) were on nine players' traffic and none of Yumeko's.
     """
     sql = ("SELECT method, url, user_id FROM api_captures "
-           "WHERE url LIKE 'https://blades.bgs.services/api/game/v1/public/%'")
+           "WHERE url LIKE 'https://api/game/v1/public/%'")
     seen = Counter()
     players = defaultdict(set)
     for method, url, user in conn.execute(sql):
