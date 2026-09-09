@@ -178,7 +178,7 @@ struct BnetLoginRequest {
     platform: Option<String>,
 }
 
-#[post("/blades.bgs.services/api/authentication/v1/public/auth/bnet/login")]
+#[post("/api/authentication/v1/public/auth/bnet/login")]
 async fn bnet_log_in(
     req: HttpRequest,
     current_session: SessionLookedUpMaybe,
@@ -570,7 +570,7 @@ async fn bind_linked_devices(
         .await
 }
 
-#[post("/blades.bgs.services/api/authentication/v1/public/auth/bnet/link")]
+#[post("/api/authentication/v1/public/auth/bnet/link")]
 async fn bnet_link(
     app_state: web::Data<Arc<ServerGlobal>>,
     body: web::Json<BnetLinkRequest>,
@@ -936,7 +936,7 @@ async fn apply_forced_link_changes(
 /// recoverable, and a character here cannot be re-captured). If they kept the
 /// linked account's character, nothing moves, which is what this endpoint did
 /// for every answer before #185.
-#[post("/blades.bgs.services/api/authentication/v1/public/auth/bnet/link/force")]
+#[post("/api/authentication/v1/public/auth/bnet/link/force")]
 async fn bnet_link_force(
     req: HttpRequest,
     current_session: SessionLookedUpMaybe,
@@ -1003,7 +1003,7 @@ async fn bnet_link_force(
     }))
 }
 
-#[post("/blades.bgs.services/api/authentication/v1/public/auth/anon")]
+#[post("/api/authentication/v1/public/auth/anon")]
 async fn anon_log_in(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,

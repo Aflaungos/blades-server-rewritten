@@ -26,9 +26,9 @@ import urllib.request
 
 BASE = os.environ.get("ARENA_BASE", "http://127.0.0.1:8087")
 HOST, PORT = "127.0.0.1", int(os.environ.get("ARENA_PORT", "8087"))
-WS_PATH = "/blades.bgs.services/api/rms/v1/public/"
-LOGIN = "/blades.bgs.services/api/authentication/v1/public/auth/anon"
-CREATE = "/blades.bgs.services/api/matchmaking/v1/public/matches/create"
+WS_PATH = "/api/rms/v1/public/"
+LOGIN = "/api/authentication/v1/public/auth/anon"
+CREATE = "/api/matchmaking/v1/public/matches/create"
 
 
 def post(path, body, token=None):

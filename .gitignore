@@ -1,7 +1,11 @@
 /target
 test_*
 data/bundles.blades.bgs.services/
+deploy/static/bundles.blades.bgs.services/
+deploy/static/bad
+data/1*
 data/parsed.json
+saved/
 .env
 *.pyc
 build-app/tmp
