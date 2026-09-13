@@ -47,7 +47,7 @@ pub struct ArenaConfig {
     /// UUID, the **solo-fallback** match (one lone human → vs bot) loads THAT
     /// character's real loadout into the 2nd fighter (slot 1) instead of the empty
     /// `starter()`. A real loadout has a non-empty `profile_character_json`, so the
-    /// engine's existing `broadcast_profiles` emits the opponent's op54 PROFILE
+    /// engine's round-start actor broadcaster emits the opponent's op54 PROFILE
     /// (GameMessageId 35) — the frame that flips the client's `ClientChecklist`
     /// `OpponentLoadoutReady` and crosses "Connecting…" → "Setting up…". Without it,
     /// the bot falls back to `starter()` (empty profile) and the profile is skipped

@@ -343,7 +343,7 @@ const CUSTOMIZATION_SLOT0: &str =
 const CUSTOMIZATION_SLOT1: &str =
     r#"{"CharacterUID":"Visual_Player_FemaleRedguardVisual","hairIndex":7,"skinIndex":5}"#;
 
-/// A fighter that carries a (non-empty) profile, so `broadcast_profiles` emits the
+/// A fighter that carries a non-empty profile, so the round-start relay emits the
 /// op54 PROFILE — required to reproduce s506's t+2 opponent profile.
 ///
 /// `character_uuid` is what the op50 Player/Avatar spawns put at NetData propId4
@@ -495,7 +495,7 @@ fn round_start_reproduces_s506_sequence_and_stagger() {
     let profile = profile.expect(
         "DIVERGENCE: no op54 PROFILE emitted — the client never receives the opponent's \
          character/gear, so it cannot build the opponent actor (stalls at 'Setting up…'). \
-         engine::broadcast_profiles skipped it.",
+         the round-start profile relay skipped it.",
     );
 
     // s506 order: Clock (t+0) → Spawn (t+0) → Profile (t+2) → BackendMatchCreated (t+4)
@@ -716,8 +716,8 @@ fn drive_identity_burst() -> Vec<(usize, Vec<u8>)> {
 /// character's appearance — the observed live bug.
 ///
 /// **Status at `af2602d`: PASSES.** The engine's per-viewer construction is
-/// correct in isolation — `broadcast_spawns` / `broadcast_avatars` /
-/// `broadcast_profiles` all key off `actor.slot == viewer`. The live identity
+/// correct in isolation — `broadcast_spawns` and `broadcast_round_start_actors`
+/// both key off `actor.slot == viewer`. The live identity
 /// inversion is therefore NOT in the burst's construction but in the fighter-slot
 /// → peer resolution one layer up (`MatchRegistry::{tick_matches,
 /// handle_live_user_data}` fall back to the FIFO `m.players[target]`), which

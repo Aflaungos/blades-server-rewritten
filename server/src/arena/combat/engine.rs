@@ -463,7 +463,7 @@ impl MatchInstance {
     ///
     /// The registry uses this to hold the burst back until every peer's fighter slot
     /// is *authoritatively* known. The burst is per-viewer by construction
-    /// (`broadcast_spawns` / `broadcast_avatars` / `broadcast_profiles` all branch on
+    /// (`broadcast_spawns` / `broadcast_round_start_actors` both branch on
     /// `actor.slot == viewer`), so its content is only ever as correct as the
     /// slot→peer addressing applied one layer up; emitting it while a peer is still
     /// bound by FIFO admission order is what swaps the two players' identities.
@@ -620,8 +620,8 @@ impl MatchInstance {
         // committed. During the BETWEEN-ROUNDS walk this is the frame that follows a
         // loadout change on the `ChooseLoadout` screen, and it used to be dropped: the
         // opponent's client was never re-sent the op54 PROFILE, so it kept rendering (and
-        // the local HUD kept describing) the gear from round 1. `broadcast_profiles` ran
-        // from exactly one place — the round-start `Spawning` branch — so nothing could
+        // the local HUD kept describing) the gear from round 1. The round-start profile
+        // relay ran from exactly one place — the `Spawning` branch — so nothing could
         // refresh it mid-match.
         //
         // Re-broadcast the sender's profile to its opponent so the opponent actor is
@@ -853,7 +853,7 @@ impl MatchInstance {
                     self.broadcast_welcome(&mut out);
                     // Round-start emission audit — confirm what actually goes on the wire:
                     // carrier→count (58=clock, 50=spawn, 54=profile/flow) + each fighter's
-                    // profile-JSON size (0 ⇒ empty ⇒ broadcast_profiles skipped it ⇒ the
+                    // profile-JSON size (0 ⇒ empty ⇒ the profile relay skipped it ⇒ the
                     // client can't build its opponent ⇒ "Connecting…" stall).
                     let mut carriers = std::collections::BTreeMap::new();
                     for (_, b) in &out {
@@ -919,16 +919,13 @@ impl MatchInstance {
                         MATCH_STATE_SETUP_TIMEOUT,
                     );
                     // NOW (after state-4, retail order) the Avatars + the opponent PROFILE +
-                    // stat words. Retail s506 sends own Avatar(#3522349) → opp PROFILE
-                    // (#3522353) → opp Avatar(#3522368) → avatar stat words — all AFTER the
-                    // Match reaches InitialPlayerSetup(4). Each Avatar's discovery binds its
-                    // player (GetPvpPlayer by char-UUID → _{local,opponent}Info.Player), so
-                    // both Players (sent in the WaitingForPlayers burst above) are already in
-                    // _pvpPlayers by the time these resolve. broadcast_avatars sends BOTH the
-                    // own (Autonomous) AND opponent (Simulated) avatars — the Simulated one is
-                    // what flips HasOpponentPlayer (proven on-device 2026-06-19).
-                    self.broadcast_avatars(&mut out);
-                    self.broadcast_profiles(&mut out);
+                    // stat words. Retail s506 sends, PER VIEWER, own Avatar(#3522349) →
+                    // opponent PROFILE(#3522353) → opponent Avatar(#3522368) → avatar stat
+                    // words. Keep that interleaving exact: spawning the Simulated opponent
+                    // before its profile starts `PvpEncounter.SpawnOpponent` without the
+                    // `LoadoutJSON` it needs, which races into the zoomed-out / immobile-
+                    // opponent "Setting up…" stall seen on Pixel.
+                    self.broadcast_round_start_actors(&mut out);
                     self.broadcast_stat_updates(&mut out);
                 }
                 if elapsed >= SPAWN_HANDSHAKE_HOLD {
@@ -1141,7 +1138,7 @@ impl MatchInstance {
                         // follows InitialPlayerSetup(4). Re-send the op54 PROFILEs here so
                         // each client rebuilds its opponent actor for the new round instead
                         // of carrying round 1's body forward. Before this,
-                        // `broadcast_profiles` had exactly one caller (the `Spawning`
+                        // the profile relay had exactly one caller (the `Spawning`
                         // branch), so no profile could ever be refreshed mid-match.
                         if matches!(state, MatchState::SynchronizingLoadout) {
                             self.broadcast_missing_interround_profiles(&mut out);
@@ -1249,8 +1246,9 @@ impl MatchInstance {
     /// [docs/arena-journey-log.md §8; il2cpp PvpClientManager.OnObjectDiscover →
     /// PvpEncounter.SpawnOpponent → OnOpponentLoaded]
     ///
-    /// The op54 PROFILE (gear/customization/stats JSON), broadcast right after, is what
-    /// constructs the opponent — see `broadcast_profiles`.
+    /// The op54 PROFILE (gear/customization/stats JSON), delivered before the opponent
+    /// Avatar at round start, supplies the loadout used to construct the opponent — see
+    /// `broadcast_round_start_actors`.
     fn broadcast_spawns(&self, out: &mut Vec<(usize, Vec<u8>)>) {
         for viewer in 0..self.combat.fighters.len() {
             for actor in &self.combat.fighters {
@@ -1268,7 +1266,8 @@ impl MatchInstance {
                 // Player op50 — for BOTH fighters (self Autonomous, opponent Simulated).
                 // Retail s506 sends the two Player spawns FIRST (obj 120 role3, obj 122
                 // role2), BEFORE either Avatar — the Avatars come later (see
-                // `broadcast_avatars`, after the Match→InitialPlayerSetup transition).
+                // `broadcast_round_start_actors`, after the
+                // Match→InitialPlayerSetup transition).
                 // Both Player net-objects must be registered in `PvpClientManager._pvpPlayers`
                 // before the avatars' resource-load callbacks run, because the avatar
                 // discovery is what BINDS the player to the encounter:
@@ -1309,11 +1308,11 @@ impl MatchInstance {
         }
     }
 
-    /// Broadcast the round-start **Avatar** op50 spawns — both the viewer's OWN
-    /// (Autonomous) and the OPPONENT's (Simulated) fighter body. Retail s506 sends
-    /// BOTH (obj 124 role3 + obj 125 role2), AFTER the two Player spawns and AFTER the
-    /// Match net-object reaches `InitialPlayerSetup`(4) (own avatar @ #3522349, opponent
-    /// avatar @ #3522368, interleaved with the opponent profile). **Each avatar's
+    /// Broadcast the round-start identity tail in retail's exact PER-VIEWER order:
+    /// OWN Avatar (Autonomous) → OPPONENT PROFILE → OPPONENT Avatar (Simulated).
+    /// Retail s506 sends both avatars (obj 124 role3 + obj 125 role2), AFTER the two
+    /// Player spawns and AFTER the Match net-object reaches `InitialPlayerSetup`(4),
+    /// with the opponent profile interleaved between them. **Each avatar's
     /// discovery is the player-binding trigger** (`HasLocalPlayer`/`HasOpponentPlayer`):
     /// the client's `PvpEncounter.FinishSpawnLocalAvatar`/`SpawnOpponent` looks the
     /// avatar's character UUID (NetData propId4) up in `_pvpPlayers` via
@@ -1321,17 +1320,39 @@ impl MatchInstance {
     /// the OPPONENT (Simulated) avatar, `HasOpponentPlayer` never flips — proven
     /// on-device 2026-06-19: injecting the missing Simulated avatar flipped it 0→1.
     /// [il2cpp RE: Match.get_HasLocalPlayer @0x178AAF4 → _pvpEncounter._localInfo.Player.]
-    fn broadcast_avatars(&self, out: &mut Vec<(usize, Vec<u8>)>) {
+    fn broadcast_round_start_actors(&self, out: &mut Vec<(usize, Vec<u8>)>) {
         for viewer in 0..self.combat.fighters.len() {
-            for actor in &self.combat.fighters {
-                let role = if actor.slot == viewer {
-                    NetRole::Autonomous
-                } else {
-                    NetRole::Simulated
-                };
+            let Some(own) = self.combat.fighters.get(viewer) else {
+                continue;
+            };
+            out.push((
+                viewer,
+                messages::spawn_avatar(
+                    own.net_object_id,
+                    NetRole::Autonomous,
+                    &own.loadout.character_uuid,
+                ),
+            ));
+
+            for opponent in self.combat.fighters.iter().filter(|actor| actor.slot != viewer) {
+                if !opponent.loadout.profile_character_json.is_empty() {
+                    out.push((
+                        viewer,
+                        messages::player_profile(
+                            opponent.player_net_object_id,
+                            &opponent.loadout.profile_equipped_json,
+                            &opponent.loadout.profile_character_json,
+                            opponent.loadout.hide_helmet,
+                        ),
+                    ));
+                }
                 out.push((
                     viewer,
-                    messages::spawn_avatar(actor.net_object_id, role, &actor.loadout.character_uuid),
+                    messages::spawn_avatar(
+                        opponent.net_object_id,
+                        NetRole::Simulated,
+                        &opponent.loadout.character_uuid,
+                    ),
                 ));
             }
         }
@@ -1646,27 +1667,6 @@ impl MatchInstance {
         }
     }
 
-    /// Broadcast the op54 PROFILE (full character + equipped-gear JSON) a client needs to
-    /// construct the OPPONENT's avatar — appearance/gear/abilities/PvP stats
-    /// (`SetupOpponentActor`/`LoadoutJSON`). Large (tens of KB) → rusty_enet fragments it
-    /// on ENet channel 4. Skipped for fighters with no profile (starter loadout / bot).
-    /// Sent after the op50 spawns, before the flow states (docs/arena-protocol-spec.md §6.2).
-    ///
-    /// **Opponent-only — each viewer gets ONLY its opponent's profile, never its own.**
-    /// The retail server never echoes a client its own profile during setup: the client
-    /// already has it (it uploads its own via op54 *c2s*); the server relays only the
-    /// *other* player's. Verified from s506 (video↔capture): the client receives exactly
-    /// one op54 profile = the opponent's (`05:05:38`). Sending a client a profile for its
-    /// OWN (Autonomous) object — an Authority-role op54 it never expects, emitted first —
-    /// stalled the client's profile pipeline so the opponent's profile (sent right after)
-    /// was never applied → the match sat at "Connecting…", never "Setting up…" (the
-    /// 2026-06-17 paired-match stall). [docs/arena-journey-log.md §7]
-    fn broadcast_profiles(&self, out: &mut Vec<(usize, Vec<u8>)>) {
-        for actor in 0..self.combat.fighters.len() {
-            self.broadcast_profile_of(out, actor);
-        }
-    }
-
     /// Start a fresh exactly-once profile-relay ledger for this between-round walk.
     /// `combat.round` still names the round that just ended until InRound is emitted,
     /// so it is a stable and unique epoch for the whole walk.
@@ -1715,7 +1715,7 @@ impl MatchInstance {
     }
 
     /// Send ONE fighter's op54 PROFILE to every OTHER fighter — the per-actor half of
-    /// [`Self::broadcast_profiles`], split out so the between-rounds
+    /// [`Self::broadcast_round_start_actors`], split out so the between-rounds
     /// `PlayerLoadoutReady`(op36) path can refresh a single player's profile without
     /// re-sending both. Same opponent-only rule and same empty-profile skip: a client is
     /// never sent its own profile, and a fighter with no profile JSON (bot / starter
@@ -2093,7 +2093,7 @@ pub(in crate::arena::combat) mod tests {
     #[test]
     fn round_start_profile_is_opponent_only() {
         let now = Instant::now();
-        // Two fighters that each carry a (non-empty) profile, so broadcast_profiles emits.
+        // Two fighters that each carry a non-empty profile.
         let mk = |name: &str| {
             let mut l = crate::arena::combat::loadout::starter();
             l.display_name = name.to_string();
@@ -2120,6 +2120,66 @@ pub(in crate::arena::combat) mod tests {
             Some(m.combat.fighters[1].player_net_object_id as i64),
             "viewer 0 receives the OPPONENT's (slot 1) profile, not its own"
         );
+    }
+
+    /// Regression for the intermittent Pixel "Setting up…" stall. The June binding
+    /// fix documented retail's per-viewer order but its three separate broadcasters
+    /// actually grouped both Avatar spawns before the profile. That let the Simulated
+    /// Avatar start `SpawnOpponent` before its LoadoutJSON existed. Depending on asset
+    /// timing Unity either recovered or parked with a zoomed-out camera and a frozen
+    /// opponent. Pin the capture order, including the profile BETWEEN the two avatars.
+    #[test]
+    fn round_start_interleaves_opponent_profile_before_simulated_avatar() {
+        let now = Instant::now();
+        let mk = |name: &str, uuid: &str| {
+            let mut l = crate::arena::combat::loadout::starter();
+            l.display_name = name.to_string();
+            l.character_uuid = uuid.to_string();
+            l.profile_equipped_json = r#"{"equippedItems":{}}"#.to_string();
+            l.profile_character_json = format!(r#"{{"name":"{name}","id":"{uuid}"}}"#);
+            l
+        };
+        let mut m = MatchInstance::new(
+            2,
+            2,
+            vec![
+                mk("Alice", "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"),
+                mk("Bob", "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"),
+            ],
+            now,
+        );
+        m.on_tick(2, now); // Players + Match at WaitingForPlayers(3).
+        let setup = m.on_tick(2, now + MATCH_SETUP_STAGGER);
+
+        for viewer in 0..2 {
+            let kinds: Vec<&str> = setup
+                .iter()
+                .filter(|(target, _)| *target == viewer)
+                .filter_map(|(_, frame)| {
+                    let nd = arena_proto::parse_netdata(&frame[2..]);
+                    match (frame.get(1).copied(), nd.int(1), nd.int(2), nd.int(3)) {
+                        (Some(0x35), Some(54), _, _) => Some("match-state"),
+                        (Some(0x32), Some(56), Some(3), _) => Some("own-avatar"),
+                        (Some(0x36), _, _, Some(35)) => Some("opponent-profile"),
+                        (Some(0x32), Some(56), Some(2), _) => Some("opponent-avatar"),
+                        (Some(0x36), _, _, Some(65)) => Some("stats"),
+                        _ => None,
+                    }
+                })
+                .collect();
+            assert_eq!(
+                kinds,
+                [
+                    "match-state",
+                    "own-avatar",
+                    "opponent-profile",
+                    "opponent-avatar",
+                    "stats",
+                    "stats",
+                ],
+                "viewer {viewer}: retail s506 requires profile delivery before the Simulated Avatar spawn",
+            );
+        }
     }
 
     /// A player's hide-helmet toggle must reach the OPPONENT's client.
@@ -2188,7 +2248,7 @@ pub(in crate::arena::combat) mod tests {
     /// viewer (slot 0) IF AND ONLY IF the 2nd fighter (the bot, slot 1) has a
     /// NON-EMPTY `profile_character_json`:
     ///   - empty slot-1 loadout (today's `starter()` bot)  → ZERO opponent profiles
-    ///     (the bug: `broadcast_profiles`' `is_empty()` guard skips it → the client's
+    ///     (the bug: the profile relay's `is_empty()` guard skips it → the client's
     ///     `OpponentLoadoutReady` never flips → "Connecting…" forever);
     ///   - ghost slot-1 loadout (a real character's profile) → exactly ONE opponent
     ///     profile, addressed to slot 1's player object (the fix: `ARENA_DEBUG_GHOST`
@@ -3032,7 +3092,7 @@ pub(in crate::arena::combat) mod tests {
 
     /// **Report #24/#113 — between-round profile relays are complete but not duplicated.**
     ///
-    /// `broadcast_profiles` had exactly ONE caller — the round-start `Spawning` branch —
+    /// The profile relay had exactly ONE caller — the round-start `Spawning` branch —
     /// so no op54 PROFILE could ever be refreshed mid-match: whatever the opponent's body
     /// looked like in round 1, it looked like in round 3. op36 was dropped on the floor
     /// alongside op57.
