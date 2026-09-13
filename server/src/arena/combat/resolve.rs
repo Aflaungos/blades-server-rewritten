@@ -3099,6 +3099,7 @@ fn on_round_ended(
         &combat.game_session_id,
     );
     combat.match_state = MatchState::PostRound;
+    combat.match_state_timeout_secs = MATCH_STATE_POST_ROUND_TIMEOUT;
 
     if match_won {
         // Final round → walk the terminal match-end states next.

@@ -73,6 +73,17 @@ struct PlayerConn {
     #[allow(dead_code)]
     player_session_id: String,
     crypto: CryptoCtx,
+    /// Last carrier / nested UserMessage GameMessageId observed from this client.
+    /// These are intentionally kept in-memory only and exposed solely through the
+    /// token-gated debug route; they make a client stuck at "Setting Up" distinguishable
+    /// from a server that merely advanced without the client.
+    last_carrier: Option<u8>,
+    last_user_message_gmid: Option<u8>,
+    last_match_state_ack: Option<String>,
+    /// Number of cryptographically-proven mobile source-port migrations in this
+    /// match. A rebind resets ENet reliability, so the current replicated MatchState
+    /// has to be replayed on the replacement peer.
+    rebind_count: u32,
 }
 
 /// A live match: up to `capacity` players sharing one authoritative instance and
@@ -390,6 +401,8 @@ pub struct DebugMatchView {
     pub order: u64,
     pub capacity: usize,
     pub phase: &'static str,
+    pub match_state: u8,
+    pub setup_step: usize,
     pub peers: Vec<DebugPeerView>,
 }
 
@@ -406,6 +419,19 @@ pub struct DebugPeerView {
     /// fixed (key, nonce) at counter 0, so an injected frame can never desync the
     /// stream. Exposed here as the per-peer crypto identity, not a running counter.
     pub nonce_hex: String,
+    pub last_carrier: Option<u8>,
+    pub last_user_message_gmid: Option<u8>,
+    pub last_match_state_ack: Option<String>,
+    pub rebind_count: u32,
+}
+
+/// A cryptographically-proven mobile peer migration plus the authoritative state
+/// frames that the replacement ENet generation must receive. The old generation's
+/// reliable queue cannot follow the new PeerID, so relying on ENet retransmission
+/// alone leaves Unity parked at the last MatchState it saw.
+pub struct EncryptedPeerRebind {
+    pub old_addr: SocketAddr,
+    pub replay: Vec<(u8, Vec<u8>)>,
 }
 
 /// **DEBUG.** What one injected frame produced: the peer it was sent to and the
@@ -647,6 +673,10 @@ impl MatchRegistry {
             addr: peer,
             player_session_id: player_session_id.to_string(),
             crypto,
+            last_carrier: None,
+            last_user_message_gmid: None,
+            last_match_state_ack: None,
+            rebind_count: 0,
         });
         if m.players.len() >= m.capacity {
             m.reached_capacity = true;
@@ -708,6 +738,10 @@ impl MatchRegistry {
             addr: peer,
             player_session_id: String::new(), // bound later if/when the psid arrives
             crypto,
+            last_carrier: None,
+            last_user_message_gmid: None,
+            last_match_state_ack: None,
+            rebind_count: 0,
         });
         if m.players.len() >= m.capacity {
             m.reached_capacity = true;
@@ -822,7 +856,26 @@ impl MatchRegistry {
             chacha20_legacy_xor(&mut plain, &c.key, &c.nonce);
         }
         let marker = plain.first().copied();
-        let opcode = plain.get(1).copied(); // user_data[1] = GameMessageId
+        let opcode = plain.get(1).copied(); // user_data[1] = carrier / MessageType
+        let user_message_gmid = crate::arena::combat::messages::user_message_gmid(&plain);
+        let player = &mut m.players[enet_slot];
+        player.last_carrier = opcode;
+        if let Some(gmid) = user_message_gmid {
+            player.last_user_message_gmid = Some(gmid);
+            if gmid == arena_proto::GameMessageId::MatchStateChangeAck as u8 {
+                player.last_match_state_ack = Some(
+                    match arena_proto::parse_netdata(&plain[2..]).string(4) {
+                        Some("BackendMatchCreated") => "BackendMatchCreated",
+                        Some("StateTimeout") => "StateTimeout",
+                        Some("NextState") => "NextState",
+                        Some("RoundEnd") => "RoundEnd",
+                        Some(_) => "Other",
+                        None => "Malformed",
+                    }
+                    .to_owned(),
+                );
+            }
+        }
 
         // Fighter-slot resolution: if this peer isn't authoritatively bound yet, try to
         // extract its playerSessionId from an identity-bearing c2s frame (`PlayerInfo`
@@ -887,7 +940,7 @@ impl MatchRegistry {
         &self,
         peer: SocketAddr,
         user_data: &[u8],
-    ) -> Option<SocketAddr> {
+    ) -> Option<EncryptedPeerRebind> {
         let mut addr_index = self.addr_index.lock().unwrap();
         if addr_index.contains_key(&peer) {
             return None;
@@ -922,6 +975,7 @@ impl MatchRegistry {
         let (gsid, player_idx, old_peer) = candidate?;
         let m = matches.get_mut(&gsid).expect("rebind candidate match exists");
         m.players[player_idx].addr = peer;
+        m.players[player_idx].rebind_count = m.players[player_idx].rebind_count.saturating_add(1);
         if let Some(slot) = m.peer_to_slot.remove(&old_peer) {
             m.peer_to_slot.insert(peer, slot);
         }
@@ -930,7 +984,22 @@ impl MatchRegistry {
         info!(
             "match registry: encrypted peer rebind {old_peer} → {peer} in match {gsid}"
         );
-        Some(old_peer)
+        // A reliable command is reliable only within one ENet peer generation. The
+        // replacement PeerID has a new sequence space and cannot receive commands
+        // queued on the old peer, so replay the CURRENT numeric MatchState plus its
+        // flow trigger. This is deliberately a property UPDATE, not another object
+        // spawn: Unity retains its replicated objects across the transport recovery,
+        // and duplicate spawns can create a second opponent actor at a bad transform.
+        let fighter_slot = m.peer_to_slot.get(&peer).copied().unwrap_or(player_idx);
+        let mut replay = Vec::new();
+        let key = m.players[player_idx].crypto.key;
+        let nonce = m.players[player_idx].crypto.nonce;
+        for mut plaintext in m.instance.replay_current_state(fighter_slot) {
+            let channel = crate::arena::combat::messages::retail_channel(&plaintext);
+            chacha20_legacy_xor(&mut plaintext, &key, &nonce);
+            replay.push((channel, plaintext));
+        }
+        Some(EncryptedPeerRebind { old_addr: old_peer, replay })
     }
 
     /// Drop a peer from its match (disconnect). When the last player leaves, the
@@ -1225,6 +1294,8 @@ impl MatchRegistry {
                 order: m.order,
                 capacity: m.capacity,
                 phase: m.instance.state_name(),
+                match_state: m.instance.match_state_code(),
+                setup_step: m.instance.setup_step(),
                 peers: m
                     .players
                     .iter()
@@ -1235,6 +1306,10 @@ impl MatchRegistry {
                         player_session_id: p.player_session_id.clone(),
                         character_name: m.instance.fighter_display_name(slot).to_string(),
                         nonce_hex: hex_lower(&p.crypto.nonce),
+                        last_carrier: p.last_carrier,
+                        last_user_message_gmid: p.last_user_message_gmid,
+                        last_match_state_ack: p.last_match_state_ack.clone(),
+                        rebind_count: p.rebind_count,
                     })
                     .collect(),
             })
@@ -1522,12 +1597,78 @@ mod tests {
         let mut encrypted = vec![0x84, 54, 0, 0, 0, 0];
         chacha20_legacy_xor(&mut encrypted, &key, &nonce);
 
-        assert_eq!(
-            reg.rebind_encrypted_peer(new_peer, &encrypted),
-            Some(old_peer)
-        );
+        let rebound = reg
+            .rebind_encrypted_peer(new_peer, &encrypted)
+            .expect("the encrypted payload proves the replacement peer");
+        assert_eq!(rebound.old_addr, old_peer);
         assert!(!reg.is_active(&old_peer));
         assert!(reg.is_active(&new_peer));
+    }
+
+    /// A source-port migration creates a brand-new ENet reliable sequence space.
+    /// Prove the registry does not merely move the address: once the authoritative
+    /// FSM is live, it also gives the replacement peer the current InRound Match
+    /// property and StateTimeout flow trigger, encrypted under that peer's key.
+    #[test]
+    fn live_rebind_replays_current_match_state_and_records_client_ack() {
+        let reg = MatchRegistry::new(4);
+        let gsid = Uuid::new_v4();
+        assert!(reg.allocate_with_bots(
+            &["aaaaaaaa-0000-0000-0000-000000000000".to_string()],
+            vec![Loadout::default(), Loadout::default()],
+            gsid,
+            1,
+        ));
+
+        let old_peer: SocketAddr = "109.56.118.105:44853".parse().unwrap();
+        let new_peer: SocketAddr = "109.56.118.105:38510".parse().unwrap();
+        let (client_sk, client_pk) = gen_keypair();
+        let (server_pk, nonce) = reg
+            .admit_connection(old_peer, &client_pk)
+            .expect("old peer admitted");
+        let key = x25519_shared(&client_sk, &server_pk);
+
+        let t0 = Instant::now();
+        for i in 0..=320 {
+            reg.tick_matches(t0 + Duration::from_millis(100 * i));
+        }
+        assert_eq!(reg.debug_list()[0].phase, "StateTimeout");
+
+        let mut ack = crate::arena::combat::messages::match_state_change_ack(560, "StateTimeout");
+        ack[0] = 0x84;
+        let mut encrypted_ack = ack.clone();
+        chacha20_legacy_xor(&mut encrypted_ack, &key, &nonce);
+
+        let rebound = reg
+            .rebind_encrypted_peer(new_peer, &encrypted_ack)
+            .expect("ciphertext proves the replacement peer");
+        assert_eq!(rebound.old_addr, old_peer);
+        assert_eq!(rebound.replay.len(), 2, "numeric MatchState + flow trigger");
+
+        let replay_plain: Vec<Vec<u8>> = rebound
+            .replay
+            .into_iter()
+            .map(|(_, mut bytes)| {
+                chacha20_legacy_xor(&mut bytes, &key, &nonce);
+                bytes
+            })
+            .collect();
+        assert_eq!(replay_plain[0][1], 0x35, "first repair is an op55 property update");
+        assert_eq!(
+            arena_proto::parse_netdata(&replay_plain[0][2..]).int(5),
+            Some(crate::arena::combat::state::MatchState::InRound as i64),
+        );
+        assert!(replay_plain[1].ends_with(b"StateTimeout"));
+
+        // The real ENet path processes the same triggering ciphertext after the
+        // migration. Pin the diagnostic evidence used to distinguish a client that
+        // received/ACKed StateTimeout from one still parked before it.
+        reg.handle_live_user_data(&new_peer, &encrypted_ack)
+            .expect("replacement peer is now active");
+        let peer = &reg.debug_list()[0].peers[0];
+        assert_eq!(peer.rebind_count, 1);
+        assert_eq!(peer.last_user_message_gmid, Some(80));
+        assert_eq!(peer.last_match_state_ack.as_deref(), Some("StateTimeout"));
     }
 
     #[test]
@@ -1546,9 +1687,8 @@ mod tests {
             .expect("old peer admitted");
         let new_peer: SocketAddr = "109.56.118.105:38510".parse().unwrap();
 
-        assert_eq!(
-            reg.rebind_encrypted_peer(new_peer, &[0x6b, 0xde, 0, 0, 0, 0]),
-            None
+        assert!(
+            reg.rebind_encrypted_peer(new_peer, &[0x6b, 0xde, 0, 0, 0, 0]).is_none()
         );
         assert!(reg.is_active(&old_peer));
         assert!(!reg.is_active(&new_peer));

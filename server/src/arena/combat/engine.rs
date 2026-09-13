@@ -418,6 +418,37 @@ impl MatchInstance {
         self.combat.phase_name()
     }
 
+    pub fn match_state_code(&self) -> u8 {
+        self.combat.match_state as u8
+    }
+
+    pub fn setup_step(&self) -> usize {
+        self.setup_step
+    }
+
+    /// State repair for a replacement ENet peer generation. Reliable commands queued
+    /// on the old generation cannot be retransmitted on the new PeerID, while the
+    /// Unity-side replicated objects remain alive. Re-assert the current Match object
+    /// property and current flow trigger so a client that missed InRound(13) cannot
+    /// remain forever on the setup camera while the server is already live.
+    pub fn replay_current_state(&self, viewer: usize) -> Vec<Vec<u8>> {
+        if viewer >= self.combat.fighters.len() || self.combat.match_state == MatchState::Idle {
+            return Vec::new();
+        }
+        let mut out = vec![messages::update_match(
+            self.combat.match_net_object_id,
+            self.combat.fighters.len() as u8,
+            self.combat.match_state,
+            self.combat.match_state_timeout_secs,
+            self.combat.round,
+            &self.combat.game_session_id,
+        )];
+        if let Some(flow) = messages::flow_state(self.combat.flow_controller_id, self.combat.phase) {
+            out.push(flow);
+        }
+        out
+    }
+
     /// True once the match has run its full course — the post-match MatchState walk
     /// reached the terminal `DisconnectingPlayersAfterMatch`(19) and the FSM finished.
     /// The registry uses this to actively ENet-disconnect the player(s) at match-end
@@ -754,6 +785,7 @@ impl MatchInstance {
         // PostMatch and DisconnectingPlayers, and take_finished_peers disconnects the
         // survivor cleanly.
         self.combat.match_state = MatchState::PostRound;
+        self.combat.match_state_timeout_secs = 3.0;
         self.combat.winner = Some(winner);
         self.combat.matchend_step = 0;
         self.combat.phase = FlowState::RoundEnd;
@@ -817,6 +849,7 @@ impl MatchInstance {
                     // MatchState=WaitingForPlayers(3); record it so the FSM advances it
                     // 3→4→5 from here (the player-binding gate).
                     self.combat.match_state = MatchState::WaitingForPlayers;
+                    self.combat.match_state_timeout_secs = MATCH_STATE_WAIT_TIMEOUT;
                     self.broadcast_welcome(&mut out);
                     // Round-start emission audit — confirm what actually goes on the wire:
                     // carrier→count (58=clock, 50=spawn, 54=profile/flow) + each fighter's
@@ -1311,6 +1344,7 @@ impl MatchInstance {
     /// `InitialPlayerSetup`(4). Also records the state on `MatchCombat`. [s506 obj 123]
     fn broadcast_match_state(&mut self, out: &mut Vec<(usize, Vec<u8>)>, state: MatchState, timeout_secs: f32) {
         self.combat.match_state = state;
+        self.combat.match_state_timeout_secs = timeout_secs;
         for viewer in 0..self.combat.fighters.len() {
             out.push((
                 viewer,

@@ -102,6 +102,8 @@ struct MatchView {
     /// The match's current flow phase (Connecting / Spawning / BackendMatchCreated
     /// / StateTimeout / …).
     phase: String,
+    match_state: u8,
+    setup_step: usize,
     peers: Vec<PeerView>,
 }
 
@@ -115,6 +117,10 @@ struct PeerView {
     /// Hex of the peer's 8-byte ChaCha20 nonce (its crypto identity). NOTE: not a
     /// running counter — the cipher resets counter=0 per command (see module docs).
     nonce_hex: String,
+    last_carrier: Option<u8>,
+    last_user_message_gmid: Option<u8>,
+    last_match_state_ack: Option<String>,
+    rebind_count: u32,
 }
 
 #[get("/arena/debug/peers")]
@@ -132,6 +138,8 @@ pub async fn debug_peers(
             capacity: m.capacity,
             connected: m.peers.len(),
             phase: m.phase.to_string(),
+            match_state: m.match_state,
+            setup_step: m.setup_step,
             peers: m
                 .peers
                 .into_iter()
@@ -141,6 +149,10 @@ pub async fn debug_peers(
                     player_session_id: p.player_session_id,
                     character_name: p.character_name,
                     nonce_hex: p.nonce_hex,
+                    last_carrier: p.last_carrier,
+                    last_user_message_gmid: p.last_user_message_gmid,
+                    last_match_state_ack: p.last_match_state_ack,
+                    rebind_count: p.rebind_count,
                 })
                 .collect(),
         })
