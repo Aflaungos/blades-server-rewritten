@@ -325,6 +325,51 @@ fn handle_packet(
     addr: std::net::SocketAddr,
     data: &[u8],
 ) {
+    // Parse the plaintext retail key exchange BEFORE consulting addr_index. Mobile
+    // clients routinely reuse the same UDP source address for their next queue. If
+    // that address still belongs to the preceding match, trying to decrypt this
+    // plaintext frame with the old key produces a bad marker and the fresh match
+    // remains forever at "Opponent Found: Setting Up".
+    if let Some((conn_id, client_pub)) = parse_key_exchange(data) {
+        let was_active = registry.is_active(&addr);
+        if !was_active || registry.has_fresh_connection_reservation(addr) {
+            if was_active {
+                info!(
+                    "arena-enet: fresh op-0x38 from active address {addr} — retiring the old match generation before re-queue"
+                );
+                let now = std::time::Instant::now();
+                for (target, channel, bytes) in registry.peer_departed(&addr, now) {
+                    send_to(host, peer_at, &target, channel, &bytes);
+                }
+            }
+            match registry.admit_connection(addr, &client_pub) {
+                Some((server_pk, nonce)) => {
+                    let mut reply = Vec::with_capacity(55);
+                    reply.extend_from_slice(&[0xBE, 0x38]);
+                    reply.extend_from_slice(&conn_id);
+                    reply.extend_from_slice(&[0, 0, 0, 1]);
+                    reply.extend_from_slice(&[0x01, 0x20]);
+                    reply.extend_from_slice(&server_pk);
+                    reply.push(0x08);
+                    reply.extend_from_slice(&nonce);
+                    send_to(host, peer_at, &addr, 0, &reply);
+                    info!("arena-enet: {addr} admitted (op-0x38 key exchange)");
+                }
+                None => warn!(
+                    "arena-enet: {addr} sent op-0x38 handshake but NO fresh match has a free slot \
+                     (active {}, permits {} free)",
+                    registry.active_count(),
+                    registry.available_permits()
+                ),
+            }
+            return;
+        }
+        debug!(
+            "arena-enet: duplicate op-0x38 from active address {addr} with no fresh reservation; keeping the current match generation"
+        );
+        return;
+    }
+
     if registry.is_active(&addr) {
         if let Some(out) = registry.handle_live_user_data(&addr, data) {
             match out.opcode {
@@ -369,54 +414,32 @@ fn handle_packet(
         return;
     }
 
-    // Unknown peer ⇒ the retail connect handshake (op 0x38, PLAINTEXT; spec §4.1):
-    //   BE 38 | conn_id(6) | 00 00 00 00 | 01 20 | client_pubkey(32) [| zero-pad]
-    // rusty_enet has reassembled the (fragmented, ~40 KB-padded) message; we read
-    // only the leading fields. Bind the connection (FIFO — no psid on the wire) +
-    // reply with our pubkey and the session nonce in the same op-0x38 shape;
-    // thereafter the connection's traffic is ChaCha20 (the shared ECDH key + nonce).
-    const MARKER: u8 = 0xBE;
-    const OP_KEYEXCHANGE: u8 = 0x38;
-    if data.len() >= 46
-        && data[0] == MARKER
-        && data[1] == OP_KEYEXCHANGE
-        && data[12] == 0x01
-        && data[13] == 0x20
+    info!(
+        "arena-enet: {addr} {}B from an unknown peer — NOT an op-0x38 handshake \
+         (b0={:#04x} b1={:#04x} b12={:#04x} b13={:#04x})",
+        data.len(),
+        data.first().copied().unwrap_or(0),
+        data.get(1).copied().unwrap_or(0),
+        data.get(12).copied().unwrap_or(0),
+        data.get(13).copied().unwrap_or(0),
+    );
+}
+
+/// Decode the fixed prefix of the retail plaintext op-0x38 key exchange.
+fn parse_key_exchange(data: &[u8]) -> Option<([u8; 6], [u8; 32])> {
+    if data.len() < 46
+        || data[0] != 0xBE
+        || data[1] != 0x38
+        || data[12] != 0x01
+        || data[13] != 0x20
     {
-        let conn_id = &data[2..8]; // 6-byte per-connection id, echoed back
-        let mut client_pub = [0u8; 32];
-        client_pub.copy_from_slice(&data[14..46]);
-        match registry.admit_connection(addr, &client_pub) {
-            Some((server_pk, nonce)) => {
-                let mut reply = Vec::with_capacity(55);
-                reply.extend_from_slice(&[MARKER, OP_KEYEXCHANGE]);
-                reply.extend_from_slice(conn_id);
-                reply.extend_from_slice(&[0, 0, 0, 1]); // s2c direction (c2s sends 0)
-                reply.extend_from_slice(&[0x01, 0x20]); // pubkey field: tag 0x01, len 32
-                reply.extend_from_slice(&server_pk);
-                reply.push(0x08); // nonce field: len 8
-                reply.extend_from_slice(&nonce);
-                send_to(host, peer_at, &addr, 0, &reply);
-                info!("arena-enet: {addr} admitted (op-0x38 key exchange)");
-            }
-            None => warn!(
-                "arena-enet: {addr} sent op-0x38 handshake but NO match has a free slot \
-                 (active {}, permits {} free) — match reclaimed, never allocated, or FIFO mis-bind?",
-                registry.active_count(),
-                registry.available_permits()
-            ),
-        }
-    } else {
-        info!(
-            "arena-enet: {addr} {}B from an unknown peer — NOT an op-0x38 handshake \
-             (b0={:#04x} b1={:#04x} b12={:#04x} b13={:#04x})",
-            data.len(),
-            data.first().copied().unwrap_or(0),
-            data.get(1).copied().unwrap_or(0),
-            data.get(12).copied().unwrap_or(0),
-            data.get(13).copied().unwrap_or(0),
-        );
+        return None;
     }
+    let mut conn_id = [0u8; 6];
+    conn_id.copy_from_slice(&data[2..8]);
+    let mut client_pub = [0u8; 32];
+    client_pub.copy_from_slice(&data[14..46]);
+    Some((conn_id, client_pub))
 }
 
 /// Send a reliable packet on `channel` to the peer at `addr` (looked up by PeerID).
@@ -509,6 +532,25 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn retail_key_exchange_parser_accepts_only_the_plaintext_handshake() {
+        let mut frame = vec![0u8; 46];
+        frame[0] = 0xBE;
+        frame[1] = 0x38;
+        frame[2..8].copy_from_slice(&[1, 2, 3, 4, 5, 6]);
+        frame[12] = 0x01;
+        frame[13] = 0x20;
+        frame[14..46].copy_from_slice(&[7u8; 32]);
+        assert_eq!(
+            parse_key_exchange(&frame),
+            Some(([1, 2, 3, 4, 5, 6], [7u8; 32]))
+        );
+
+        frame[1] = 0x36;
+        assert_eq!(parse_key_exchange(&frame), None, "encrypted game traffic is not a key exchange");
+        assert_eq!(parse_key_exchange(&frame[..45]), None, "a truncated exchange is rejected");
+    }
+
     /// A rusty_enet test client: connect, then send/recv reliable channel-0 frames.
     struct Client {
         host: ArenaHost,
@@ -524,7 +566,7 @@ mod tests {
             let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
             let mut host = Host::new(
                 BladesEnetSocket::new(sock),
-                HostSettings { peer_limit: 1, ..Default::default() },
+                HostSettings { peer_limit: 2, ..Default::default() },
             )
             .unwrap();
             // Request 7 channels (ch0–6), matching the retail client's CONNECT
@@ -593,6 +635,97 @@ mod tests {
             chacha20_legacy_xor(&mut ud, &c.key, &c.nonce);
             self.send_plain(&ud);
         }
+    }
+
+    fn hs_c2s(pk: &[u8; 32]) -> Vec<u8> {
+        let mut m = vec![
+            0xBE, 0x38, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0, 0, 0, 0, 0x01, 0x20,
+        ];
+        m.extend_from_slice(pk);
+        m
+    }
+
+    /// The exact production failure: matchmaking allocates a fresh match while the
+    /// phone's address still indexes a stuck previous match, then the phone opens a
+    /// new ENet generation and sends plaintext op-0x38 from that same address. The
+    /// new exchange must be answered, not decrypted with the old match key.
+    #[test]
+    fn fresh_key_exchange_replaces_active_match_at_same_address() {
+        let registry = MatchRegistry::new(4);
+        assert!(registry.allocate_with_bots(
+            &["old".to_string()],
+            vec![Default::default(), Default::default()],
+            Uuid::new_v4(),
+            1,
+        ));
+
+        let server_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let mut server = Host::new(
+            BladesEnetSocket::new(server_sock),
+            HostSettings { peer_limit: 4, ..Default::default() },
+        )
+        .unwrap();
+        let mut peer_at = HashMap::new();
+        let mut client = Client::connect(server_addr);
+
+        for _ in 0..2000 {
+            while pump(&mut server, &registry, &mut peer_at) {}
+            server.flush();
+            client.drain();
+            if client.connected {
+                break;
+            }
+        }
+        assert!(client.connected, "first ENet generation connects");
+        let (_, old_pk) = gen_keypair();
+        client.send_plain(&hs_c2s(&old_pk));
+        for _ in 0..2000 {
+            while pump(&mut server, &registry, &mut peer_at) {}
+            server.flush();
+            client.drain();
+            if !client.inbox.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(client.inbox.first().map(Vec::len), Some(55));
+        assert!(registry.is_active(&client.addr()));
+
+        assert!(registry.allocate_with_bots(
+            &["new".to_string()],
+            vec![Default::default(), Default::default()],
+            Uuid::new_v4(),
+            1,
+        ));
+        assert!(registry.has_fresh_connection_reservation(client.addr()));
+        client.reconnect(server_addr);
+        for _ in 0..2000 {
+            while pump(&mut server, &registry, &mut peer_at) {}
+            server.flush();
+            client.drain();
+            if client.connected {
+                break;
+            }
+        }
+        assert!(client.connected, "second ENet generation connects at the same address");
+
+        let (_, new_pk) = gen_keypair();
+        client.send_plain(&hs_c2s(&new_pk));
+        for _ in 0..2000 {
+            while pump(&mut server, &registry, &mut peer_at) {}
+            server.flush();
+            client.drain();
+            if !client.inbox.is_empty() {
+                break;
+            }
+        }
+        assert_eq!(
+            client.inbox.first().map(Vec::len),
+            Some(55),
+            "the fresh plaintext key exchange receives a fresh server key/nonce reply"
+        );
+        assert_eq!(registry.active_count(), 1, "the stuck old solo match was retired");
+        assert!(!registry.has_fresh_connection_reservation(client.addr()));
     }
 
     /// Two rusty_enet clients, a shared 2-player match: both CONNECT, op-0x38
@@ -682,11 +815,6 @@ mod tests {
         // 2. op-0x38 connect handshake. c2s: BE 38 | conn_id(6) | 00000000 | 01 20 |
         //    client_pubkey(32). s2c reply also carries 08 | nonce(8) after the pubkey.
         //    No psid in the handshake — admit_connection FIFO-binds to the open match.
-        fn hs_c2s(pk: &[u8; 32]) -> Vec<u8> {
-            let mut m = vec![0xBE, 0x38, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0, 0, 0, 0, 0x01, 0x20];
-            m.extend_from_slice(pk);
-            m
-        }
         let (sk_a, pk_a) = gen_keypair();
         let (sk_b, pk_b) = gen_keypair();
         a.send_plain(&hs_c2s(&pk_a));

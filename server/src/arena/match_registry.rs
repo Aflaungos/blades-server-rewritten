@@ -134,6 +134,19 @@ struct Match {
 }
 
 impl Match {
+    /// Whether this reservation may still accept a brand-new ENet connection.
+    ///
+    /// A match that filled once is never a matchmaking target again. After one
+    /// player leaves it intentionally remains alive long enough to deliver the
+    /// concession/result walk to the survivor, but its vacant peer slot is not a
+    /// lobby seat. Admitting a re-queued client there mixes the previous match's
+    /// crypto/state with the new ticket and strands the client at "Setting Up".
+    fn accepts_new_connection(&self) -> bool {
+        !self.reached_capacity
+            && self.instance.is_connecting()
+            && self.players.len() < self.capacity
+    }
+
     /// True once every connected peer has an authoritative fighter slot (and the
     /// match is actually full — a half-connected match is the connect gate's problem,
     /// not this one's).
@@ -296,6 +309,15 @@ impl Match {
     fn peer_for_slot(&mut self, slot: usize) -> Option<SocketAddr> {
         if let Some((addr, _)) = self.peer_to_slot.iter().find(|&(_, &s)| s == slot) {
             return Some(*addr);
+        }
+        // Once any peer has been authoritatively placed, a missing slot means that
+        // fighter has no connected peer (a bot, not-yet-connected opponent, or a
+        // departed player). `players` is compacted on departure, so indexing that
+        // vector by fighter slot can otherwise redirect the departed slot's frames to
+        // the survivor. That produces duplicate/conflicting result-state updates and
+        // can strand the survivor instead of returning it to the lobby.
+        if !self.peer_to_slot.is_empty() {
+            return None;
         }
         let fallback = self.players.get(slot)?.addr;
         if !self.misaddress_logged {
@@ -662,10 +684,15 @@ impl MatchRegistry {
         peer: SocketAddr,
         client_pub: &[u8; 32],
     ) -> Option<([u8; 32], [u8; 8])> {
+        // A phone commonly reuses its UDP source address when it returns to the
+        // lobby and queues again. The caller removes the old live generation before
+        // reaching this method; excluding it here is a second guard against ever
+        // appending the fresh key exchange to its previous match.
+        let previous = self.addr_index.lock().unwrap().get(&peer).copied();
         let mut matches = self.matches.lock().unwrap();
         let gsid = matches
             .values()
-            .filter(|m| m.players.len() < m.capacity)
+            .filter(|m| Some(m.game_session_id) != previous && m.accepts_new_connection())
             .min_by_key(|m| (!m.expected_ip_to_slot.contains_key(&peer.ip()), m.order))
             .map(|m| m.game_session_id)?;
         let m = matches.get_mut(&gsid).expect("just selected");
@@ -713,6 +740,18 @@ impl MatchRegistry {
             m.capacity
         );
         Some((server_pk, nonce))
+    }
+
+    /// True when `peer` has a newly allocated reservation distinct from the match
+    /// currently owning that address. Used by the live ENet host to distinguish a
+    /// fresh plaintext op-0x38 key exchange from a duplicate frame belonging to the
+    /// active generation.
+    pub fn has_fresh_connection_reservation(&self, peer: SocketAddr) -> bool {
+        let current = self.addr_index.lock().unwrap().get(&peer).copied();
+        self.matches.lock().unwrap().values().any(|m| {
+            Some(m.game_session_id) != current
+                && m.accepts_new_connection()
+        })
     }
 
     /// Raw-socket dev path ([`udp::UdpServer`]). The whole ENet datagram is walked
@@ -1513,6 +1552,104 @@ mod tests {
         );
         assert!(reg.is_active(&old_peer));
         assert!(!reg.is_active(&new_peer));
+    }
+
+    /// Once a match has filled, a later vacancy belongs to its result/concession
+    /// walk. It must never become the oldest "free slot" selected for somebody's
+    /// next matchmaking ticket.
+    #[test]
+    fn departed_filled_match_is_not_reused_for_a_new_connection() {
+        let reg = MatchRegistry::new(4);
+        let old_gsid = Uuid::new_v4();
+        assert!(reg.allocate(
+            &["old-a".to_string(), "old-b".to_string()],
+            vec![Loadout::default(), Loadout::default()],
+            old_gsid,
+        ));
+        let a: SocketAddr = "10.99.0.47:41000".parse().unwrap();
+        let b: SocketAddr = "10.99.0.48:42000".parse().unwrap();
+        reg.admit_connection(a, &[3u8; 32]).expect("old A admitted");
+        reg.admit_connection(b, &[5u8; 32]).expect("old B admitted");
+        reg.peer_departed(&b, Instant::now());
+
+        let new_gsid = Uuid::new_v4();
+        assert!(reg.allocate_with_bots(
+            &["new-b".to_string()],
+            vec![Loadout::default(), Loadout::default()],
+            new_gsid,
+            1,
+        ));
+        reg.admit_connection(b, &[7u8; 32]).expect("new B admitted");
+
+        let addr_index = reg.addr_index.lock().unwrap();
+        assert_eq!(
+            addr_index.get(&b),
+            Some(&new_gsid),
+            "the re-queued peer must enter its fresh reservation, not the vacant old match"
+        );
+        drop(addr_index);
+        let matches = reg.matches.lock().unwrap();
+        assert_eq!(matches.get(&old_gsid).unwrap().players.len(), 1);
+        assert_eq!(matches.get(&new_gsid).unwrap().players.len(), 1);
+    }
+
+    /// A fresh op-0x38 may arrive from the exact address still indexing a stuck
+    /// previous match. The live host uses this predicate to retire the old generation
+    /// before admitting the new key exchange.
+    #[test]
+    fn active_address_detects_and_enters_a_fresh_reservation() {
+        let reg = MatchRegistry::new(4);
+        let old_gsid = Uuid::new_v4();
+        let addr: SocketAddr = "109.56.118.105:44853".parse().unwrap();
+        assert!(reg.allocate_with_bots(
+            &["old".to_string()],
+            vec![Loadout::default(), Loadout::default()],
+            old_gsid,
+            1,
+        ));
+        reg.admit_connection(addr, &[3u8; 32]).expect("old peer admitted");
+
+        let new_gsid = Uuid::new_v4();
+        assert!(reg.allocate_with_bots(
+            &["new".to_string()],
+            vec![Loadout::default(), Loadout::default()],
+            new_gsid,
+            1,
+        ));
+        assert!(
+            reg.has_fresh_connection_reservation(addr),
+            "the active address must recognize the separately allocated next match"
+        );
+
+        reg.peer_departed(&addr, Instant::now());
+        reg.admit_connection(addr, &[5u8; 32]).expect("re-queued peer admitted");
+        assert_eq!(reg.active_count(), 1, "the empty stuck match is retired");
+        assert_eq!(reg.addr_index.lock().unwrap().get(&addr), Some(&new_gsid));
+    }
+
+    #[test]
+    fn departed_fighter_slot_is_not_redirected_to_the_survivor() {
+        let reg = MatchRegistry::new(4);
+        let gsid = Uuid::new_v4();
+        assert!(reg.allocate(
+            &["slot-zero".to_string(), "slot-one".to_string()],
+            vec![Loadout::default(), Loadout::default()],
+            gsid,
+        ));
+        let departed: SocketAddr = "10.99.0.47:41000".parse().unwrap();
+        let survivor: SocketAddr = "10.99.0.48:42000".parse().unwrap();
+        reg.admit(departed, "slot-zero", &[3u8; 32]).expect("slot 0 admitted");
+        reg.admit(survivor, "slot-one", &[5u8; 32]).expect("slot 1 admitted");
+        reg.peer_departed(&departed, Instant::now());
+
+        let mut matches = reg.matches.lock().unwrap();
+        let m = matches.get_mut(&gsid).unwrap();
+        assert_eq!(
+            m.peer_for_slot(0),
+            None,
+            "slot 0 left; compacting players must not make slot 1 receive its frames"
+        );
+        assert_eq!(m.peer_for_slot(1), Some(survivor));
     }
 
     /// A match that FILLED and then lost one player must not be reclaimed as if
