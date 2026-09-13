@@ -863,9 +863,17 @@ impl MatchRegistry {
         if let Some(gmid) = user_message_gmid {
             player.last_user_message_gmid = Some(gmid);
             if gmid == arena_proto::GameMessageId::MatchStateChangeAck as u8 {
-                player.last_match_state_ack = arena_proto::parse_netdata(&plain[2..])
-                    .string(4)
-                    .map(str::to_owned);
+                player.last_match_state_ack = Some(
+                    match arena_proto::parse_netdata(&plain[2..]).string(4) {
+                        Some("BackendMatchCreated") => "BackendMatchCreated",
+                        Some("StateTimeout") => "StateTimeout",
+                        Some("NextState") => "NextState",
+                        Some("RoundEnd") => "RoundEnd",
+                        Some(_) => "Other",
+                        None => "Malformed",
+                    }
+                    .to_owned(),
+                );
             }
         }
 
