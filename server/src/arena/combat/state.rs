@@ -2095,6 +2095,10 @@ pub struct MatchCombat {
     /// `Idle`; the FSM drives it through `WaitingForPlayers`(3)→`InitialPlayerSetup`(4)
     /// →`BackendMatchCreation`(5) at round start (the player-binding gate).
     pub match_state: MatchState,
+    /// `CurrentMatchStateTimeout` (propId6) paired with `match_state`. The same
+    /// MatchState can carry different authored timeouts in round 0 and between
+    /// rounds, so transport recovery must retain the exact value, not infer it.
+    pub match_state_timeout_secs: f32,
     /// The match's `gameSessionId` (Match net-object propId9). Set by `MatchInstance`
     /// from the registry; a nil UUID until then (the binding gate is propId5, not 9).
     pub game_session_id: String,
@@ -2188,6 +2192,7 @@ impl MatchCombat {
             flow_controller_id: 560, // matches captured flow-controller id range
             match_net_object_id: 0,  // assigned by MatchInstance::new
             match_state: MatchState::Idle,
+            match_state_timeout_secs: 0.0,
             game_session_id: String::new(), // set by MatchInstance::new from the registry
             channels: Vec::new(),
             next_net_object_id: 564, // matches captured combat-actor id range

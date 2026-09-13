@@ -408,8 +408,15 @@ fn handle_packet(
     // decrypting to a valid marker/opcode, migrate the address, and process the
     // packet normally. The old ENet Disconnect becomes harmless because its
     // address is no longer indexed.
-    if let Some(old_addr) = registry.rebind_encrypted_peer(addr, data) {
-        info!("arena-enet: recovered mobile peer address {old_addr} → {addr}");
+    if let Some(rebind) = registry.rebind_encrypted_peer(addr, data) {
+        info!(
+            "arena-enet: recovered mobile peer address {} → {addr}; replaying {} current-state frame(s)",
+            rebind.old_addr,
+            rebind.replay.len(),
+        );
+        for (channel, bytes) in &rebind.replay {
+            send_to(host, peer_at, &addr, *channel, bytes);
+        }
         handle_packet(host, registry, peer_at, addr, data);
         return;
     }
@@ -726,6 +733,128 @@ mod tests {
         );
         assert_eq!(registry.active_count(), 1, "the stuck old solo match was retired");
         assert!(!registry.has_fresh_connection_reservation(client.addr()));
+    }
+
+    /// End-to-end reproduction of the mobile setup failure: the app-level crypto
+    /// session survives, but ENet reconnects from a new UDP source port after the
+    /// authoritative server has already reached InRound. Reliable commands queued
+    /// on the old PeerID cannot cross that boundary, so the replacement must receive
+    /// an explicit current-state replay on its own ENet generation.
+    #[test]
+    fn encrypted_mobile_rebind_receives_live_state_replay_over_new_enet_peer() {
+        let registry = MatchRegistry::new(4);
+        assert!(registry.allocate_with_bots(
+            &["mobile-player".to_string()],
+            vec![Default::default(), Default::default()],
+            Uuid::new_v4(),
+            1,
+        ));
+
+        let server_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let mut server = Host::new(
+            BladesEnetSocket::new(server_sock),
+            HostSettings {
+                peer_limit: 4,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let mut peer_at = HashMap::new();
+        let mut old = Client::connect(server_addr);
+
+        for _ in 0..2000 {
+            while pump(&mut server, &registry, &mut peer_at) {}
+            server.flush();
+            old.drain();
+            if old.connected {
+                break;
+            }
+        }
+        assert!(old.connected);
+
+        let (client_sk, client_pk) = gen_keypair();
+        old.send_plain(&hs_c2s(&client_pk));
+        for _ in 0..2000 {
+            while pump(&mut server, &registry, &mut peer_at) {}
+            server.flush();
+            old.drain();
+            if !old.inbox.is_empty() {
+                break;
+            }
+        }
+        let reply = old.inbox.first().expect("key exchange reply");
+        let mut server_pk = [0u8; 32];
+        server_pk.copy_from_slice(&reply[14..46]);
+        let mut nonce = [0u8; 8];
+        nonce.copy_from_slice(&reply[47..55]);
+        old.crypto = Some(CryptoCtx {
+            key: x25519_shared(&client_sk, &server_pk),
+            nonce,
+        });
+        old.inbox.clear();
+
+        let mut vnow = std::time::Instant::now();
+        for _ in 0..160 {
+            while pump(&mut server, &registry, &mut peer_at) {}
+            vnow += Duration::from_millis(250);
+            for (addr, channel, bytes) in registry.tick_matches(vnow) {
+                send_to(&mut server, &peer_at, &addr, channel, &bytes);
+            }
+            server.flush();
+            old.drain();
+            if old.inbox.iter().any(|m| m.ends_with(b"StateTimeout")) {
+                break;
+            }
+        }
+        assert_eq!(registry.debug_list()[0].phase, "StateTimeout");
+
+        let mut replacement = Client::connect(server_addr);
+        replacement.crypto = old.crypto.clone();
+        assert_ne!(replacement.addr(), old.addr(), "new mobile source port");
+        for _ in 0..2000 {
+            while pump(&mut server, &registry, &mut peer_at) {}
+            server.flush();
+            replacement.drain();
+            if replacement.connected {
+                break;
+            }
+        }
+        assert!(replacement.connected);
+
+        let mut ack = crate::arena::combat::messages::match_state_change_ack(560, "StateTimeout");
+        ack[0] = 0x84;
+        replacement.send_enc_payload(&ack);
+        for _ in 0..2000 {
+            while pump(&mut server, &registry, &mut peer_at) {}
+            server.flush();
+            old.drain();
+            replacement.drain();
+            let saw_inround = replacement.inbox.iter().any(|m| {
+                m.get(1) == Some(&0x35)
+                    && arena_proto::parse_netdata(&m[2..]).int(5)
+                        == Some(crate::arena::combat::state::MatchState::InRound as i64)
+            });
+            let saw_flow = replacement
+                .inbox
+                .iter()
+                .any(|m| m.ends_with(b"StateTimeout"));
+            if saw_inround && saw_flow {
+                break;
+            }
+        }
+        assert!(replacement.inbox.iter().any(|m| {
+            m.get(1) == Some(&0x35)
+                && arena_proto::parse_netdata(&m[2..]).int(5)
+                    == Some(crate::arena::combat::state::MatchState::InRound as i64)
+        }));
+        assert!(replacement
+            .inbox
+            .iter()
+            .any(|m| m.ends_with(b"StateTimeout")));
+        let peer = &registry.debug_list()[0].peers[0];
+        assert_eq!(peer.rebind_count, 1);
+        assert_eq!(peer.last_match_state_ack.as_deref(), Some("StateTimeout"));
     }
 
     /// Two rusty_enet clients, a shared 2-player match: both CONNECT, op-0x38
