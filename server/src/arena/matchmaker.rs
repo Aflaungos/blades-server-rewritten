@@ -2227,7 +2227,7 @@ fn derive_player_session_ids(game_session_id: Uuid, count: usize) -> Vec<String>
 ///     avatars → each client renders the opponent with its OWN appearance;
 ///   - **an empty UUID** (a `starter()` fallback on a slow/missing `load_loadout`)
 ///     → `spawn_avatar` emits `propId4 = ""`, which can't bind a distinct opponent
-///     AND drops the opponent profile (`broadcast_profiles` skips empty profiles).
+///     AND drops the opponent profile (the round-start relay skips empty profiles).
 ///
 /// Mirrors the existing ghost-path [`is_self_match`] guard, but for the human pair.
 /// `Ok(())` when every fighter has a distinct, non-empty `character_uuid`; otherwise
@@ -2266,7 +2266,7 @@ fn check_paired_uuids_distinct(loadouts: &[crate::arena::combat::Loadout]) -> Re
 /// value collapses identity just as thoroughly, and it fails in a way that is easy to
 /// ship by accident, because [`loadout::starter`] — the fallback whenever a character
 /// load is slow, errors, or the row is missing — has an EMPTY profile:
-///   - **empty** → `broadcast_profiles` skips that fighter, so the opponent never gets
+///   - **empty** → the profile relay skips that fighter, so the opponent never gets
 ///     an op54 profile at all and the client leaves the opponent body wearing whatever
 ///     it already has (the local character's customization);
 ///   - **identical** → both clients dress both avatars from the same blob.
@@ -2281,7 +2281,7 @@ fn check_paired_profiles_present_and_distinct(
         if lo.profile_character_json.is_empty() {
             return Err(format!(
                 "fighter {i} (\"{}\", char {}) has an EMPTY profile_character_json — a degraded \
-                 loadout::starter() fallback. broadcast_profiles skips empty profiles, so the \
+                 loadout::starter() fallback. The profile relay skips empty profiles, so the \
                  opponent never receives this fighter's op54 PROFILE and renders its body with \
                  the LOCAL character's appearance.",
                 lo.display_name, lo.character_uuid,
@@ -2909,7 +2909,7 @@ async fn resolve(
 
     // DEBUG GHOST (`ARENA_DEBUG_GHOST`): in the solo-fallback path (bots >= 1) the
     // bot fighter(s) otherwise fall back to `loadout::starter()`, whose
-    // `profile_character_json` is EMPTY → the engine's `broadcast_profiles` skips it
+    // `profile_character_json` is EMPTY → the engine's profile relay skips it
     // → the client never receives the opponent's op54 PROFILE (GameMessageId 35) →
     // `ClientChecklist.OpponentLoadoutReady` never flips → "Connecting…" forever.
     // When a ghost user_id is configured, load THAT real character into the bot
@@ -4144,7 +4144,7 @@ mod tests {
     /// The symmetric half of the guard: distinct `character_uuid`s are necessary but
     /// NOT sufficient. The op54 PROFILE is the blob the client dresses the avatar
     /// from, and a bare `loadout::starter()` fallback carries an EMPTY one — which
-    /// `broadcast_profiles` skips, so the opponent's body keeps the local character's
+    /// the round-start profile relay skips, so the opponent's body keeps the local character's
     /// appearance even though every UUID was distinct.
     #[test]
     fn paired_profile_presence_guard() {
