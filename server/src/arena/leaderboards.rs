@@ -31,10 +31,13 @@
 //! # Ranking source
 //!
 //! The active season's bounded slice of `arena_match_results`, not the character's
-//! lifetime/current JSON. The latest result supplies the cup total, while windowed
-//! counts supply current-season wins. This excludes characters carried over from an
-//! old season and admits a participant who played this season but finished on zero
-//! cups. Bot opponents have no result row and therefore cannot enter the board.
+//! lifetime/current JSON. Trophy deltas are replayed from a zero season baseline
+//! (including the floor at zero), while windowed counts supply current-season wins.
+//! Replaying is intentional: late imports used to carry retail trophies into their
+//! first local result, making the stored `trophies_after` inconsistent with the
+//! season-scoped win count. This excludes that inherited balance, excludes characters
+//! carried over from an old season, and admits a participant who played this season
+//! but finished on zero cups. Bot opponents have no result row and cannot enter.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -133,17 +136,37 @@ const RANKED_CTE: &str = "
         ORDER BY starts_at DESC
         LIMIT 1
     ),
-    season_matches AS (
+    season_deltas AS (
         SELECT r.character_id,
-               r.trophies_after AS score,
+               r.recorded_at,
+               r.id,
+               (SUM(r.trophy_delta) OVER (
+                   PARTITION BY r.character_id
+                   ORDER BY r.recorded_at, r.id
+                   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+               ))::bigint AS raw_score,
                COUNT(*) FILTER (WHERE r.win) OVER (PARTITION BY r.character_id) AS wins,
                ROW_NUMBER() OVER (
                    PARTITION BY r.character_id ORDER BY r.recorded_at DESC, r.id DESC
                ) AS latest
         FROM arena_match_results r
         JOIN active_season s
-          ON r.recorded_at >= to_timestamp(s.starts_at)
+         ON r.recorded_at >= to_timestamp(s.starts_at)
          AND r.recorded_at < to_timestamp(s.cutoff)
+    ),
+    season_matches AS (
+        SELECT character_id,
+               raw_score - LEAST(
+                   0,
+                   MIN(raw_score) OVER (
+                       PARTITION BY character_id
+                       ORDER BY recorded_at, id
+                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                   )
+               ) AS score,
+               wins,
+               latest
+        FROM season_deltas
     ),
     ranked AS (
         SELECT c.id,
