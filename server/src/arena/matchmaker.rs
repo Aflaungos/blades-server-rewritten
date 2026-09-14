@@ -25,7 +25,8 @@ use actix_web::{
 use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::pooled_connection::bb8::PooledConnection;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use log::{info, warn};
+use futures_util::FutureExt;
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use uuid::Uuid;
@@ -2459,7 +2460,33 @@ impl ArenaGlobal {
         let mm_cfg = config.clone();
         let mm_reg = registry.clone();
         actix_web::rt::spawn(async move {
-            matchmaker_loop(rx, mm_cfg, mm_reg, Some(db_pool)).await;
+            // A closed receiver makes every future `/matches/create` fail as
+            // 503-4-2 while `/healthz` and the rest of HTTP keep returning 200.
+            // There is no useful degraded mode: the sender stored in ArenaGlobal
+            // cannot be attached to a replacement receiver. Treat either a panic or
+            // an unexpected clean exit as a process-level failure so Docker's
+            // `restart: always` starts a coherent arena again. The panic hook retains
+            // the original panic and backtrace in journald before this branch runs.
+            let outcome = std::panic::AssertUnwindSafe(matchmaker_loop(
+                rx,
+                mm_cfg,
+                mm_reg,
+                Some(db_pool),
+            ))
+            .catch_unwind()
+            .await;
+            match outcome {
+                Ok(()) => error!(
+                    "matchmaker: actor exited while the arena process was still alive; terminating process for a clean restart"
+                ),
+                Err(_) => error!(
+                    "matchmaker: actor panicked; terminating process for a clean restart"
+                ),
+            }
+            // 70 = EX_SOFTWARE. `process::exit` is intentional here: this task is
+            // the only owner of the receiver, so continuing can only serve permanent
+            // 503-4-2 responses until an operator happens to restart the container.
+            std::process::exit(70);
         });
         // The live ENet arena host (tokio-enet) is spawned from main() once
         // ServerGlobal exists (it needs the shared Arc). `udp.rs`'s raw-socket
