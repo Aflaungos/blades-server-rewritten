@@ -47,7 +47,7 @@ use actix_web::{
     web::{self, Json},
 };
 use blades_lib::{
-    economy::{RewardGrant, apply_reward},
+    economy::{RewardGrant, apply_reward, consume_stackable},
     server_state::{AbyssRun, AbyssSliceEntry},
     user_data::{CompleteCharacterWithIdWithoutData, CompleteInventory, CompleteInventoryUpdate,
                 CompleteWallet, DungeonGeneratedData, InventoryChangeTracker},
@@ -301,10 +301,10 @@ struct ReviveAction {
 /// The six `/update` action types the client actually sends.
 ///
 /// Only one arm used to exist (`EnemyKilled`); the other five fell into `Unknown` and
-/// were dropped, `abyss_slice_completed` — the floor-advance signal — among them. The
-/// The two arms not acted on yet (`enemy_loot_collected`, `item_consumed`) are named
-/// rather than swallowed so the next change can see them, and so a body carrying them
-/// is not silently reduced to "unknown".
+/// were dropped, `abyss_slice_completed` — the floor-advance signal — among them.
+/// The one arm not acted on yet (`enemy_loot_collected`) is named rather than swallowed
+/// so the next change can see it, and so a body carrying it is not silently reduced to
+/// "unknown".
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct CombatCompletedAction {
@@ -320,6 +320,20 @@ struct CombatCompletedAction {
 struct DurabilityUpdate {
     id: Uuid,
     durability: f64,
+}
+
+/// A potion or food used during the current run.
+///
+/// The client names the stackable template, never an instanced inventory id. Only a
+/// currently equipped consumable is eligible, and the server debits its own backpack
+/// count instead of trusting a request-side quantity.
+#[derive(Deserialize, Debug)]
+#[serde(rename_all = "camelCase")]
+struct ItemConsumedAction {
+    item_template_id: Uuid,
+    #[allow(dead_code)]
+    #[serde(default)]
+    time: u64,
 }
 
 #[derive(Deserialize, Debug)]
@@ -340,9 +354,8 @@ enum AbyssUpdateAction {
     /// generate abyss enemy loot at all (see the follow-ups in the PR).
     #[allow(dead_code)]
     EnemyLootCollected(Value),
-    /// A potion/food used mid-run. Not applied yet.
-    #[allow(dead_code)]
-    ItemConsumed(Value),
+    /// A potion/food used mid-run. The server removes one owned, equipped stack.
+    ItemConsumed(ItemConsumedAction),
     #[serde(other)]
     Unknown,
 }
@@ -400,6 +413,16 @@ pub async fn update_abyss(
                 let revive_count = run.revive_count;
                 let future_rewards = build_future_rewards(&app_state);
                 apply_combat_durability(&body.actions, &mut entry.inventory.0, &mut tracker);
+                let consumed = apply_item_consumption(
+                    &body.actions,
+                    &mut entry.inventory.0,
+                    &mut tracker,
+                );
+                if consumed > 0 {
+                    // Retail increments once per inventory-mutating request, not once
+                    // per action in the batch.
+                    entry.inventory.0.backpack_version += 1;
+                }
 
                 save_economy(&mut conn, character_id, &entry).await?;
 
@@ -867,11 +890,9 @@ fn apply_actions(
                 run.revive_count += 1;
             }
             // Inventory changes are applied separately from run scoring below.
-            AbyssUpdateAction::CombatCompleted(_) => {}
+            AbyssUpdateAction::CombatCompleted(_) | AbyssUpdateAction::ItemConsumed(_) => {}
             // Parsed, named, and deliberately not acted on yet — see the enum's doc.
-            AbyssUpdateAction::EnemyLootCollected(_)
-            | AbyssUpdateAction::ItemConsumed(_)
-            | AbyssUpdateAction::Unknown => {}
+            AbyssUpdateAction::EnemyLootCollected(_) | AbyssUpdateAction::Unknown => {}
         }
     }
 }
@@ -917,6 +938,46 @@ fn apply_combat_durability(
         }
     }
     changed
+}
+
+/// Debit one backpack stack for each valid `item_consumed` action.
+///
+/// The equipped-list check prevents an arbitrary material UUID from being destroyed by
+/// a malformed request, while `consume_stackable` prevents the client from consuming an
+/// item it does not own and records the exact inventory diff the response must carry.
+/// Invalid actions stay lenient: ignoring them avoids turning a stale client action into
+/// a generic network error, but never creates inventory or grants an effect.
+fn apply_item_consumption(
+    actions: &[AbyssUpdateAction],
+    inventory: &mut CompleteInventory,
+    tracker: &mut InventoryChangeTracker,
+) -> usize {
+    let mut consumed = 0;
+    for action in actions {
+        let AbyssUpdateAction::ItemConsumed(action) = action else {
+            continue;
+        };
+        if !inventory
+            .loadout
+            .equipped_consumables
+            .contains(&action.item_template_id)
+        {
+            log::warn!(
+                "abyss: ignored item_consumed for unequipped template {}",
+                action.item_template_id
+            );
+            continue;
+        }
+        match consume_stackable(inventory, action.item_template_id, 1, tracker) {
+            Ok(()) => consumed += 1,
+            Err(error) => log::warn!(
+                "abyss: ignored item_consumed for unavailable template {}: {}",
+                action.item_template_id,
+                error
+            ),
+        }
+    }
+    consumed
 }
 
 /// The `killScoreMultiplier` used when the server cannot identify the enemy variant.
@@ -1741,6 +1802,46 @@ mod tests {
             update.loadout.equipped_items.0[&slot].item.durability,
             75.0,
             "the client diff must carry the changed durability"
+        );
+    }
+
+    #[test]
+    fn item_consumed_debits_only_owned_equipped_stackables() {
+        let potion = Uuid::new_v4();
+        let unequipped = Uuid::new_v4();
+        let mut inventory = CompleteInventory {
+            backpack: Default::default(),
+            loadout: Default::default(),
+            treasury: Default::default(),
+            overflow_treasury: Default::default(),
+            backpack_version: 0,
+            treasury_version: 0,
+        };
+        inventory.backpack.stackable_items.add(potion, 2);
+        inventory.backpack.stackable_items.add(unequipped, 4);
+        inventory.loadout.equipped_consumables.push(potion);
+
+        let actions = parse_actions(serde_json::json!([
+            {"type": "item_consumed", "itemTemplateId": potion, "time": 1},
+            {"type": "item_consumed", "itemTemplateId": potion, "time": 2},
+            {"type": "item_consumed", "itemTemplateId": potion, "time": 3},
+            {"type": "item_consumed", "itemTemplateId": unequipped, "time": 4}
+        ]));
+        let mut tracker = InventoryChangeTracker::default();
+
+        assert_eq!(
+            apply_item_consumption(&actions, &mut inventory, &mut tracker),
+            2,
+            "two owned potions are consumed; unavailable/unequipped actions are ignored"
+        );
+        assert_eq!(inventory.backpack.stackable_items.count(potion), 0);
+        assert_eq!(inventory.backpack.stackable_items.count(unequipped), 4);
+        assert!(tracker.modified_backpack.stackable_items.contains(&potion));
+
+        let update = inventory.generate_client_update(&tracker);
+        assert!(
+            update.backpack.removed_stackable_items.contains(&potion),
+            "consuming the final potion must remove it in the client diff"
         );
     }
 
