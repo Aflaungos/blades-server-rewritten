@@ -167,7 +167,7 @@ Paths are il2cpp's, from the `URL_PATH` constants on the request classes in
 | GET | `/guilds/current` | member | `{guild, members}` |
 | POST/PUT | `/guilds/current` | **GM** | `{guild, members}` |
 | GET | `/guilds/current/messages` | member | `{guildMessageBoard}` or `{}` |
-| POST | `/guilds/current/messages` | member | `{guildMessageBoard}` |
+| POST | `/guilds/current/messages` | member | `{guildMessageBoard: [posted message]}` |
 | GET | `/guilds/current/applications` | **GM** | `{guildApplications}` |
 | POST | `/guilds/current/approve/{userId}` | **GM** | `{member}` |
 | POST | `/guilds/current/deny/{userId}` | **GM** | `{}` |
@@ -199,6 +199,9 @@ Plus the pre-existing exchange endpoints under `/guilds/current/exchanges`.
   captured `page=1` carried exactly 100, ranked 1..100.
 - **Empty message windows return the literal `{}`**, not
   `{"guildMessageBoard": []}`. 23 captured polls confirm it.
+- **Posting returns only the newly created message**, not a refreshed page of
+  history. All 64 captured POST responses have a one-entry `guildMessageBoard`;
+  the client appends and enriches that entry before releasing the guild UI.
 - **Message paging** takes `oldestCreationTime` (exclusive lower bound — "what's
   new since?") and `newestCreationTime` (exclusive upper bound — "let me scroll
   back"). The client polls with a steadily increasing `oldestCreationTime`.
