@@ -226,9 +226,10 @@ pub fn award_payload(kind: &str, tier: &str, rank: i32) -> Value {
 
 /// Live standings for every character that scored, best first.
 ///
-/// Reads the final in-window cup total, match count, and sticky Arena high-water
-/// from `arena_match_results`, which is already durable per match. Current
-/// character JSON is deliberately not a season boundary.
+/// Replays the in-window trophy deltas from zero (including the zero floor), and
+/// reads the match count from `arena_match_results`, which is already durable per
+/// match. Current character JSON and imported `trophies_after` baselines are
+/// deliberately not season boundaries.
 pub async fn freeze_standings(
     conn: &mut AsyncPgConnection,
     season: &SeasonRow,
@@ -245,10 +246,6 @@ pub async fn freeze_standings(
         wins: i64,
         #[diesel(sql_type = diesel::sql_types::BigInt)]
         high_water: i64,
-        #[diesel(sql_type = diesel::sql_types::Integer)]
-        arena: i32,
-        #[diesel(sql_type = diesel::sql_types::Integer)]
-        arena_level: i32,
         #[diesel(sql_type = diesel::sql_types::Nullable<diesel::sql_types::Text>)]
         guild_id: Option<String>,
     }
@@ -257,14 +254,20 @@ pub async fn freeze_standings(
     // already belong to the next season when a delayed/retried close runs, and
     // lifetime aggregation made every old match appear in every new season.
     //
-    // The last audit row supplies trophies AND sticky Arena high-water as they
-    // stood at the cutoff. This also admits a participant who finished at zero
-    // cups; retail still paid the highest-Arena participation reward.
+    // Replay deltas from the season's required zero baseline. `trophies_after`
+    // cannot be trusted here because a character imported after season start used
+    // to carry retail cups into its first result; counting only local wins beside
+    // that inherited total produced impossible standings (including cups with zero
+    // wins). The running-prefix minimum implements the per-result `max(0)` clamp:
+    // final = raw_sum - min(0, lowest_prefix_sum).
     let cutoff = season.ends_at.min(super::arena_season::now_unix());
     let rows: Vec<Row> = diesel::sql_query(
-        "WITH season_matches AS ( \
-             SELECT character_id, trophies_after AS trophies, \
-                    matchmaking_trophies_after AS high_water, arena, arena_level, \
+        "WITH season_deltas AS ( \
+             SELECT character_id, recorded_at, id, \
+                    (SUM(trophy_delta) OVER ( \
+                        PARTITION BY character_id ORDER BY recorded_at, id \
+                        ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW \
+                    ))::bigint AS raw_score, \
                     COUNT(*) OVER (PARTITION BY character_id) AS matches, \
                     COUNT(*) FILTER (WHERE win) OVER (PARTITION BY character_id) AS wins, \
                     ROW_NUMBER() OVER ( \
@@ -273,10 +276,23 @@ pub async fn freeze_standings(
              FROM arena_match_results \
              WHERE recorded_at >= to_timestamp($1) \
                AND recorded_at < to_timestamp($2) \
+         ), season_scores AS ( \
+             SELECT character_id, recorded_at, id, matches, wins, latest, \
+                    raw_score - LEAST( \
+                        0, \
+                        MIN(raw_score) OVER ( \
+                            PARTITION BY character_id ORDER BY recorded_at, id \
+                            ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW \
+                        ) \
+                    ) AS trophies \
+             FROM season_deltas \
+         ), season_matches AS ( \
+             SELECT character_id, trophies, matches, wins, latest, \
+                    MAX(trophies) OVER (PARTITION BY character_id) AS high_water \
+             FROM season_scores \
          ) \
          SELECT c.id AS character_id, m.trophies, m.matches, m.wins, \
-                m.high_water, m.arena, m.arena_level, \
-                gm.guild_id AS guild_id \
+                m.high_water, gm.guild_id AS guild_id \
          FROM season_matches m \
          JOIN characters c ON c.id = m.character_id \
          LEFT JOIN guild_members gm ON gm.character_id = c.id \
@@ -291,17 +307,20 @@ pub async fn freeze_standings(
     Ok(rows
         .into_iter()
         .enumerate()
-        .map(|(i, r)| StandingRow {
-            season_id: season.id,
-            character_id: r.character_id,
-            rank: (i as i32) + 1,
-            trophies: r.trophies,
-            matches: r.matches as i32,
-            wins: r.wins as i32,
-            guild_id: r.guild_id,
-            high_water: r.high_water,
-            arena: r.arena,
-            arena_level: r.arena_level,
+        .map(|(i, r)| {
+            let tier = super::arena_ladder::tier_for_trophies(r.high_water);
+            StandingRow {
+                season_id: season.id,
+                character_id: r.character_id,
+                rank: (i as i32) + 1,
+                trophies: r.trophies,
+                matches: r.matches as i32,
+                wins: r.wins as i32,
+                guild_id: r.guild_id,
+                high_water: r.high_water,
+                arena: tier.arena as i32,
+                arena_level: tier.level as i32,
+            }
         })
         .collect())
 }

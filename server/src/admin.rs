@@ -42,7 +42,7 @@ use blades_lib::{
         UserAccount,
     },
 };
-use diesel::{OptionalExtension, ExpressionMethods, QueryDsl, SelectableHelper, insert_into};
+use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper, insert_into};
 use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt};
 use log::warn;
 use serde::{Deserialize, Serialize};
@@ -60,7 +60,9 @@ use crate::{
         CharacterDbAlone, CharacterDbEntry, CharacterDbEntryCharacterAlone,
         CharacterDbEntryEconomy, QuestDbEntry, UserDBEntry,
     },
-    schema::{arena_ai_mimic_control, arena_ai_mimics, characters, quests, users},
+    schema::{
+        arena_ai_mimic_control, arena_ai_mimics, arena_seasons, characters, quests, users,
+    },
 };
 
 // service id used in the BladeApiError envelope for this dev endpoint. Not a
@@ -160,6 +162,24 @@ pub struct ImportCharacterResponse {
     pub created: bool,
 }
 
+/// Put an imported/restored character on the season that is live in this database.
+///
+/// Season start resets every character that exists at that moment, but restores can
+/// arrive later carrying retail (or an older local season's) cups. If that inherited
+/// balance is allowed through, the first local result records it in
+/// `arena_match_results` while the leaderboard counts only local-season wins. That is
+/// how a character can appear with hundreds of cups and zero wins. Reuse the normal
+/// rollover path here so late arrivals enter at zero and, when the source season id is
+/// known, their old PvP block is archived rather than discarded.
+fn align_import_with_active_season(
+    character: &mut CompleteCharacter,
+    active_season: Option<&season_store::SeasonRow>,
+) -> bool {
+    active_season
+        .map(|season| arena_season::roll_character_into(character, &season.config()).reset)
+        .unwrap_or(false)
+}
+
 /// Change one arena user's sole character's AI-mimic status.
 ///
 /// The capture platform gives every selected archived alt its own deterministic
@@ -247,6 +267,31 @@ pub async fn import_character(
     let response = conn
         .transaction::<_, BladeApiError, _>(|mut conn| {
             async move {
+                // A season reset is a boundary for late imports too. The bulk start
+                // handler can only reset rows that existed when it ran; without this,
+                // a restored character's historical trophies become the baseline for
+                // its first current-season match and corrupt both its card and ladder.
+                let active_season: Option<season_store::SeasonRow> = arena_seasons::table
+                    .filter(arena_seasons::status.eq("active"))
+                    .select(season_store::SeasonRow::as_select())
+                    .order(arena_seasons::starts_at.desc())
+                    .first(&mut conn)
+                    .await
+                    .optional()?;
+                let mut character = body.character;
+                let inherited_trophies = character.pvp_trophies;
+                let inherited_matches = character.number_pvp_match_played;
+                if let Some(active_season) = active_season.as_ref() {
+                    if align_import_with_active_season(&mut character, Some(active_season)) {
+                        log::info!(
+                            "[import] rolled user {user_id} into active arena season {} — removed inherited cups {} and matches {} from live counters",
+                            active_season.id,
+                            inherited_trophies,
+                            inherited_matches,
+                        );
+                    }
+                }
+
                 // 1. Ensure a backing `users` row exists (characters.user_id is a
                 //    NOT NULL FK -> users.id). If absent, insert a minimal user:
                 //    a random secret_id and an empty UserAccount (no device ids).
@@ -289,7 +334,7 @@ pub async fn import_character(
                 let entry = CharacterDbEntry {
                     id: character_id,
                     user_id,
-                    character: JsonDbWrapper(body.character),
+                    character: JsonDbWrapper(character),
                     data: JsonDbWrapper(body.data),
                     wallet: JsonDbWrapper(body.wallet),
                     inventory: JsonDbWrapper(body.inventory),
@@ -2552,6 +2597,70 @@ mod tests {
         let _: CompleteInventory = parsed.inventory;
         let _: CompleteWallet = parsed.wallet;
         let _: CompleteCharacterData = parsed.data;
+    }
+
+    #[test]
+    fn late_import_enters_the_active_season_at_zero_cups() {
+        let old_season = Uuid::parse_str("aaaaaaaa-1111-2222-3333-444444444444").unwrap();
+        let live_season = Uuid::parse_str("bbbbbbbb-1111-2222-3333-444444444444").unwrap();
+        let season = season_store::SeasonRow {
+            id: live_season,
+            number: 2,
+            name: "September 2026".into(),
+            starts_at: 1_788_220_800,
+            ends_at: 1_790_812_800,
+            status: "active".into(),
+            scoring: "shipped".into(),
+            reset_rule: "hard_reset".into(),
+            created_at: 1_788_220_700,
+            ended_at: None,
+        };
+        let mut character = CompleteCharacter::default();
+        character.pvp_season_id = old_season;
+        character.pvp_trophies = 1_432;
+        character.matchmaking_pvp_trophies = 1_510;
+        character.number_pvp_match_played = 27;
+        character.pvp_winning_streak = 4;
+
+        assert!(align_import_with_active_season(&mut character, Some(&season)));
+        assert_eq!(character.pvp_season_id, live_season);
+        assert_eq!(character.pvp_trophies, 0);
+        assert_eq!(character.matchmaking_pvp_trophies, 0);
+        assert_eq!(character.number_pvp_match_played, 0);
+        assert_eq!(character.pvp_winning_streak, 0);
+        let old_season_key = old_season.to_string();
+        assert!(
+            character
+                .pvp_season_history
+                .get(old_season_key.as_str())
+                .is_some(),
+            "the inherited standings are archived rather than discarded"
+        );
+    }
+
+    #[test]
+    fn reimport_on_the_same_season_preserves_live_progress() {
+        let live_season = Uuid::parse_str("bbbbbbbb-1111-2222-3333-444444444444").unwrap();
+        let season = season_store::SeasonRow {
+            id: live_season,
+            number: 2,
+            name: "September 2026".into(),
+            starts_at: 1_788_220_800,
+            ends_at: 1_790_812_800,
+            status: "active".into(),
+            scoring: "shipped".into(),
+            reset_rule: "hard_reset".into(),
+            created_at: 1_788_220_700,
+            ended_at: None,
+        };
+        let mut character = CompleteCharacter::default();
+        character.pvp_season_id = live_season;
+        character.pvp_trophies = 77;
+        character.number_pvp_match_played = 2;
+
+        assert!(!align_import_with_active_season(&mut character, Some(&season)));
+        assert_eq!(character.pvp_trophies, 77);
+        assert_eq!(character.number_pvp_match_played, 2);
     }
 
     /// `new-flags` is renamed (dash, not camelCase). Make sure a body using the

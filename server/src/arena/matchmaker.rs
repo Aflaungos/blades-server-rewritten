@@ -22,10 +22,11 @@ use actix_web::{
     post,
     web::{self, Json},
 };
-use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
+use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::pooled_connection::bb8::PooledConnection;
 use diesel_async::{AsyncPgConnection, RunQueryDsl};
-use log::{info, warn};
+use futures_util::FutureExt;
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender, unbounded_channel};
 use uuid::Uuid;
@@ -34,12 +35,14 @@ use crate::{
     BladeApiError, DbPool, ServerGlobal,
     arena::{
         MatchmakingMessage,
+        arena_season,
         config::ArenaConfig,
         key_submit::{KeySubmitConfig, KeySubmitter},
         match_registry::MatchRegistry,
+        season_store,
     },
     models::CharacterDbEntryCharacterWalletInventory,
-    schema::{arena_ai_mimic_control, arena_ai_mimics, characters},
+    schema::{arena_ai_mimic_control, arena_ai_mimics, arena_seasons, characters},
     session::{Session, SessionLookedUpMaybe},
 };
 
@@ -412,11 +415,64 @@ async fn load_loadout(
         .await
         .ok()
         .unwrap_or_default();
-    let row = pick_character(rows, character_id);
-    match row {
-        Some(r) => loadout_from_row(&r),
-        None => loadout::starter(),
+    let Some(mut row) = pick_character(rows, character_id) else {
+        return loadout::starter();
+    };
+
+    // Repair characters imported after the bulk season-start reset before their
+    // loadout becomes the match's trophy baseline. This is the recovery path for
+    // rows already imported by an older build; the import endpoint prevents new
+    // stale rows. The update is deliberately guarded by pvpSeasonId through
+    // `roll_character_into`, so an ordinary same-season queue does no write.
+    let active_season: Option<season_store::SeasonRow> = arena_seasons::table
+        .filter(arena_seasons::status.eq("active"))
+        .select(season_store::SeasonRow::as_select())
+        .order(arena_seasons::starts_at.desc())
+        .first(&mut conn)
+        .await
+        .optional()
+        .unwrap_or(None);
+    if let Some(active_season) = active_season {
+        let inherited_trophies = row.character.0.pvp_trophies;
+        let inherited_matches = row.character.0.number_pvp_match_played;
+        let mut aligned = row.character.0.clone();
+        if arena_season::roll_character_into(&mut aligned, &active_season.config()).reset {
+            let aligned_json = match serde_json::to_value(&aligned) {
+                Ok(value) => value,
+                Err(error) => {
+                    warn!(
+                        "matchmaker: could not serialize season-aligned character {}: {error}",
+                        row.id,
+                    );
+                    return loadout_from_row(&row);
+                }
+            };
+            let updated = diesel::sql_query(
+                "UPDATE characters SET character = $1, \
+                 server_state = server_state - 'arenaPromotionLootGrants' \
+                     - 'arenaPromotionItemRepairs' WHERE id = $2",
+            )
+            .bind::<diesel::sql_types::Jsonb, _>(aligned_json)
+            .bind::<diesel::sql_types::Uuid, _>(row.id)
+            .execute(&mut conn)
+            .await;
+            match updated {
+                Ok(_) => {
+                    info!(
+                        "matchmaker: repaired stale season baseline for character {} — removed inherited cups {} and matches {} from live counters for season {}",
+                        row.id, inherited_trophies, inherited_matches, active_season.id,
+                    );
+                    row.character.0 = aligned;
+                }
+                Err(error) => warn!(
+                    "matchmaker: could not repair stale season baseline for character {}: {error}",
+                    row.id,
+                ),
+            }
+        }
     }
+
+    loadout_from_row(&row)
 }
 
 /// Build a full combat [`Loadout`] from a loaded `characters` row: the parsed combat
@@ -2404,7 +2460,33 @@ impl ArenaGlobal {
         let mm_cfg = config.clone();
         let mm_reg = registry.clone();
         actix_web::rt::spawn(async move {
-            matchmaker_loop(rx, mm_cfg, mm_reg, Some(db_pool)).await;
+            // A closed receiver makes every future `/matches/create` fail as
+            // 503-4-2 while `/healthz` and the rest of HTTP keep returning 200.
+            // There is no useful degraded mode: the sender stored in ArenaGlobal
+            // cannot be attached to a replacement receiver. Treat either a panic or
+            // an unexpected clean exit as a process-level failure so Docker's
+            // `restart: always` starts a coherent arena again. The panic hook retains
+            // the original panic and backtrace in journald before this branch runs.
+            let outcome = std::panic::AssertUnwindSafe(matchmaker_loop(
+                rx,
+                mm_cfg,
+                mm_reg,
+                Some(db_pool),
+            ))
+            .catch_unwind()
+            .await;
+            match outcome {
+                Ok(()) => error!(
+                    "matchmaker: actor exited while the arena process was still alive; terminating process for a clean restart"
+                ),
+                Err(_) => error!(
+                    "matchmaker: actor panicked; terminating process for a clean restart"
+                ),
+            }
+            // 70 = EX_SOFTWARE. `process::exit` is intentional here: this task is
+            // the only owner of the receiver, so continuing can only serve permanent
+            // 503-4-2 responses until an operator happens to restart the container.
+            std::process::exit(70);
         });
         // The live ENet arena host (tokio-enet) is spawned from main() once
         // ServerGlobal exists (it needs the shared Arc). `udp.rs`'s raw-socket
@@ -3265,13 +3347,35 @@ async fn load_skill(
         .load(&mut conn)
         .await
         .ok()?;
+    let active_season_id: Option<Uuid> = arena_seasons::table
+        .filter(arena_seasons::status.eq("active"))
+        .select(arena_seasons::id)
+        .order(arena_seasons::starts_at.desc())
+        .first(&mut conn)
+        .await
+        .optional()
+        .ok()
+        .flatten();
     let skill_of = |c: &serde_json::Value| {
+        let character_season_id = c
+            .get("pvpSeasonId")
+            .and_then(|value| value.as_str())
+            .and_then(|value| Uuid::parse_str(value).ok());
+        // Late imports from a different season are reset in `load_loadout` before
+        // the fight. Bracket them at that effective zero here as well, rather than
+        // pairing one last match using the inherited retail total.
+        let stale_season = active_season_id
+            .map(|active| character_season_id != Some(active))
+            .unwrap_or(false);
         Some(Skill {
             level: c.get("level")?.as_i64()? as i32,
-            trophies: c
-                .get("matchmakingPvpTrophies")
-                .and_then(|v| v.as_i64())
-                .unwrap_or(0),
+            trophies: if stale_season {
+                0
+            } else {
+                c.get("matchmakingPvpTrophies")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0)
+            },
         })
     };
     // The request DOES say which character is queueing — `matches/create`'s `playerId`.
