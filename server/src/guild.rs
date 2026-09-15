@@ -602,7 +602,7 @@ async fn append_message(
     cid: Uuid,
     message_type: &str,
     data: Value,
-) -> Result<(), BladeApiError> {
+) -> Result<MessageWire, BladeApiError> {
     let ts = now_secs();
     let row = GuildMessageRow {
         message_id: format!("{}::{}", ts, Uuid::new_v4()),
@@ -615,10 +615,10 @@ async fn append_message(
     };
     use crate::schema::guild_messages;
     diesel::insert_into(guild_messages::table)
-        .values(row)
+        .values(&row)
         .execute(conn)
         .await?;
-    Ok(())
+    Ok(MessageWire::from_row(row))
 }
 
 // ---- Handlers ------------------------------------------------------------------
@@ -1730,7 +1730,8 @@ async fn append_promote_message(
             "guildRank": GuildRank::Grandmaster.as_wire(),
         }),
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// `POST /guilds/current/leave`.
@@ -1922,6 +1923,12 @@ struct MessageBoardResponse {
     guild_message_board: Vec<MessageWire>,
 }
 
+fn posted_message_response(posted: MessageWire) -> MessageBoardResponse {
+    MessageBoardResponse {
+        guild_message_board: vec![posted],
+    }
+}
+
 /// Paging window for `GET /guilds/current/messages`.
 ///
 /// il2cpp `GetAllGuildMessagesRequest` takes both an `oldestCreationTime` and a
@@ -1991,7 +1998,13 @@ struct PostMessageRequest {
     text: String,
 }
 
-/// `POST /guilds/current/messages` -> the refreshed board.
+/// `POST /guilds/current/messages` -> only the newly posted message.
+///
+/// This differs deliberately from GET: retail's POST responses always contain
+/// exactly the message created by that request. The client feeds this response
+/// into a post-specific enrichment runner and appends it to its existing board;
+/// returning the full board makes that runner process duplicate/history rows and
+/// can leave the guild view locked after the write has already succeeded.
 ///
 /// Membership is required — a non-member cannot post to a guild's chat, which is
 /// enforced by `require_membership` rather than by the client declining to show
@@ -2020,7 +2033,7 @@ pub async fn post_message(
     if !message_length_ok(&text) {
         return Err(invalid_text());
     }
-    append_message(
+    let posted = append_message(
         &mut conn,
         &m.guild_id,
         user_id,
@@ -2029,13 +2042,7 @@ pub async fn post_message(
         json!({ "type": "CLIENT", "text": text }),
     )
     .await?;
-    Ok(Json(MessageBoardResponse {
-        guild_message_board: message_board(&mut conn, &m.guild_id, &MessageQuery {
-            oldest_creation_time: None,
-            newest_creation_time: None,
-        })
-        .await?,
-    }))
+    Ok(Json(posted_message_response(posted)))
 }
 
 // ---- Guild Exchange (gift) -------------------------------------------------------
@@ -2502,6 +2509,31 @@ mod tests {
         let id = guild_id_from_uuid(Uuid::from_u128(0x1234_5678_9abc_def0_1122_3344_5566_7788));
         assert_eq!(id.len(), 24);
         assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    /// Retail POST captures contain exactly the row created by the request, not
+    /// a refreshed page of existing chat history. The post-specific client
+    /// runner appends and enriches this list before releasing the guild UI.
+    #[test]
+    fn post_message_response_contains_one_created_message() {
+        let posted = MessageWire::from_row(GuildMessageRow {
+            message_id: "1782855363::e8108b5b-ed3f-4e0c-bf6f-e3bc77e438af".into(),
+            guild_id: "69daf06759aa5eb7b33e8778".into(),
+            user_id: Uuid::from_u128(0x123),
+            character_id: Uuid::from_u128(0x456),
+            message_type: "CLIENT".into(),
+            type_specific_data: JsonDbWrapper(json!({
+                "type": "CLIENT",
+                "text": "hello guild",
+            })),
+            creation_time: 1_782_855_363,
+        });
+        let response = posted_message_response(posted);
+
+        let value = serde_json::to_value(response).unwrap();
+        let board = value["guildMessageBoard"].as_array().unwrap();
+        assert_eq!(board.len(), 1);
+        assert_eq!(board[0]["typeSpecificData"]["text"], "hello guild");
     }
 }
 
