@@ -11,6 +11,7 @@ use std::{collections::HashMap, fs::File, io::BufReader, path::Path};
 
 use blades_lib::economy::{Price, RewardGrant};
 use blades_lib::features::challenges::ChallengeTemplate;
+use blades_lib::features::chests::ChestLootTables;
 use blades_lib::features::daily_reward::DailyRewardDef;
 use blades_lib::features::game_events::EventDef;
 use blades_lib::static_data::{
@@ -126,7 +127,7 @@ pub fn load(dir: &Path) -> StaticData {
     };
     let challenge_templates: Vec<ChallengeTemplate> = read_json(&dir.join("challenges.json"));
     let daily_rewards: Vec<DailyRewardDef> = read_json(&dir.join("daily_rewards.json"));
-    let chest_loots: Vec<RewardGrant> = read_json(&dir.join("chest_loots.json"));
+    let chest_loots: ChestLootTables = read_json(&dir.join("chest_loots.json"));
     let game_events: Vec<EventDef> = read_json(&dir.join("game_events.json"));
     let salvage_recipes: HashMap<Uuid, HashMap<Uuid, u64>> =
         read_json(&dir.join("salvage_recipes.json"));
@@ -194,6 +195,50 @@ mod tests {
     /// The committed `deploy/static/*.json` must deserialize into the `StaticData`
     /// structs — a no-DB guard that the capture-derived data still matches our types
     /// (e.g. catches an Item that drops `properties`).
+    /// Report #141: "chests in the store still load the same loot". The old pool was
+    /// a flat 40-bundle list keyed only by chest id, so a tier-1 and a tier-5 chest
+    /// could draw the same bundle and a chest's level changed nothing. Assert the
+    /// committed data now separates them on BOTH axes.
+    #[test]
+    fn committed_chest_loot_varies_by_tier_and_level() {
+        use blades_lib::economy::GOLD;
+        use blades_lib::features::chests::pick_loot;
+
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../deploy/static");
+        let sd = load(&dir);
+
+        // Same chest id and level, different tier -> different, richer loot.
+        let gold_at = |tier: u64, level: u64| {
+            pick_loot(&sd.chest_loots, tier, level, "chest-1")
+                .unwrap_or_else(|| panic!("no loot for tier {tier}"))
+                .currencies
+                .get(&GOLD)
+                .copied()
+                .unwrap_or(0)
+        };
+        let by_tier: Vec<u64> = (1..=5).map(|t| gold_at(t, 50)).collect();
+        for (tier, pair) in by_tier.windows(2).enumerate() {
+            assert!(
+                pair[1] > pair[0],
+                "tier {} paid {} but tier {} paid {} — chest tier must raise the gold",
+                tier + 1,
+                pair[0],
+                tier + 2,
+                pair[1]
+            );
+        }
+
+        // Same chest id and tier, different level -> different loot. Retail scaled
+        // chest contents with the chest's level; a flat pool did not.
+        for tier in 1..=3u64 {
+            assert_ne!(
+                gold_at(tier, 1),
+                gold_at(tier, 100),
+                "tier {tier} pays the same at chest level 1 and 100"
+            );
+        }
+    }
+
     #[test]
     fn committed_static_data_loads_non_empty() {
         let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../deploy/static");
@@ -235,6 +280,25 @@ mod tests {
         days.sort_unstable();
         assert_eq!(days, (0u8..7).collect::<Vec<_>>(), "daily_rewards.json weekdays");
         assert!(!sd.chest_loots.is_empty(), "chest_loots.json (Item.properties default)");
+        // Tiers 1-3 are the ones retail capture covers well enough to publish; a
+        // silently tier-less file is exactly the regression that made every chest
+        // pay the same bundle (#141).
+        for tier in 1..=3u64 {
+            let pool = sd.chest_loots.tiers.get(&tier);
+            assert!(
+                pool.is_some_and(|p| p.len() >= 100),
+                "chest_loots.json tier {tier} pool"
+            );
+        }
+        // Tiers 4 and 5 are too thinly captured to be tables, but they must still
+        // have loot of their OWN: without it `pick_loot` silently hands a tier-5
+        // chest the tier-3 table, which is the bug this file was rebuilt to fix.
+        for tier in 1..=5u64 {
+            assert!(
+                sd.chest_loots.has_own_pool(tier),
+                "chest_loots.json has no pool of its own for tier {tier}"
+            );
+        }
         assert!(!sd.game_events.is_empty(), "game_events.json");
         assert!(!sd.salvage_recipes.is_empty(), "salvage_recipes.json");
         assert!(!sd.shop_data.by_template.is_empty(), "shops.json byTemplate");

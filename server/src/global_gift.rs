@@ -320,9 +320,12 @@ pub async fn claim_global_gift(
                             "arena-season:{gift_id}:{character_id}:{}:{index}",
                             chest.tier
                         );
-                        if let Some(loot) =
-                            chests::pick_loot(&globals.static_data.chest_loots, &key)
-                        {
+                        if let Some(loot) = chests::pick_loot(
+                            &globals.static_data.chest_loots,
+                            chest.tier,
+                            chest.level,
+                            &key,
+                        ) {
                             let mut loot = loot.clone();
                             for item in &mut loot.items {
                                 item.id = Uuid::new_v4();

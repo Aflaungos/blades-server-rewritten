@@ -12,6 +12,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::economy::RewardGrant;
+use crate::features::chests::ChestLootTables;
 use crate::features::challenges::ChallengeTemplate;
 use crate::features::daily_reward::DailyRewardDef;
 use crate::features::game_events::EventDef;
@@ -1086,9 +1087,11 @@ pub struct StaticData {
     pub challenge_templates: Vec<ChallengeTemplate>,
     /// Daily login reward rotation pool.
     pub daily_rewards: Vec<DailyRewardDef>,
-    /// Representative chest-loot bundles (one is picked per chest by id), since per-tier
-    /// loot tables aren't captured.
-    pub chest_loots: Vec<RewardGrant>,
+    /// Per-tier chest-loot pools derived from 741 retail chest openings. Retail's
+    /// loot tables were never shipped in the APK, so each entry is a bundle
+    /// Bethesda's server actually returned for a chest of that tier and level; the
+    /// chest id picks one deterministically. See `docs/chest-loot-extraction.md`.
+    pub chest_loots: ChestLootTables,
     /// Daily / Sigil quest event library (a rotating few are surfaced as active).
     pub game_events: Vec<EventDef>,
     /// Representative salvage yield per `recipeId` (`recipeId` -> {material -> count}),
