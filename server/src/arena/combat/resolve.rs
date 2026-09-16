@@ -809,7 +809,34 @@ pub fn on_c2s_input(
                 .set_actor_state(ActorStateType::Charging, now);
             return Vec::new();
         }
-        // Button UP — commit the swing.
+        // Button UP — commit the swing, but ONLY if we ever saw the press.
+        //
+        // A release with no recorded press is not a swing. The path that produces
+        // one is the block: a guard press sets `charge_press_at = None` (a block is
+        // "not a charge and never a swing", above), so if the matching RELEASE is
+        // not classified as a block it falls through to here — and we committed a
+        // full swing for a button the player never pressed, with `hold_secs` 0 and
+        // no `Charging` wind-up, so no animation played either.
+        //
+        // That is exactly what report #113 describes, from a player who opens with
+        // a held shield: "Every time I released that first block, it seemed like I
+        // was quickly hitting my opponent, though I did not push a button for this
+        // nor see the strike animation. All that I saw was my opponent taking the
+        // hit."
+        //
+        // The block-vs-swing split is positional and admits misses by construction
+        // — the comment above records 344 of 351 block presses below pointer X 0.5,
+        // so 7 were not. Rather than chase that classification, require the thing a
+        // real swing always has: a press. A genuine swing goes DOWN (which records
+        // `charge_press_at` and enters `Charging`) and only then UP.
+        if combat.fighters[sender].charge_press_at.is_none()
+            && combat.fighters[sender].actor_state() != ActorStateType::Charging
+        {
+            debug!(
+                "combat: slot {sender} op46 UP with no recorded press — ignoring                  (block release misread as a swing)"
+            );
+            return Vec::new();
+        }
         let hold_secs = combat.fighters[sender]
             .charge_press_at
             .map(|t| now.saturating_duration_since(t).as_secs_f32())
@@ -6837,6 +6864,76 @@ mod phase4_tests {
         let mut f = messages::frame_for_test(w.finish());
         f[0] = 0x84;
         f
+    }
+
+    /// Report #113, the phantom hit: releasing a held block struck the opponent.
+    ///
+    /// In the reporter's words — a player who opens every fight with a raised
+    /// shield — "Every time I released that first block, it seemed like I was
+    /// quickly hitting my opponent, though I did not push a button for this nor
+    /// see the strike animation. All that I saw was my opponent taking the hit."
+    ///
+    /// The path: a guard press clears `charge_press_at` (a block is never a
+    /// swing), so a RELEASE that is not classified as a block falls through to the
+    /// swing commit — with no press recorded, no `Charging` wind-up, and therefore
+    /// no animation. The block/swing split is positional and admits misses by
+    /// construction: 344 of 351 captured block presses sit below pointer X 0.5,
+    /// so 7 did not.
+    ///
+    /// Damage is checked AFTER `land_due_impacts`, because a swing schedules its
+    /// impact rather than applying it inline — an assertion taken at commit time
+    /// reads 0 damage for a real swing too, and would pass whatever the code did.
+    #[test]
+    fn a_release_with_no_press_does_not_swing() {
+        let now = Instant::now();
+        let mut combat = live_combat(now);
+        let before = combat.fighters[1].health;
+
+        // Guard up, then a release the classifier fails to label as a block.
+        on_c2s_input(&mut combat, 0, &make_act_frame(true, 0.0, true), now);
+        assert_eq!(combat.fighters[0].actor_state(), ActorStateType::Blocking);
+        on_c2s_input(&mut combat, 0, &make_act_frame(false, 0.0, false), now);
+        land(&mut combat, now);
+
+        assert_eq!(
+            combat.fighters[1].health, before,
+            "releasing a block must not damage the opponent"
+        );
+    }
+
+    /// The control, and the reason this is a guard rather than a deletion: an
+    /// ordinary press-then-release must still swing and still land. A fix that
+    /// silenced the phantom hit by silencing swings would pass the test above and
+    /// break every fight.
+    #[test]
+    fn an_ordinary_press_then_release_still_swings() {
+        let now = Instant::now();
+        let mut combat = live_combat(now);
+        let before = combat.fighters[1].health;
+
+        on_c2s_input(&mut combat, 0, &make_pos_frame(0.8, 0.5, 0.0), now);
+        on_c2s_input(&mut combat, 0, &make_act_frame(true, 0.0, false), now);
+        on_c2s_input(&mut combat, 0, &make_act_frame(false, 0.1, false), now);
+        land(&mut combat, now);
+
+        assert!(
+            combat.fighters[1].health < before,
+            "a real swing must still land: {} -> {}",
+            before,
+            combat.fighters[1].health
+        );
+    }
+
+    /// A bare release with no prior input at all — a reconnect, or a dropped
+    /// press — is also not a swing.
+    #[test]
+    fn a_bare_release_with_no_history_does_not_swing() {
+        let now = Instant::now();
+        let mut combat = live_combat(now);
+        let before = combat.fighters[1].health;
+        on_c2s_input(&mut combat, 0, &make_act_frame(false, 0.0, false), now);
+        land(&mut combat, now);
+        assert_eq!(combat.fighters[1].health, before);
     }
 
     /// Report #113: a fighter caught mid-cast when the round ended held that pose
