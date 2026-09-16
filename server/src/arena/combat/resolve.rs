@@ -7963,6 +7963,107 @@ mod shipped_effects_tests {
         );
     }
 
+    /// THE DODGE MUST BE TAKEN BACK WHEN THE WINDOW CLOSES.
+    ///
+    /// Retail sends the remove: of 405 captured `Dodging` (12) op51 frames, 204
+    /// are applies and **201 are removes**. We sent only the apply, so the dodge
+    /// indicator on the client had nothing to clear on — the same shape as the
+    /// stun that stuck forever, which is why `emit_status_removals` exists.
+    ///
+    /// The fix is to let `tracked_statuses` SEE the dodge window, so the existing
+    /// per-tick diff does the announcing. Report #113.
+    #[test]
+    fn the_dodge_window_closing_sends_an_op51_remove() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        let u = uuid_of("DodgingStrike");
+        apply_shipped_effects(&mut c, 0, 1, u, 1, 500.0, 0, now);
+
+        // A tick inside the window records the dodge as announced, and takes
+        // nothing back — the dodge is still up.
+        let during = emit_status_removals(&mut c, now + Duration::from_millis(500));
+        assert!(
+            dodging_removes(&during).is_empty(),
+            "a live dodge must not be un-announced"
+        );
+
+        // A tick after it lapses takes it back, to both viewers.
+        let after = emit_status_removals(&mut c, now + Duration::from_millis(1_500));
+        assert_eq!(
+            dodging_removes(&after).len(),
+            2,
+            "the closed dodge window must send an op51 remove to both viewers"
+        );
+    }
+
+    /// The same remove is owed when the dodge CONNECTS, not only when it times
+    /// out — `apply_negation_pools` drops a drained pool, so the window is over
+    /// early and the client must hear about it.
+    #[test]
+    fn a_dodge_that_eats_a_hit_also_sends_its_remove() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        let u = uuid_of("DodgingStrike");
+        apply_shipped_effects(&mut c, 0, 1, u, 1, 500.0, 0, now);
+        emit_status_removals(&mut c, now);
+
+        // A hit far bigger than the pool drains it outright.
+        let mut components = [(crate::arena::combat::state::DamageType::Slashing, 5_000.0f32)];
+        let neg = c.fighters[0].apply_negation_pools(&mut components);
+        assert!(neg.negated || components[0].1 < 5_000.0, "the dodge must have eaten some of it");
+        assert!(
+            c.fighters[0].negation_pools.is_empty(),
+            "a drained pool is dropped — the window is over"
+        );
+
+        let out = emit_status_removals(&mut c, now + Duration::from_millis(100));
+        assert_eq!(
+            dodging_removes(&out).len(),
+            2,
+            "a spent dodge must be taken back as well as an expired one"
+        );
+    }
+
+    /// THE CONTROL. The storm-armor shields live in the same `negation_pools`
+    /// vector but are announced from elsewhere; if the new scan were not
+    /// source-scoped, the very first diff would emit a bogus `Dodging` remove for
+    /// a shield — exactly the trap `announced_statuses` is documented against.
+    #[test]
+    fn a_shield_pool_is_never_announced_as_a_dodge() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        apply_shipped_effects(&mut c, 0, 1, uuid_of("FirestormArmor"), 1, 500.0, 0, now);
+        assert!(
+            c.fighters[0].negation_pools.iter().any(|p| p.source != DamageNegationSource::Dodge),
+            "the fixture must actually hold a non-dodge pool, or this proves nothing"
+        );
+        assert!(
+            !c.fighters[0].tracked_statuses(now).contains(&StatusEffectType::Dodging),
+            "a storm-armor shield is not a dodge"
+        );
+        for t in [0u64, 500, 1_500, 5_000] {
+            let out = emit_status_removals(&mut c, now + Duration::from_millis(t));
+            assert!(
+                dodging_removes(&out).is_empty(),
+                "a shield must never produce a Dodging remove (t={t}ms)"
+            );
+        }
+    }
+
+    /// op51 `Dodging` REMOVE frames in a batch (propId 4 apply, 5 status).
+    fn dodging_removes(out: &[(usize, Vec<u8>)]) -> Vec<usize> {
+        out.iter()
+            .enumerate()
+            .filter(|(_, (_, f))| messages::user_message_gmid(f) == Some(51))
+            .filter(|(_, (_, f))| {
+                let nd = arena_proto::parse_netdata(&f[2..]);
+                nd.int(5) == Some(StatusEffectType::Dodging as i64)
+                    && matches!(nd.get(4), Some(arena_proto::NetDataValue::Bool(false)))
+            })
+            .map(|(i, _)| i)
+            .collect()
+    }
+
     /// The three *Armor spells get a real shield. No op51: the elemental-armor status
     /// id is not pinned, and a guessed id is dropped silently by the client.
     #[test]
