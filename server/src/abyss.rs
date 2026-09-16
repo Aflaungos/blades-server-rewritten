@@ -290,8 +290,10 @@ struct SliceCompletedAction {
 #[derive(Deserialize, Debug)]
 #[serde(rename_all = "camelCase")]
 struct ReviveAction {
+    /// A BOOL on the wire in all 14 captured revives — see
+    /// [`count_from_bool_or_number`]. Never read; parsed so the body survives.
     #[allow(dead_code)]
-    #[serde(default)]
+    #[serde(default, deserialize_with = "count_from_bool_or_number")]
     gems_payment: u64,
     #[allow(dead_code)]
     #[serde(default)]
@@ -319,7 +321,54 @@ struct CombatCompletedAction {
 #[serde(rename_all = "camelCase")]
 struct DurabilityUpdate {
     id: Uuid,
+    /// Sent as a JSON **string**, not a number: `"durability": "673.2878"`.
+    ///
+    /// All 838 durability values in the captured corpus are strings and not one
+    /// is a number, so `f64` here rejected every post-fight update — and because
+    /// serde fails the whole body, the entire request 400s, not just this field.
+    ///
+    /// The dungeon path already reads both forms
+    /// ([`crate::dungeon_update::deserialize_f64_number_or_string`]); the Abyss
+    /// kept its own `f64` and never got the same treatment. Reuse it rather than
+    /// grow a second reader for one wire quirk.
+    ///
+    /// That is report #156. The shape on the wire is exact and repeatable:
+    ///
+    /// ```text
+    /// 12:11:45  abysses/current/start   200
+    /// 12:11:50  .../update              200   <- enemy_killed
+    /// 12:12:15  .../update              200   <- enemy_killed
+    /// 12:12:16  .../update              400   <- first combat_completed
+    /// 12:12:19  .../update              400   <- client retries the same action
+    /// 12:12:27  .../update              400      …forever
+    /// ```
+    ///
+    /// The client shows "Network Not Reachable" and the run is dead about a
+    /// minute in, every time. The reporter did it twice, five minutes apart, and
+    /// both runs have byte-identical shapes.
+    #[serde(deserialize_with = "crate::dungeon_update::deserialize_f64_number_or_string")]
     durability: f64,
+}
+
+/// Accept a JSON integer OR a JSON bool.
+///
+/// `gemsPayment` is a **bool** in all 14 captured revives — `true`/`false`, not a
+/// count — so `u64` rejected every one of them, killing the whole update the way
+/// the durability field did. Nothing reads the value; it is parsed only so the
+/// body survives, and a bool maps to 1/0 rather than being invented.
+fn count_from_bool_or_number<'de, D>(d: D) -> Result<u64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+    match Value::deserialize(d)? {
+        Value::Bool(b) => Ok(u64::from(b)),
+        Value::Number(n) => Ok(n.as_u64().unwrap_or(0)),
+        Value::Null => Ok(0),
+        other => Err(D::Error::custom(format!(
+            "gemsPayment must be a number or a bool, got {other}"
+        ))),
+    }
 }
 
 /// A potion or food used during the current run.
@@ -2101,4 +2150,113 @@ mod tests {
         assert!(empty.enemy_generated_data.is_empty());
     }
 
+}
+
+#[cfg(test)]
+mod update_body_shape_tests {
+    use super::*;
+
+    /// THE regression. `durability` arrives as a JSON string.
+    ///
+    /// All 838 durability values in the captured corpus are strings —
+    /// `"durability": "673.2878"` — and not one is a number. `f64` rejected
+    /// them, and because serde fails the whole body that 400s the entire
+    /// request, not just the field. Report #156: the first post-fight update a
+    /// minute into the Abyss 400s, the client retries the same action forever,
+    /// and the player sees "Network Not Reachable".
+    #[test]
+    fn a_string_durability_is_accepted() {
+        let body: UpdateAbyssRequest = serde_json::from_value(serde_json::json!({
+            "currentState": {"b64": ""},
+            "actions": [{
+                "type": "combat_completed",
+                "time": 1787617384801u64,
+                "items": [
+                    {"id": "11111111-2222-4333-8444-555555555555", "durability": "673.2878"},
+                    {"id": "66666666-7777-4888-8999-aaaaaaaaaaaa", "durability": "6.074898"}
+                ]
+            }]
+        }))
+        .expect("a captured combat_completed body must deserialize");
+        let AbyssUpdateAction::CombatCompleted(action) = &body.actions[0] else {
+            panic!("expected combat_completed, got {:?}", body.actions[0]);
+        };
+        assert_eq!(action.items.len(), 2);
+        assert!((action.items[0].durability - 673.2878).abs() < 1e-9);
+        assert!((action.items[1].durability - 6.074898).abs() < 1e-9);
+    }
+
+    /// The control: a NUMBER must still work. Swapping one wire type for the
+    /// other would have passed the test above and broken every other client.
+    #[test]
+    fn a_numeric_durability_still_works() {
+        let body: UpdateAbyssRequest = serde_json::from_value(serde_json::json!({
+            "actions": [{
+                "type": "combat_completed",
+                "items": [{"id": "11111111-2222-4333-8444-555555555555", "durability": 42.5}]
+            }]
+        }))
+        .expect("a numeric durability must still deserialize");
+        let AbyssUpdateAction::CombatCompleted(action) = &body.actions[0] else {
+            panic!("expected combat_completed");
+        };
+        assert!((action.items[0].durability - 42.5).abs() < 1e-9);
+    }
+
+    /// `gemsPayment` is a BOOL in all 14 captured revives, not a count. `u64`
+    /// rejected every one, killing the whole update the same way.
+    #[test]
+    fn a_boolean_gems_payment_is_accepted() {
+        let body: UpdateAbyssRequest = serde_json::from_value(serde_json::json!({
+            "actions": [
+                {"type": "revive", "gemsPayment": true,  "time": 1782858208727u64},
+                {"type": "revive", "gemsPayment": false, "time": 1782858208728u64}
+            ]
+        }))
+        .expect("a captured revive body must deserialize");
+        assert_eq!(body.actions.len(), 2);
+        assert!(matches!(body.actions[0], AbyssUpdateAction::Revive(_)));
+    }
+
+    /// Garbage must still be rejected — the field is permissive about the wire
+    /// type, not about the value. Without this the deserializer could silently
+    /// default and hide a real client change.
+    #[test]
+    fn a_non_numeric_durability_string_is_still_an_error() {
+        let err = serde_json::from_value::<UpdateAbyssRequest>(serde_json::json!({
+            "actions": [{
+                "type": "combat_completed",
+                "items": [{"id": "11111111-2222-4333-8444-555555555555", "durability": "banana"}]
+            }]
+        }));
+        assert!(err.is_err(), "a non-numeric string must not be accepted");
+    }
+
+    /// One whole captured update body, every action type in it at once, with the
+    /// exact key sets the corpus shows. This is what the handler really receives.
+    #[test]
+    fn a_full_captured_body_with_every_action_type_deserializes() {
+        let body: UpdateAbyssRequest = serde_json::from_value(serde_json::json!({
+            "currentState": {"b64": ""},
+            "actions": [
+                {"type": "enemy_killed", "spawnGroupId": "11111111-2222-4333-8444-555555555555",
+                 "spawnerIndex": 3, "enemyIndex": 2, "xpReward": 214.0, "time": 1787617384801u64},
+                {"type": "enemy_loot_collected", "spawnGroupId": "11111111-2222-4333-8444-555555555555",
+                 "spawnerIndex": 0, "enemyIndex": 0, "loot": [], "time": 1787617384802u64},
+                {"type": "combat_completed", "time": 1787617384803u64,
+                 "items": [{"id": "66666666-7777-4888-8999-aaaaaaaaaaaa", "durability": "355.0"}]},
+                {"type": "item_consumed", "itemTemplateId": "22222222-3333-4444-8555-666666666666",
+                 "time": 1787617384804u64},
+                {"type": "revive", "gemsPayment": true, "time": 1787617384805u64},
+                {"type": "abyss_slice_completed", "time": 1787617384806u64}
+            ]
+        }))
+        .expect("the full captured action set must deserialize");
+        assert_eq!(body.actions.len(), 6);
+        assert!(
+            !body.actions.iter().any(|a| matches!(a, AbyssUpdateAction::Unknown)),
+            "no captured action may fall into Unknown: {:?}",
+            body.actions
+        );
+    }
 }
