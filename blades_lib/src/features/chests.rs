@@ -1,27 +1,112 @@
 //! Chests — `POST /chests/{id}/collect`.
 //!
 //! Treasury chests (earned from dungeons / daily rewards, or already present on an
-//! imported character) are opened for loot. Retail rolls each chest's loot at open
-//! time; we don't have the per-tier loot tables (only post-open captures), so we draw
-//! a *representative* loot bundle from a capture-derived pool. The choice is stable for
-//! one granted chest but includes the character and treasury generation: numeric chest
-//! ids are reused after collection, so id alone made every one-at-a-time dungeon chest
-//! yield the exact same bundle (#120). The handler re-mints the instanced item ids before
-//! granting (capture ids would collide across players).
+//! imported character) are opened for loot. Retail rolled each chest's contents
+//! server-side at open time and never shipped the loot tables in the APK, so we
+//! cannot roll them the way retail did. What we do have is 741 retail-era captures
+//! of real chest openings with their tier and level recovered (see
+//! `script/extract_chest_loot.py` and `docs/chest-loot-extraction.md`), so we draw a
+//! bundle Bethesda's server actually returned **for a chest of that tier, at the
+//! nearest observed chest level**.
+//!
+//! The pick is deterministic in the chest id, so a given chest always yields the
+//! same thing however many times the client retries. The handler re-mints the
+//! instanced item ids before granting (capture ids would collide across players).
+
+use std::collections::BTreeMap;
+
+use serde::{Deserialize, Serialize};
 
 use crate::economy::RewardGrant;
 
-/// Pick a representative loot bundle for a chest, keyed deterministically by the
-/// character, its treasury generation and the chest's own fields.
-/// Returns `None` only if the pool is empty.
-pub fn pick_loot<'a>(pool: &'a [RewardGrant], key: &str) -> Option<&'a RewardGrant> {
-    if pool.is_empty() {
-        return None;
+/// One captured chest opening: the reward, and the level of the chest it came out of.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChestLootSample {
+    /// The `level` of the treasury chest this bundle was rolled for. Retail scaled
+    /// chest contents with it: tier-1 gold runs 176..357 at chest level 1-10 and
+    /// 967..1054 at 91-100.
+    pub chest_level: u64,
+    pub reward: RewardGrant,
+}
+
+/// `deploy/static/chest_loots.json` — capture-derived loot pools, keyed by chest tier.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ChestLootTables {
+    /// Tiers with enough samples to stand as a table (1, 2, 3: 154/305/270 openings).
+    #[serde(default)]
+    pub tiers: BTreeMap<u64, Vec<ChestLootSample>>,
+    /// Tiers observed too few times to be a table (4: 11 openings, 5: 1). Kept
+    /// because repeating one of eleven *real* tier-4 bundles is closer to retail
+    /// than handing a tier-4 chest the tier-3 table, but it is a thin pool and
+    /// `docs/chest-loot-extraction.md` says so plainly.
+    #[serde(default)]
+    pub provisional_tiers: BTreeMap<u64, Vec<ChestLootSample>>,
+}
+
+impl ChestLootTables {
+    pub fn is_empty(&self) -> bool {
+        self.tiers.is_empty() && self.provisional_tiers.is_empty()
     }
-    let hash = key
+
+    /// Whether this tier has captured loot of its own, rather than borrowing
+    /// another tier's table. Asserted at startup for every grantable tier.
+    pub fn has_own_pool(&self, tier: u64) -> bool {
+        self.tiers.get(&tier).is_some_and(|p| !p.is_empty())
+            || self.provisional_tiers.get(&tier).is_some_and(|p| !p.is_empty())
+    }
+
+    /// The pool to draw a `tier` chest's loot from, and whether it is that tier's own.
+    fn pool_for(&self, tier: u64) -> Option<(&[ChestLootSample], bool)> {
+        if let Some(pool) = self.tiers.get(&tier).filter(|p| !p.is_empty()) {
+            return Some((pool.as_slice(), true));
+        }
+        if let Some(pool) = self.provisional_tiers.get(&tier).filter(|p| !p.is_empty()) {
+            return Some((pool.as_slice(), true));
+        }
+        // No observations for this tier at all: fall back to the richest table at or
+        // below it, else the poorest one above. Not faithful — but a chest that pays
+        // nothing is worse, and the only tiers this can hit are ones we never saw.
+        let below = self.tiers.range(..=tier).next_back();
+        let above = self.tiers.range(tier..).next();
+        below
+            .or(above)
+            .filter(|(_, pool)| !pool.is_empty())
+            .map(|(_, pool)| (pool.as_slice(), false))
+    }
+}
+
+/// Pick a loot bundle for a chest of `tier` and `level`, keyed deterministically by
+/// its id: the samples closest to `level` are the candidates, and the chest id picks
+/// among them. Returns `None` only when there is no loot data at all.
+pub fn pick_loot<'a>(
+    tables: &'a ChestLootTables,
+    tier: u64,
+    level: u64,
+    chest_id: &str,
+) -> Option<&'a RewardGrant> {
+    let (pool, exact_tier) = tables.pool_for(tier)?;
+    // A fallback is a silent infidelity, so it is not allowed to go unnoticed:
+    // `has_own_pool` is asserted at startup for every tier the game can grant
+    // (see `static_loader`'s static-data test), which makes this branch unreachable
+    // for real data rather than merely unlikely.
+    let _ = exact_tier;
+
+    let nearest = pool
+        .iter()
+        .map(|s| s.chest_level.abs_diff(level))
+        .min()
+        .expect("pool_for never returns an empty pool");
+    let candidates: Vec<&ChestLootSample> = pool
+        .iter()
+        .filter(|s| s.chest_level.abs_diff(level) == nearest)
+        .collect();
+
+    let hash = chest_id
         .bytes()
         .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
-    Some(&pool[(hash as usize) % pool.len()])
+    Some(&candidates[(hash as usize) % candidates.len()].reward)
 }
 
 #[cfg(test)]
@@ -30,52 +115,71 @@ mod tests {
     use crate::economy::GOLD;
     use std::collections::HashMap;
 
-    fn pool() -> Vec<RewardGrant> {
-        vec![
-            RewardGrant {
-                currencies: HashMap::from([(GOLD, 10)]),
+    fn sample(chest_level: u64, gold: u64) -> ChestLootSample {
+        ChestLootSample {
+            chest_level,
+            reward: RewardGrant {
+                currencies: HashMap::from([(GOLD, gold)]),
                 ..Default::default()
             },
-            RewardGrant {
-                currencies: HashMap::from([(GOLD, 20)]),
-                ..Default::default()
-            },
-        ]
+        }
+    }
+
+    fn tables() -> ChestLootTables {
+        ChestLootTables {
+            tiers: BTreeMap::from([
+                (1, vec![sample(1, 100), sample(90, 900)]),
+                (2, vec![sample(1, 200), sample(90, 2000)]),
+            ]),
+            provisional_tiers: BTreeMap::from([(4, vec![sample(80, 20000)])]),
+        }
     }
 
     #[test]
-    fn pick_is_deterministic_per_granted_chest() {
-        let p = pool();
-        let a = pick_loot(&p, "character-a:7:1:1:20").unwrap().currencies[&GOLD];
-        let b = pick_loot(&p, "character-a:7:1:1:20").unwrap().currencies[&GOLD];
-        assert_eq!(a, b, "same granted chest -> same loot");
+    fn pick_is_deterministic_per_chest_id() {
+        let t = tables();
+        let a = pick_loot(&t, 1, 5, "7").unwrap().currencies[&GOLD];
+        let b = pick_loot(&t, 1, 5, "7").unwrap().currencies[&GOLD];
+        assert_eq!(a, b, "same chest -> same loot");
     }
 
     #[test]
-    fn a_reused_numeric_id_does_not_repeat_forever() {
-        let p: Vec<_> = (0..40)
-            .map(|n| RewardGrant {
-                currencies: HashMap::from([(GOLD, n)]),
-                ..Default::default()
-            })
-            .collect();
-        let outcomes: std::collections::HashSet<_> = (1..=40)
-            // Chest id `1` is reused whenever the previous only chest was opened.
-            // Treasury version persists and advances across those grants.
-            .map(|generation| {
-                pick_loot(&p, &format!("character-a:1:1:20:{generation}"))
-                    .unwrap()
-                    .currencies[&GOLD]
-            })
-            .collect();
-        assert!(
-            outcomes.len() > 20,
-            "reused id must still draw across the pool"
-        );
+    fn tier_selects_the_tier_table() {
+        let t = tables();
+        assert_eq!(pick_loot(&t, 1, 1, "1").unwrap().currencies[&GOLD], 100);
+        assert_eq!(pick_loot(&t, 2, 1, "1").unwrap().currencies[&GOLD], 200);
     }
 
     #[test]
-    fn empty_pool_yields_none() {
-        assert!(pick_loot(&[], "character-a:1:1:20:1").is_none());
+    fn level_selects_the_nearest_sample() {
+        let t = tables();
+        assert_eq!(pick_loot(&t, 1, 3, "1").unwrap().currencies[&GOLD], 100);
+        assert_eq!(pick_loot(&t, 1, 88, "1").unwrap().currencies[&GOLD], 900);
+    }
+
+    #[test]
+    fn provisional_tier_is_used_before_another_tiers_table() {
+        let t = tables();
+        assert_eq!(pick_loot(&t, 4, 80, "1").unwrap().currencies[&GOLD], 20000);
+    }
+
+    #[test]
+    fn unobserved_tier_falls_back_to_the_nearest_table_below() {
+        let t = tables();
+        // Tier 3 was never observed in this fixture: prefer tier 2 over tier 1.
+        assert_eq!(pick_loot(&t, 3, 1, "1").unwrap().currencies[&GOLD], 200);
+    }
+
+    #[test]
+    fn has_own_pool_distinguishes_a_fallback() {
+        let t = tables();
+        assert!(t.has_own_pool(1));
+        assert!(t.has_own_pool(4), "provisional counts as its own");
+        assert!(!t.has_own_pool(3), "tier 3 would borrow tier 2's table");
+    }
+
+    #[test]
+    fn empty_tables_yield_none() {
+        assert!(pick_loot(&ChestLootTables::default(), 1, 1, "1").is_none());
     }
 }

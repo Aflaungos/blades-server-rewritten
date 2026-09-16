@@ -84,7 +84,12 @@ pub async fn collect_chest(
                 "{character_id}:{chest_id}:{chest_tier}:{chest_level}:{}",
                 entry.inventory.0.treasury_version
             );
-            let mut reward = chests::pick_loot(&globals.static_data.chest_loots, &loot_key)
+            let mut reward = chests::pick_loot(
+                &globals.static_data.chest_loots,
+                chest_tier,
+                chest_level,
+                &loot_key,
+            )
                 .cloned()
                 .unwrap_or_default();
             for item in &mut reward.items {
