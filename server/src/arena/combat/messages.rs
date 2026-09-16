@@ -151,6 +151,28 @@ pub fn user_message_gmid(user_data: &[u8]) -> Option<u8> {
         .and_then(|v| u8::try_from(v).ok())
 }
 
+/// True iff a c2s frame is the player's `ConcedeMatch` (the in-match exit button).
+///
+/// **Both wire forms, because the client uses the second one.** The engine used to
+/// test `user_data[1] == 28` only — a bare carrier byte. No captured frame has that
+/// shape: every one of the 34 `ConcedeMatch` frames in the corpus rides carrier
+/// `0x36` with the id at NetData propId 3, exactly like op36/op61. A carrier-byte
+/// histogram over the c2s traffic of the four sessions that contain a concede shows
+/// `BE36` 5003 times and `BE1C` not once, while `BE41`, `BE69` and `BE37` all appear
+/// — so a bare carrier was detectable and is simply not what arrives.
+///
+/// That is report #153: concede between rounds did nothing, because the branch that
+/// ends the match could never match a real client frame. The regression that
+/// "proved" concede worked fed the engine `[0xBE, 28]`, a frame the client never
+/// sends — it tested the implementation's own assumption rather than the wire.
+///
+/// The bare form is still accepted: it costs one comparison, the debug injector
+/// emits it, and removing it would break those paths for no gain.
+pub fn is_concede_match(user_data: &[u8]) -> bool {
+    user_data.get(1) == Some(&(GameMessageId::ConcedeMatch as u8))
+        || user_message_gmid(user_data) == Some(GameMessageId::ConcedeMatch as u8)
+}
+
 /// True iff a carrier-`0x36` c2s frame is the client's `LoadoutClientBackendSynchronized`
 /// (op61) — a round-transition handshake signal, NOT a combat input.
 pub fn is_loadout_backend_synchronized(user_data: &[u8]) -> bool {
@@ -2949,5 +2971,72 @@ mod tests {
         assert_eq!(nd.int(0), Some(125), "p0 defender obj");
         assert_eq!(nd.int(1), Some(56), "p1 Avatar");
         assert_eq!(nd.int(3), Some(66), "p3 DamageNegated gmid");
+    }
+}
+
+#[cfg(test)]
+mod concede_wire_form_tests {
+    use super::*;
+
+    /// A real client concede: carrier `0x36`, id at NetData propId 3.
+    fn concede_frame() -> Vec<u8> {
+        let mut w = NetDataWriter::new();
+        w.int(0, 1)
+            .byte(1, NetObjectType::Player as u8)
+            .byte(2, NetRole::Authority as u8)
+            .byte(3, GameMessageId::ConcedeMatch as u8);
+        frame(MSGTYPE_USERMESSAGE, w.finish())
+    }
+
+    /// THE regression. Every one of the 34 ConcedeMatch frames in the corpus rides
+    /// carrier `0x36`; a carrier histogram over the c2s traffic of the four sessions
+    /// containing a concede shows `BE36` 5003 times and `BE1C` not once — while
+    /// `BE41`, `BE69` and `BE37` all appear, so a bare carrier was detectable.
+    /// Testing `user_data[1] == 28` therefore never fired on a real frame, and the
+    /// exit button did nothing (report #153).
+    #[test]
+    fn the_wire_form_the_client_actually_sends_is_a_concede() {
+        let f = concede_frame();
+        assert_eq!(f[1], MSGTYPE_USERMESSAGE, "the client rides carrier 0x36");
+        assert_ne!(
+            f[1],
+            GameMessageId::ConcedeMatch as u8,
+            "byte 1 is the CARRIER, never the GameMessageId — the old check read this"
+        );
+        assert!(is_concede_match(&f), "a real client concede must be recognised");
+    }
+
+    /// The bare-carrier form stays accepted: the debug injector emits it and the
+    /// cost is one comparison.
+    #[test]
+    fn the_bare_carrier_form_is_still_accepted() {
+        assert!(is_concede_match(&[MARKER_S2C, GameMessageId::ConcedeMatch as u8]));
+    }
+
+    /// The control, and the one that matters most: the OTHER carrier-0x36 frames
+    /// the client sends constantly between rounds must NOT read as a concede.
+    /// Widening the check until it matched would have ended matches at random.
+    #[test]
+    fn the_neighbouring_handshake_frames_are_not_concedes() {
+        for (name, gmid) in [
+            ("PlayerLoadoutReady", GameMessageId::PlayerLoadoutReady),
+            ("LoadoutClientBackendSynchronized", GameMessageId::LoadoutClientBackendSynchronized),
+            ("PlayerWelcome", GameMessageId::PlayerWelcome),
+        ] {
+            let mut w = NetDataWriter::new();
+            w.int(0, 1)
+                .byte(1, NetObjectType::Player as u8)
+                .byte(2, NetRole::Authority as u8)
+                .byte(3, gmid as u8);
+            let f = frame(MSGTYPE_USERMESSAGE, w.finish());
+            assert!(!is_concede_match(&f), "{name} must not read as a concede");
+        }
+    }
+
+    /// A short or empty frame must not panic or match.
+    #[test]
+    fn a_truncated_frame_is_not_a_concede() {
+        assert!(!is_concede_match(&[]));
+        assert!(!is_concede_match(&[MARKER_S2C]));
     }
 }
