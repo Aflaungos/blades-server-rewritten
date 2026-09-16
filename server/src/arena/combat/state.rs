@@ -2543,6 +2543,48 @@ impl MatchCombat {
         0
     }
 
+    /// Charge every equipped ability's **initial cooldown** for the round that is
+    /// about to go live.
+    ///
+    /// `ActiveAbility._initialCooldown` ("cooldown charged at the start of a fight")
+    /// is a first-use delay, distinct from the between-cast `_cooldown`, and
+    /// `docs/arena-cooldowns-authoritative.md` records it as charged on ROUND start.
+    /// The field was extracted into `gamedata.rs` for all 43 abilities that ship one
+    /// and then never read by anything, so the gate simply did not exist: with the
+    /// cooldown map empty at round start, an ability was castable on the round's
+    /// first tick.
+    ///
+    /// Report: the AI opened round 2 with **Reckless Fury 1.35 s in** (match
+    /// `7c8f70ac`, round live 19:36:03.271, cast 19:36:04.626). Reckless Fury has the
+    /// longest initial cooldown in the game at 10.5 s — it should not have been
+    /// available until 10.5 s. Stamina could not gate it either: the same reset
+    /// refills pools to full, so its 425 cost was affordable immediately.
+    ///
+    /// Charged per round, not per match, because the pools, effects and cooldowns all
+    /// reset per round — a round is the "fight" this field is charged at the start of.
+    pub fn charge_initial_cooldowns(&mut self, now: Instant) {
+        for f in &mut self.fighters {
+            for a in &f.loadout.abilities {
+                let Some(secs) =
+                    super::tables::ability_initial_cooldown_secs(&a.instance_uuid, a.level)
+                else {
+                    continue;
+                };
+                if secs <= 0.0 {
+                    continue;
+                }
+                // Never SHORTEN an existing entry: the between-round reset clears the
+                // map first, so in practice this only ever inserts, but a future caller
+                // must not be able to hand a fighter a discount.
+                let until = now + std::time::Duration::from_secs_f32(secs);
+                let e = f.cooldowns.entry(a.instance_uuid.clone()).or_insert(until);
+                if *e < until {
+                    *e = until;
+                }
+            }
+        }
+    }
+
     /// Reset both fighters to full pools for the next round (best-of-3 loop): HP/
     /// Stamina/Magicka back to max, clear cooldowns / status effects / block /
     /// swing-throttle, actor back to Idle. The stats sequence id keeps rising

@@ -4760,6 +4760,108 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Initial cooldown: the round-start first-use delay
+    // -----------------------------------------------------------------------
+
+    /// Reckless Fury must not be castable on the round's opening tick.
+    ///
+    /// `ActiveAbility._initialCooldown` is charged when a round goes live, and
+    /// Reckless Fury's is 10.5 s — the longest in the game, 3.8x the 2.75 s tier
+    /// below it. The field was extracted into `gamedata.rs` and never read, so the
+    /// gate did not exist: the AI opened round 2 of match `7c8f70ac` with Reckless
+    /// Fury **1.35 s in** (round live 19:36:03.271, cast 19:36:04.626).
+    ///
+    /// Stamina could not stand in for the gate — the between-round reset refills
+    /// pools to full, so the 425 cost was affordable on the first tick. This test
+    /// therefore funds the cast deliberately: the ONLY thing that may reject it is
+    /// the initial cooldown.
+    #[test]
+    fn reckless_fury_is_not_castable_on_the_rounds_opening_tick() {
+        let now = Instant::now();
+        let mut combat = make_live_combat(now);
+
+        let rf_uuid = "0cfe29cd-89d9-42ad-9227-8308e2f87c7f";
+        combat.fighters[0].loadout.abilities.push(EquippedAbility {
+            instance_uuid: rf_uuid.to_string(),
+            level: 1,
+            tag: AbilityTag::Maneuver,
+        });
+        // Fund it past the 425 stamina cost, so cost can never be the reason.
+        combat.fighters[0].max_stamina = 660;
+        combat.fighters[0].stamina = 660;
+
+        // The round goes live.
+        combat.charge_initial_cooldowns(now);
+
+        // 1.35 s in — exactly where the reported cast landed.
+        let at_report = now + Duration::from_millis(1350);
+        let frame = make_ability_frame(120, rf_uuid);
+        let out = on_c2s_input(&mut combat, 0, &frame, at_report);
+        assert!(
+            out.is_empty(),
+            "Reckless Fury at 1.35 s must be refused by the 10.5 s initial cooldown, \
+             got {} frame(s)",
+            out.len()
+        );
+        assert_eq!(
+            combat.fighters[0].stamina, 660,
+            "a refused cast must not spend stamina"
+        );
+
+        // The control: the same cast, funded identically, once the 10.5 s has run.
+        // Without this the test would also pass if the ability were simply broken.
+        let after = now + Duration::from_millis(10_600);
+        let out = on_c2s_input(&mut combat, 0, &frame, after);
+        assert!(
+            !out.is_empty(),
+            "once the initial cooldown expires the same cast must go through"
+        );
+        assert_eq!(
+            combat.fighters[0].stamina,
+            660 - 425,
+            "the accepted cast spends its 425 stamina"
+        );
+    }
+
+    /// The control on the seeding itself: an ability that ships NO `_initialCooldown`
+    /// must not be gated at round start, or charging them would silently freeze
+    /// abilities retail leaves available on the opening tick.
+    #[test]
+    fn an_ability_without_an_initial_cooldown_is_open_at_round_start() {
+        let now = Instant::now();
+        let mut combat = make_live_combat(now);
+
+        // Quick Strikes ships an initialCooldown (2.08 s); Chaotic Strike does not.
+        let qs_uuid = "eb0cb7e6-47cf-48e7-8cc9-dbf80fc77f13";
+        combat.fighters[0].loadout.abilities.push(EquippedAbility {
+            instance_uuid: qs_uuid.to_string(),
+            level: 1,
+            tag: AbilityTag::Maneuver,
+        });
+        combat.fighters[0].max_stamina = 660;
+        combat.fighters[0].stamina = 660;
+        combat.charge_initial_cooldowns(now);
+
+        assert!(
+            combat.fighters[0].cooldowns.contains_key(qs_uuid),
+            "Quick Strikes ships a 2.08 s initial cooldown and must be charged"
+        );
+
+        // An ability the table has no initial cooldown for must be left uncharged.
+        let unknown = "00000000-0000-4000-8000-000000000000";
+        combat.fighters[0].loadout.abilities.push(EquippedAbility {
+            instance_uuid: unknown.to_string(),
+            level: 1,
+            tag: AbilityTag::Generic,
+        });
+        combat.charge_initial_cooldowns(now);
+        assert!(
+            !combat.fighters[0].cooldowns.contains_key(unknown),
+            "an ability with no shipped initial cooldown must stay open at round start"
+        );
+    }
+
     /// An ability cast when the caster HAS enough stamina succeeds: cooldown is set,
     /// stamina is deducted, an op65 PlayerStatsUpdate (ch1) is emitted. [spec §1]
     #[test]
