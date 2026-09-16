@@ -838,6 +838,17 @@ pub struct Loadout {
     /// bonus into the next auto-attack.
     pub maneuver_bonus_damage: f32,
 
+    /// Multiplier on POISON damage for the maneuver being resolved — Venom Strikes'
+    /// `_poisonEffectIncrease` (0.08 = +8%), which was read by nobody, so the
+    /// maneuver was a plain strike with a misleading name.
+    ///
+    /// Set on a clone for one cast, like `maneuver_bonus_damage`. The `Default` is
+    /// 0.0 and the applying code tests `> 1.0`, so both 0.0 and 1.0 are inert.
+    /// (`_poisonDurationIncrease` is deliberately NOT wired: it is **0 on all 13
+    /// ranks** despite a loc string existing for it. That is the data, not an
+    /// omission.)
+    pub poison_effect_multiplier: f32,
+
     /// Resolved perk bonuses, computed once at parse time. `Default` (every
     /// field zero) for a fighter with no perks, which every application site
     /// treats as a no-op.
@@ -1033,6 +1044,14 @@ pub struct ActiveChannel {
     /// evaluated once, when the spell goes off — the cast itself spends magicka, so
     /// re-reading it per tick would turn the perk off for every tick but the first.
     pub magicka_full_at_cast: bool,
+    /// Seconds between this channel's ticks.
+    ///
+    /// Almost always the 0.2 s global PvP tick, but THUNDERSTORM is not a channel in
+    /// the DoT sense: it ships `_numberOfBolts` 3 over a `_duration` of 9 s, i.e. one
+    /// bolt every 3 s. The interval is DERIVED (duration / bolts) — no interval field
+    /// is authored — and it is per-channel because a hardcoded global tick turned
+    /// Thunderstorm into a single immediate hit.
+    pub interval_secs: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -1251,6 +1270,31 @@ pub struct Fighter {
     /// was resolved as one ordinary Middle weapon hit. That is the whole of the
     /// production report in match fffe01ca — the AI cast Fury and was stunned 2 s
     /// later, inside the window that is supposed to make it un-stunnable.
+    /// **Magicka Surge**: a flat magicka-per-second bonus until this instant, then a
+    /// blackout window in which magicka does not regenerate at all.
+    ///
+    /// `MagickaSurgeAbility` ships `_magickaRegenerationBonus` (81.84/s at rank 1),
+    /// `_duration` (10 s) and `_noMagickaRegenDuration` (10 s) — the drawback that
+    /// pays for the surge. All three were unread, so the spell cost magicka and did
+    /// nothing whatsoever.
+    /// **Reflecting Bash**: while this instant is in the future, damage the defender
+    /// takes is redirected back at its attacker, up to `reflect_remaining`.
+    ///
+    /// `_damageReduction` (110.67 at rank 1) is the cap on damage "absorbed AND
+    /// redirected". The reduction half was already applied as a transient resistance;
+    /// the REDIRECT half was never implemented, so Reflecting Bash was strictly worse
+    /// than Shield Bash — same guard, less damage, no reflection.
+    pub reflect_until: Option<Instant>,
+    /// Remaining redirect budget for the current Reflecting Bash window.
+    pub reflect_remaining: f32,
+
+    pub magicka_surge_until: Option<Instant>,
+    /// Flat magicka/second granted while `magicka_surge_until` is in the future.
+    pub magicka_surge_bonus: f32,
+    /// No magicka regenerates at all until this instant — Magicka Surge's drawback,
+    /// which begins when the surge itself ends.
+    pub no_magicka_regen_until: Option<Instant>,
+
     pub reckless_fury_until: Option<Instant>,
     /// Flat bonus damage Fury adds to each swing while active, chosen by the
     /// wielder's WEAPON CLASS from the rank's `bonusDamages` table
@@ -1363,6 +1407,15 @@ pub struct NegationPool {
     /// on a dodge that connects: it is the only number the data actually contains,
     /// and awarding nothing was the bug.
     pub on_absorb_restore: (f32, f32, f32),
+    /// Damage types this pool does NOT absorb — `_vulnerableDamageTypes`.
+    ///
+    /// Blizzard Armor ships `[4 Fire]`: the ice shield is weak to fire. The shipped
+    /// data names the TYPE and no magnitude, so the faithful reading with nothing
+    /// invented is that the shield simply does not stop it — fire passes straight
+    /// through a Blizzard Armor instead of being halved by it. Inventing a
+    /// "takes 1.5x fire" multiplier would be making up a number the game never
+    /// authored.
+    pub bypass_types: &'static [i32],
 }
 
 /// The sliding damage-history window length (`ElementalStatusEffectData._duration` ≈ 5 s
@@ -1436,6 +1489,11 @@ impl Fighter {
         Fighter {
             slot,
             net_object_id,
+            reflect_until: None,
+            reflect_remaining: 0.0,
+            magicka_surge_until: None,
+            magicka_surge_bonus: 0.0,
+            no_magicka_regen_until: None,
             reckless_fury_until: None,
             reckless_fury_bonus: 0.0,
             player_net_object_id: 0, // assigned by MatchInstance::new
@@ -2111,9 +2169,12 @@ impl Fighter {
             // Which components may this pool touch at all? Ward is elemental-only
             // (see `NegationPool::elemental_only`); everything else keeps the old
             // "any health component" reach.
+            let bypass = pool.bypass_types;
             let eligible_ty = |t: DamageType| {
                 super::damage::is_health_type(t)
                     && (!pool.elemental_only || super::damage::is_elemental(t))
+                    // `_vulnerableDamageTypes`: a Blizzard Armor does not stop fire.
+                    && !bypass.contains(&(t as i32))
             };
             // Did this hit exhaust the pool? Only then does the overflow clause fire.
             let had_budget = pool.remaining > 0.0;
@@ -3076,6 +3137,7 @@ mod absorb_fraction_tests {
             elemental_only: false,
             consumes_overflow: false,
             on_absorb_restore: (0.0, 0.0, 0.0),
+            bypass_types: &[],
         }
     }
 
@@ -3130,6 +3192,7 @@ mod absorb_fraction_tests {
             elemental_only: true,
             consumes_overflow: true,
             on_absorb_restore: (0.0, 0.0, 0.0),
+            bypass_types: &[],
         }
     }
 
@@ -3235,6 +3298,7 @@ mod absorb_fraction_tests {
             elemental_only: false,
             consumes_overflow: false,
             on_absorb_restore: (43.5, 338.0, 4.0),
+            bypass_types: &[],
         });
         // A multi-component hit: the restoration must NOT be paid per component.
         let mut c = vec![
@@ -3263,6 +3327,7 @@ mod absorb_fraction_tests {
             elemental_only: false,
             consumes_overflow: false,
             on_absorb_restore: (43.5, 338.0, 4.0),
+            bypass_types: &[],
         });
         // Only a Magicka drain — not a health-type component, so nothing is absorbed.
         let mut c = vec![(DamageType::Magicka, 100.0)];
@@ -3287,6 +3352,7 @@ mod absorb_fraction_tests {
             elemental_only: false,
             consumes_overflow: false,
             on_absorb_restore: (0.0, 0.0, 0.0),
+            bypass_types: &[],
         });
         let mut c = vec![(DamageType::Slashing, 130.0)];
         let r = f.apply_negation_pools(&mut c);
