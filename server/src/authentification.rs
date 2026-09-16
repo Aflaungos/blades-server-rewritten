@@ -621,6 +621,17 @@ async fn anon_log_in(
                 ));
                 let session_id = app_state.session_store.store_new_session(session.clone());
                 crate::session::persist_session(&app_state.db_pool, session_id, session.as_ref()).await;
+                // Every exit from anon_log_in goes through this. Our APK has the FTUE
+                // patched out, so a player with no character never gets offered creation —
+                // it asks for its characters, gets an empty list and sits on the loading
+                // screen forever with everything answered 200 (reports #155/#158).
+                // It is a count query that returns early when a character exists, so
+                // putting it on every path costs nothing and heals the accounts already
+                // stranded — 118 of 282 when this was found.
+                // Best-effort: a failure here must never break the login itself.
+                if let Err(e) = crate::character::ensure_starter_character(&app_state, session.user_id).await {
+                    log::warn!("could not provision a starter character for {}: {}", session.user_id, e);
+                }
                 return Ok(web::Json(SessionResponse {
                     session: SessionResponseInner::from_session(session_id, session.as_ref()),
                 }));
@@ -653,6 +664,10 @@ async fn anon_log_in(
         let session_id = app_state.session_store.store_new_session(session.clone());
         crate::session::persist_session(&app_state.db_pool, session_id, session.as_ref()).await;
 
+        // Same as above: never leave an anon login without a character.
+        if let Err(e) = crate::character::ensure_starter_character(&app_state, session.user_id).await {
+            log::warn!("could not provision a starter character for {}: {}", session.user_id, e);
+        }
         return Ok(web::Json(SessionResponse {
             session: SessionResponseInner::from_session(session_id, session.as_ref()),
         }));
@@ -688,6 +703,10 @@ async fn anon_log_in(
         let session_id = app_state.session_store.store_new_session(session.clone());
         crate::session::persist_session(&app_state.db_pool, session_id, session.as_ref()).await;
 
+        // Same as above: never leave an anon login without a character.
+        if let Err(e) = crate::character::ensure_starter_character(&app_state, session.user_id).await {
+            log::warn!("could not provision a starter character for {}: {}", session.user_id, e);
+        }
         return Ok(web::Json(SessionResponse {
             session: SessionResponseInner::from_session(session_id, session.as_ref()),
         }));
@@ -774,6 +793,10 @@ async fn anon_log_in(
                 // This is a completed login, not merely a lookup hint. Falling
                 // through creates a second user for the same device and returns
                 // that new identity instead of the session we just persisted.
+                // Same as above: never leave an anon login without a character.
+                if let Err(e) = crate::character::ensure_starter_character(&app_state, session.user_id).await {
+                    log::warn!("could not provision a starter character for {}: {}", session.user_id, e);
+                }
                 return Ok(web::Json(SessionResponse {
                     session: SessionResponseInner::from_session(session_id, session.as_ref()),
                 }));
@@ -816,6 +839,10 @@ async fn anon_log_in(
         let session_id = app_state.session_store.store_new_session(session.clone());
         crate::session::persist_session(&app_state.db_pool, session_id, session.as_ref()).await;
 
+        // Same as above: never leave an anon login without a character.
+        if let Err(e) = crate::character::ensure_starter_character(&app_state, session.user_id).await {
+            log::warn!("could not provision a starter character for {}: {}", session.user_id, e);
+        }
         return Ok(web::Json(SessionResponse {
             session: SessionResponseInner::from_session(session_id, session.as_ref()),
         }));
