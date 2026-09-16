@@ -1780,9 +1780,14 @@ fn apply_ability_impact(
 fn ability_impact_delay(ability_uuid: &str, level: u8) -> Duration {
     let secs = super::gamedata::ability_rank_clamped(ability_uuid, level as u16)
         .map(|r| {
-            r.channel_duration()
-                .unwrap_or(0.0)
-                .max(r.block_duration().unwrap_or(0.0))
+            // `_delayDuration` is the spell's OWN delay and is ADDITIVE to the channel
+            // — they are separate fields, not alternatives. Delayed Lightning Bolt
+            // ships channelDuration 1.3 + delayDuration 4.0, i.e. 5.3 s to impact;
+            // ignoring the delay landed it after ~1.3 s and made it indistinguishable
+            // from the ordinary Lightning Bolt it is supposed to trade time for.
+            let channel = r.channel_duration().unwrap_or(0.0)
+                + r.get(super::gamedata::AbilityField::DelayDuration).unwrap_or(0.0);
+            channel.max(r.block_duration().unwrap_or(0.0))
         })
         .unwrap_or(0.0);
     if secs.is_finite() && secs > 0.0 {
@@ -2037,10 +2042,22 @@ fn apply_shipped_effects(
 
     if let Some(cap) = r.maximum_damage_dodged() {
         if cap > 0.0 && caster < viewers {
+            // `_dodgeDuration` is authored at **1.0 s** on all four dodge maneuvers
+            // and was ignored: the pool was given the 3600 s "until consumed"
+            // placeholder, so a Dodging Strike stayed armed for an hour and ate a hit
+            // a round or more later. It is a one-second reactive window, not a
+            // banked shield.
+            let dodge_secs = r
+                .get(super::gamedata::AbilityField::DodgeDuration)
+                .filter(|v| *v > 0.0);
+            let expires = match dodge_secs {
+                Some(secs) => now + Duration::from_secs_f32(secs),
+                None => until_consumed,
+            };
             combat.fighters[caster].negation_pools.push(NegationPool {
                 source: DamageNegationSource::Dodge,
                 remaining: cap,
-                expires_at: until_consumed,
+                expires_at: expires,
                 restoration_factor: 0.0,
                 absorb_fraction: 1.0,
                 elemental_only: false,
@@ -6860,6 +6877,46 @@ mod shipped_effects_tests {
                  echoes) — it is an instant buff, not a channel"
             );
         }
+    }
+
+    /// A dodge is a ONE-SECOND reactive window, not a banked shield. `_dodgeDuration`
+    /// is authored at 1.0 s on all four dodge maneuvers and was ignored — the pool got
+    /// the 3600 s "until consumed" placeholder, so a Dodging Strike stayed armed for an
+    /// hour and could eat a hit a round later.
+    #[test]
+    fn a_dodge_pool_expires_after_its_authored_second() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        apply_shipped_effects(&mut c, 0, 1, uuid_of("DodgingStrike"), 1, 500.0, 0, now);
+        let pool = c.fighters[0].negation_pools.first().expect("a dodge pool").clone();
+        assert!(
+            pool.expires_at <= now + Duration::from_secs_f32(1.05),
+            "the dodge must lapse after its authored ~1.0s, not an hour"
+        );
+        assert!(pool.expires_at > now, "…but it is armed now");
+
+        c.fighters[0].prune_negation_pools(now + Duration::from_secs_f32(1.5));
+        assert!(c.fighters[0].negation_pools.is_empty(), "and is gone a second later");
+    }
+
+    /// Delayed Lightning Bolt trades time for damage: `_delayDuration` 4.0 is ADDITIVE
+    /// to `_channelDuration` 1.3, so it lands at ~5.3 s. The delay field was read by
+    /// nobody, so it landed after ~1.3 s — indistinguishable from the plain bolt.
+    ///
+    /// Differential against the ordinary Lightning Bolt so it cannot pass on a
+    /// constant.
+    #[test]
+    fn delayed_lightning_bolt_waits_for_its_authored_delay() {
+        let delayed = super::ability_impact_delay(uuid_of("DelayedLightningBolt"), 1);
+        let plain = super::ability_impact_delay(uuid_of("LightningBolt"), 1);
+        assert!(
+            delayed >= Duration::from_secs_f32(5.0),
+            "delayed bolt must wait channel+delay (~5.3s), got {delayed:?}"
+        );
+        assert!(
+            delayed > plain + Duration::from_secs(3),
+            "it must land far later than the plain bolt ({plain:?}), not alongside it"
+        );
     }
 
     #[test]
