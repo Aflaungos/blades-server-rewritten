@@ -1300,17 +1300,52 @@ pub(super) fn resolve_ability_cast(
             )
         })
     } else {
-        let channel_secs = super::gamedata::ability_rank_clamped(&ea.ability_uuid, level as u16)
-            .and_then(|r| r.channel_duration())
-            .unwrap_or(0.0);
-        Some(messages::player_channeling_state_change(
-            combat.fighters[sender].net_object_id,
-            combat.fighters[sender].packed_stats(),
-            combat.fighters[target_slot].packed_stats(),
-            channel_secs,
-            &ea.ability_uuid,
-            None, // propId 7: unmodelled in the corpus — omitted, never invented
-        ))
+        // An INSTANT buff is not a channelled cast either. The same rule that
+        // excludes bashes excludes these: op53 announces a channel, and an ability
+        // that ships no `_channelDuration` has none to announce.
+        //
+        // Ward, Absorb, Magicka Surge and Blizzard Armor all ship NO channelDuration,
+        // so they were going out as a `PlayerChannelingStateChange` of 0.0 s — the
+        // same malformed frame that made bashes animate wrongly (report #24), and a
+        // value retail essentially never sends (12 of 2,860 captured op53 floats are
+        // 0.0). The corpus is explicit that retail sends nothing here at all: across
+        // 144 captured Ward cast echoes and 30 Absorb cast echoes there is not one
+        // op53 or op58 between them.
+        //
+        // That is the "spell pose appears with no spell text" report: the pose was
+        // spurious: a generic cast animation for an instant buff whose brief label
+        // had already gone. The op38 echo above still identifies the cast, which is
+        // where the client gets the spell's name from.
+        super::gamedata::ability_rank_clamped(&ea.ability_uuid, level as u16)
+            .filter(|r| {
+                // "Does this ability channel at all?" — NOT "does it ship
+                // `_channelDuration`". Frostbite and Consuming Inferno carry their
+                // channel on `_channelMaxLength` instead and ship no
+                // `_channelDuration`, yet retail demonstrably sends op53 for both.
+                //
+                // Checked against the measured corpus: this predicate agrees with
+                // observed behaviour on all 14 player abilities whose op53 status is
+                // known — the ten carriers (Resist Elements, Lightning Bolt, Fireball,
+                // Ice Spike, Frostbite, Paralyze, Poison Cloud, Delayed Lightning
+                // Bolt, Blind, Consuming Inferno) and the four that send nothing
+                // (Ward, Absorb, Magicka Surge, Blizzard Armor).
+                r.channel_duration().is_some_and(|v| v > 0.0)
+                    || r.get(super::gamedata::AbilityField::ChannelMaxLength)
+                        .is_some_and(|v| v > 0.0)
+            })
+            .map(|r| {
+                // The wire float stays `_channelDuration` (0.0 when absent), exactly
+                // as before — only WHETHER the frame is sent has changed.
+                let channel_secs = r.channel_duration().unwrap_or(0.0);
+                messages::player_channeling_state_change(
+                    combat.fighters[sender].net_object_id,
+                    combat.fighters[sender].packed_stats(),
+                    combat.fighters[target_slot].packed_stats(),
+                    channel_secs,
+                    &ea.ability_uuid,
+                    None, // propId 7: unmodelled in the corpus — omitted, never invented
+                )
+            })
     };
     if let Some(f) = state_frame {
         out.push((sender, f.clone()));
@@ -2340,7 +2375,12 @@ fn emit_damage(
             resolved.source,
             resolved.flags,
             total,
-            0,
+            // The ATTACKER's current combo depth. This was a hardcoded `0`, so all
+            // 5,147 production op50 events reported comboCount 0 regardless of the
+            // chain that produced them — which both lies to the client and destroys
+            // our own ability to compare a recorded chain against retail, since the
+            // depth is the x-axis of every combo-ramp comparison.
+            i16::try_from(attacker.combo_count).unwrap_or(i16::MAX),
             resolved.active_side,
             resolved.most_resisted,
             &components,
@@ -6786,6 +6826,40 @@ mod shipped_effects_tests {
         // 5.0s authored: up just before, down just after.
         assert!(c.fighters[0].has_reckless_fury(now + Duration::from_secs_f32(4.9)));
         assert!(!c.fighters[0].has_reckless_fury(now + Duration::from_secs_f32(5.1)));
+    }
+
+    /// op53 `PlayerChannelingStateChange` announces a CHANNEL. An ability that does
+    /// not channel must not send one — we used to send a 0.0-second frame for every
+    /// non-maneuver, which is the same malformed message that made bashes animate
+    /// wrongly (report #24) and is the likely "spell pose with no spell text".
+    ///
+    /// The predicate is "ships a channel field at all", not "ships
+    /// `_channelDuration`": Frostbite and Consuming Inferno channel via
+    /// `_channelMaxLength` and retail does send op53 for them. This asserts the split
+    /// against every player ability whose retail op53 behaviour was measured — ten
+    /// carriers and four silent ones — so it cannot pass by accident in one direction.
+    #[test]
+    fn only_channelled_abilities_announce_a_channel() {
+        let channels = |editor: &str| {
+            let r = super::super::gamedata::ability_rank_clamped(uuid_of(editor), 1)
+                .unwrap_or_else(|| panic!("{editor} rank 1"));
+            r.channel_duration().is_some_and(|v| v > 0.0)
+                || r.get(super::super::gamedata::AbilityField::ChannelMaxLength)
+                    .is_some_and(|v| v > 0.0)
+        };
+        for editor in [
+            "ResistElements", "LightningBolt", "Fireball", "IceSpike", "Frostbite",
+            "Paralyze", "PosionCloud", "DelayedLightningBolt", "Blind", "ConsumingInferno",
+        ] {
+            assert!(channels(editor), "{editor} carries an op53 in retail and must send one");
+        }
+        for editor in ["Ward", "Absorb", "MagickaSurge", "BlizzardArmor"] {
+            assert!(
+                !channels(editor),
+                "{editor} sends NO op53 in retail (0 across 144 Ward and 30 Absorb cast \
+                 echoes) — it is an instant buff, not a channel"
+            );
+        }
     }
 
     #[test]

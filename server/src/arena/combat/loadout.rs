@@ -116,7 +116,8 @@ fn install_weapon(lo: &mut Loadout, w: &'static gamedata::WeaponStats, tempering
     let two_handed = !lo.has_shield;
     let weight = tables::Weight::from_class(w.weapon_class);
     let ty = map_damage_type(w.damage_type);
-    let base = base_damage_in_hand(w, two_handed) + tables::tempering_bonus(weight, tempering_level);
+    let base = base_damage_in_hand(w, two_handed)
+        + tables::tempering_bonus_in_hand(weight, tempering_level, two_handed);
     lo.weapon = WeaponProfile {
         primary_type: Some(ty),
         base_by_type: vec![(ty, base)],

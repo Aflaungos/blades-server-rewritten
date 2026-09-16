@@ -415,7 +415,35 @@ impl RetailDamageModel {
         now: Instant,
     ) -> Vec<(DamageType, f32)> {
         let weight = attacker.weapon.weight.unwrap_or(tables::Weight::Light);
-        let scale = swing_multiplier(weight, combo_count, active_side) * swing_factor;
+        // COMBO AND CHARGE DO NOT COMPOUND. They used to be multiplied, so a deep
+        // chain delivered at full charge was scaled twice — light ×4.12 × ×1.325 =
+        // ×5.459, versatile ×2.441 × ×1.625, heavy ×1.979 × ×1.987.
+        //
+        // The retail corpus shows no trace of that product. A pairwise-ratio test
+        // over every fighter's own distinct damage values (n = 5,678, 0.025-wide
+        // bins) finds no spike at any of the three charge factors, with the
+        // neighbouring bins as controls: 1.300=146, 1.325=163, 1.350=147 — i.e. the
+        // charge ratio is no more common than its neighbours; and 1.950=69,
+        // 1.975=85, 2.000=60. Retail damage piles against ONE ceiling, not the
+        // product of two.
+        //
+        // `max` keeps both mechanics intact where they act alone — a charged opener
+        // is still a charged opener, an uncharged deep chain still ramps — and only
+        // removes the double-count. This matters on most swings, not a few: the
+        // charge threshold is the weapon's backswing time (0.117 / 0.200 / 0.250 s)
+        // against a measured median hold of 0.317 s, so full charge is the norm.
+        //
+        // The exclusion is COMBO-specific. A Middle swing is scaled by the weight's
+        // CRIT factor, not by a combo chain, and the recorded s506 Middle maneuvers
+        // (up to 274.51 ≈ 113.82 × 1.325 × 1.8) do show crit and charge compounding
+        // — `s506_middle_maneuver_lands_in_recorded_band` fails if that product is
+        // removed. So crit × charge stays; only combo × charge goes.
+        let scale = match active_side {
+            ActiveSide::Left | ActiveSide::Right => {
+                swing_multiplier(weight, combo_count, active_side).max(swing_factor)
+            }
+            _ => swing_multiplier(weight, combo_count, active_side) * swing_factor,
+        };
 
         let mut components: Vec<(DamageType, f32)> = Vec::new();
         for (ty, base) in Self::physical_base_after_armor(attacker, target, now) {
