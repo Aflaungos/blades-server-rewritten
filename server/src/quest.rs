@@ -1093,6 +1093,21 @@ struct CompleteQuestResponse {
     character: CompleteCharacterWithIdWithoutData,
 }
 
+/// Mark one stored quest completion exactly once.
+///
+/// `/complete` is retried by the client whenever it commits but the response is lost,
+/// and report #157 left finished rows sitting in the table for a whole board refresh —
+/// one prod character reached a completion count of 4 on a quest the APK permits once.
+/// A row that is already `completed` is therefore an idempotency record, not permission
+/// to pay and count the quest a second time.
+fn mark_quest_completed_once(info: &mut blades_lib::user_data::Quest) -> bool {
+    if info.completed {
+        return false;
+    }
+    info.completed = true;
+    true
+}
+
 #[post(
     "/blades.bgs.services/api/game/v1/public/characters/{character_id}/quests/{quest_id}/complete"
 )]
@@ -1124,7 +1139,7 @@ pub async fn complete_quest(
                     .ok_or_else(|| BladeApiError::new(StatusCode::NOT_FOUND, 20000, 2))?
             };
 
-            // Load the quest row and mark it completed.
+            // Load the quest row. Its completed flag is also our idempotency record.
             let mut quest_entry = {
                 use crate::schema::quests;
                 quests::table
@@ -1139,7 +1154,20 @@ pub async fn complete_quest(
                     .ok_or_else(|| BladeApiError::new(StatusCode::NOT_FOUND, 20001, 1))?
             };
 
-            quest_entry.info.0.completed = true;
+            // A replayed `/complete` answers with the same shape and an empty reward:
+            // the row already holds the completion, so nothing is paid or counted twice.
+            if !mark_quest_completed_once(&mut quest_entry.info.0) {
+                let tracker = InventoryChangeTracker::default();
+                return Ok::<_, BladeApiError>(Json(CompleteQuestResponse {
+                    reward: RewardGrant::default(),
+                    inventory: entry.inventory.0.generate_client_update(&tracker),
+                    wallet: entry.wallet.0.clone(),
+                    character: CompleteCharacterWithIdWithoutData {
+                        id: character_id,
+                        character: entry.character.0.clone(),
+                    },
+                }));
+            }
 
             // Update the character's completedQuests JSON.
             // The client expects: { "<gldQuestId>": <completion_count> }
@@ -3795,6 +3823,27 @@ mod finished_quest_tests {
     #[test]
     fn an_unfinished_ordinary_quest_is_kept() {
         assert!(!is_finished_ordinary_quest(&quest(MQ03, "NORMAL", false)));
+    }
+
+    /// The row that survives until the next board refresh must not pay twice.
+    ///
+    /// `/quests` prunes finished rows, but only on the next refresh — until then the
+    /// row is still loadable, and before this guard a second `/complete` on it
+    /// incremented `completedQuests` and paid the reward again. One prod character
+    /// had reached a count of 4 on a quest the APK permits once.
+    #[test]
+    fn completing_the_same_stored_quest_twice_pays_once() {
+        let mut info = quest(MQ03, "NORMAL", false);
+        assert!(
+            mark_quest_completed_once(&mut info),
+            "the first completion applies and is paid"
+        );
+        assert!(info.completed, "and is recorded on the row");
+        assert!(
+            !mark_quest_completed_once(&mut info),
+            "a retry must not count or reward the quest a second time"
+        );
+        assert!(info.completed, "the row still reads as completed");
     }
 
     /// Jobs and events have their own lifecycles — rotated on the daily reset and
