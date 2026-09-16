@@ -1207,7 +1207,12 @@ mod tests {
 
         // Un-armored: the raw tempered base of 144.0.
         assert!((comp(&c0, DamageType::Slashing) - 144.0).abs() < 0.5);
-        assert!((comp(&c1, DamageType::Slashing) - 144.0 * 1.45).abs() < 0.5);
+        assert!(
+            (comp(&c1, DamageType::Slashing)
+                - 144.0 * super::tables::combo_factor(super::tables::Weight::Light, 1))
+            .abs()
+                < 0.5
+        );
         assert!(
             (comp(&c4, DamageType::Slashing)
                 - 144.0 * super::tables::combo_factor(super::tables::Weight::Light, 4))
@@ -1239,7 +1244,12 @@ mod tests {
             DamageType::Slashing,
         );
         assert!((c0 - 113.82).abs() < 0.05, "144 − 30.18 = 113.82, got {c0}");
-        assert!((c1 / c0 - 1.45).abs() < 1e-3, "the ramp stays proportional, got {}", c1 / c0);
+        let step = super::tables::combo_factor(super::tables::Weight::Light, 1);
+        assert!(
+            (c1 / c0 - step).abs() < 1e-3,
+            "the ramp stays proportional to the table's own factor {step}, got {}",
+            c1 / c0
+        );
         // Armor does NOT touch the elemental track.
         let poison = comp(
             &m.resolve_attack(&lo, &armored, DamageSource::Attack, ActiveSide::Right, 1.0, 0, now),

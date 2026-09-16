@@ -92,6 +92,23 @@ const S506_MANEUVER_SLASH: &[f32] = &[201.37, 274.51, 186.98];
 /// Flappety's Light Dragonbone-Poison dagger (§3), loaded from the real
 /// `WeaponTemplateList` row plus the item's tempering level and the real
 /// `Weapon Poison Damage` tier-10 curve value.
+/// The ATTACKER's profile for the s506 chain.
+///
+/// **Provenance, corrected 2026-09-17.** `netObjectId` on an op50 is the VICTIM, so
+/// Flappety RECEIVED this chain; **Blank dealt it, wielding Serpentstrike
+/// (weaponClass 2, VERSATILE)** — resolved from the in-match ENet loadout blocks,
+/// which carry both fighters' gear.
+///
+/// The weapon here is a STAND-IN: a Dragonbone Dagger at tempering 10 reproduces the
+/// recorded 113.82 post-armour base against the shipped armour pieces below, and that
+/// is all this fixture is for — pinning the damage PIPELINE against recorded values.
+/// It is deliberately not rebuilt around Serpentstrike, because doing so would need
+/// Flappety's contemporaneous armour, which this fixture solves rather than knows.
+///
+/// What the mislabelling cost: the chain's ×1.45 first step was read as a LIGHT
+/// measurement and written into `LIGHT_COMBO_RAMP`. It is the Versatile population
+/// median (1.443). Assertions on the chain ratio below therefore use
+/// `Weight::Versatile`, not the stand-in weapon's class.
 fn flappety_dagger() -> Loadout {
     let w = gamedata::weapon(gamedata::ids::DRAGONBONE_DAGGER).expect("Dragonbone Dagger");
     let mut lo = Loadout {
@@ -105,6 +122,11 @@ fn flappety_dagger() -> Loadout {
     lo.weapon_optimal_block_boost = w.optimal_block_boost.max(1.0);
     lo.block_rating = w.block_base;
     lo.enchants = vec![(DamageType::Poison, 10)];
+    // The attacker's real class. The stand-in weapon above supplies the BASE that
+    // reproduces the recorded 113.82; the CLASS must be Blank's actual Serpentstrike
+    // (weaponClass 2), because that is what selects the combo factor — and reading it
+    // as Light is precisely the error this fixture used to encode.
+    lo.weapon.weight = Some(Weight::Versatile);
     lo
 }
 
@@ -189,7 +211,9 @@ fn s506_fixture_is_derived_from_shipped_item_data() {
         (base - 144.0).abs() < 1e-3,
         "DIVERGENCE: tempered base {base} != 99.0 + tempering_bonus(Light, 10) 45.0",
     );
-    assert_eq!(lo.weapon.weight, Some(Weight::Light));
+    // The attacker's real class — Blank's Serpentstrike. The BASE stays the
+    // stand-in's 144.0 asserted above; only the class is corrected.
+    assert_eq!(lo.weapon.weight, Some(Weight::Versatile));
     assert!((lo.swing_interval().as_secs_f32() - 0.333333).abs() < 1e-4);
     // The poison magnitude comes from the family curve, not a literal.
     let poison = super::tables::enchant_damage(WEAPON_POISON_DAMAGE, 10).expect("poison t10");
@@ -230,7 +254,7 @@ fn s506_combo_ramp_reproduces_recorded_slashing() {
             "DIVERGENCE (COMBO §4.2): combo {count} Slashing modeled {got:.2} vs s506 recorded \
              {recorded:.2} (tol ±{tol:.2}). combo_factor(Light,{count})={:.3}, tempered base 144.0, \
              armor cut {:.2}.",
-            combo_factor(Weight::Light, count),
+            combo_factor(Weight::Versatile, count),
             super::tables::armor_reduction(144.0, blank_armor_rating()),
         );
     }
@@ -238,15 +262,28 @@ fn s506_combo_ramp_reproduces_recorded_slashing() {
     let c0 = slash_of(&m.resolve_attack(&lo, &blank(), DamageSource::Attack, ActiveSide::Right, 1.0, 0, now));
     let c1 = slash_of(&m.resolve_attack(&lo, &blank(), DamageSource::Attack, ActiveSide::Left, 1.0, 1, now));
     assert!((c0 - 113.82).abs() < 0.05, "combo-0 anchor {c0:.2} != recorded 113.82");
-    assert!((c1 - 165.07).abs() < 1.0, "combo-1 anchor {c1:.2} != recorded 165.07 (×1.45)");
+    let step = super::tables::combo_factor(Weight::Versatile, 1);
+    assert!(
+        (c1 - 113.82 * step).abs() < 1.5,
+        "combo-1 anchor {c1:.2} should be the combo-0 base x the Versatile factor \
+         {step} (recorded 165.07)"
+    );
     let c9 = slash_of(&m.resolve_attack(&lo, &blank(), DamageSource::Attack, ActiveSide::Right, 1.0, 9, now));
     assert!(
-        (c9 - 113.82 * super::tables::LIGHT_COMBO_CAP).abs() < 1.0,
+        (c9 - 113.82 * super::tables::combo_factor(Weight::Versatile, 9)).abs() < 1.0,
         "a deep combo is capped at the ramp's own ceiling, got {c9:.1}"
     );
     // The ramp is exactly proportional to the post-armor base — the reason armor is
     // applied BEFORE the swing factor (see `damage.rs` module doc).
-    assert!((c1 / c0 - 1.45).abs() < 1e-3, "ratio {} != 1.45", c1 / c0);
+    // The attacker was VERSATILE (Serpentstrike) — see the fixture note. The recorded
+    // first step is 1.451, twice and identically, and the Versatile population median
+    // is 1.443.
+    let want = super::tables::combo_factor(Weight::Versatile, 1);
+    assert!(
+        (c1 / c0 - want).abs() < 0.05,
+        "recorded first step {} should match the Versatile factor {want}",
+        c1 / c0
+    );
 }
 
 #[test]
@@ -266,7 +303,7 @@ fn s506_middle_maneuver_lands_in_recorded_band() {
             rec >= lo_m * 0.85 && rec <= hi_m * 1.15,
             "DIVERGENCE (MANEUVER §4.2): recorded Middle maneuver {rec:.1} outside the modeled \
              charged band [{lo_m:.1}, {hi_m:.1}] (Light crit ×{:.3} × swing_factor).",
-            Weight::Light.crit_combo().0,
+            Weight::Versatile.crit_combo().0,
         );
     }
 }
@@ -458,12 +495,12 @@ fn s506_full_chain_through_engine_reproduces_ramp_and_resets_on_block() {
     // than a literal 2.5, so a recalibration cannot leave this asserting a stale
     // constant (it was written when the ceiling was 4.12).
     assert!(
-        last_slash > S506_SLASH_BASE * 1.5,
+        last_slash > S506_SLASH_BASE * 1.2,
         "a deep chain must climb well above its fresh swing: {last_slash:.1} vs base \
          {S506_SLASH_BASE:.1}"
     );
     assert!(
-        last_slash <= S506_SLASH_BASE * super::tables::LIGHT_COMBO_CAP + 1.0,
+        last_slash <= S506_SLASH_BASE * super::tables::combo_factor(Weight::Versatile, 9) + 1.0,
         "…and must not exceed the ramp ceiling"
     );
 
@@ -504,7 +541,7 @@ fn s506_anchor_report() {
     rows.push((
         "combo-4 Slashing (no recorded counterpart)",
         slash_of(&c4),
-        113.82 * super::tables::LIGHT_COMBO_CAP,
+        113.82 * super::tables::combo_factor(Weight::Versatile, 9),
     ));
 
     let mut def = blank();
@@ -529,7 +566,7 @@ fn s506_anchor_report() {
     rows.push((
         "deep-combo Slashing",
         slash_of(&big),
-        113.82 * super::tables::LIGHT_COMBO_CAP,
+        113.82 * super::tables::combo_factor(Weight::Versatile, 9),
     ));
 
     println!("\n  s506 anchor    | emitted  | recorded | delta");

@@ -68,37 +68,6 @@ impl Weight {
         }
     }
 
-    /// Per-step combo multiplier and ceiling for the GEOMETRIC fallback in
-    /// [`combo_factor`] (weights WITHOUT a capture-pinned per-depth table).
-    ///
-    /// The old comment here said Versatile and Heavy were "GUESS (no capture)".
-    /// **That was false.** The retail corpus does contain both: versatile appears in
-    /// 46 sessions and heavy in 21 (s615/s616 alone carry all three classes —
-    /// Flappety light, Taheen versatile, Huracan heavy). Nobody had looked.
-    ///
-    /// Measured medians relative to each fighter's own combo-0 damage, over distinct
-    /// unblocked Left/Right hits:
-    ///
-    /// | class     | n    | depth 0/1/2/3/4               |
-    /// |-----------|------|-------------------------------|
-    /// | Versatile | 1003 | 1.00 / 1.42 / 1.21 / 0.80 / 0.45 |
-    /// | Heavy     |  247 | 1.00 / 1.36 / 1.35 / 1.24 / 1.29 |
-    ///
-    /// Both PEAK around depth 1-2 at ~1.3-1.4× and never exceed ~1.4×; retail's
-    /// maximum damage does not rise with depth at all. The old geometric ceilings
-    /// (2.441 versatile, 1.979 heavy) were ~1.7-2.0× and ~1.5× too steep.
-    ///
-    /// The per-step ratio is kept — the climb to the peak is about right — and only
-    /// the CEILING is corrected, deliberately: the measured tails are non-monotonic
-    /// and pool different bases, tempering and defender armor, so the peak is what
-    /// the data robustly supports and the tail shape is not.
-    pub fn combo_step_cap(self) -> (f32, f32) {
-        match self {
-            Weight::Light => (1.45, LIGHT_COMBO_CAP), // table-driven; see LIGHT_COMBO_RAMP
-            Weight::Versatile => (1.250, 1.40),       // capture-measured ceiling (1003 hits)
-            Weight::Heavy => (1.186, 1.40),           // capture-measured ceiling (247 hits)
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -149,60 +118,59 @@ pub fn fallback_swing_interval(weight: Weight) -> std::time::Duration {
 // Combo ramp (capture-pinned — NOT shipped data)
 // ---------------------------------------------------------------------------
 
-/// The Light-weapon combo ramp, indexed by chain depth (0 = the fresh post-reset
-/// swing).
+/// The Light combo ceiling — identical to its depth-1 factor, because the ramp is a
+/// single step (see [`combo_factor`]).
 ///
-/// **Was `[1.00, 1.45, 1.50, 2.65, 4.12]`. That table was wrong on three independent
-/// counts**, all established 2026-09-16 by re-deriving it from the raw s506 capture
-/// rather than from the spec document that quoted it:
-///
-/// 1. **Wrong fighter.** The series was read as damage Flappety DEALT. Every one of
-///    the four events carries `netObjectId = 124`, and `netObjectId` is the VICTIM:
-///    cross-tabulating the `wasOptimalBlocking` flag against blocking intervals built
-///    from op51 gives 190/200 set-and-blocking with a perfect 0/970 control, and the
-///    attacker reading is refuted 0/200. Object 124 is Flappety (bound two ways: a
-///    netRole-3 Autonomous avatar carrying their char UUID, and the c2s input
-///    messages, which exist only on 124). So **Blank dealt this chain**, with gear
-///    that is not in our data — no `blades_alt_equipment` row, no
-///    `arena_session_loadout` row, and a full UUID harvest over every s506 packet
-///    returns zero item templates (control: both char UUIDs *are* found). The "light"
-///    label never had a basis.
-/// 2. **Wrong index.** The wire `comboCount` (propId 9) for the four values is
-///    **0 / 1 / 1 / 2**, not 0/1/3/4.
-/// 3. **Confounded magnitude.** 2.65 and 4.12 are the StaggeredWeakness-amplified
-///    combo-1 and combo-2 divided by the UN-amplified combo-0. Plain `Staggered` does
-///    not amplify (seq 277/287 reproduce 113.82/165.07 exactly); `StaggeredWeakness`
-///    does. They were never combo factors.
-///
-/// The replacement is depth-1 from the one clean, twice-replicated, zero-status wire
-/// measurement (113.82 → 165.07 = ×1.4502), and depths 2-4 from within-chain corpus
-/// medians over 95 retail sessions — 368 chains, 40 sessions, 184 distinct fighters,
-/// deduped and gated on constant status, no dodge/ward/absorb, and no
-/// StaggeredWeakness. Within-chain means base, armour, weapon and defender are
-/// constant by construction.
-///
-/// CONFIDENCE, stated because it is uneven: **high** that 4.12 had to go and that the
-/// cap belongs near 2.3; **medium** on 1.45 at depth 1; **low** on depths 2-4, where
-/// n falls to 86 / 17 / 5 after controls. The table is also now effectively
-/// class-agnostic — the corpus cannot separate weapon classes today, because the only
-/// class channel is a September equipment snapshot and gating June chains on it
-/// rejects 45% of them. Recovering contemporaneous equipment from the 179 inventory
-/// and 7,257 character bodies we already hold is the single blocking step for a real
-/// per-class ramp.
-pub const LIGHT_COMBO_RAMP: [f32; 5] = [1.00, 1.45, 1.75, 1.78, 2.30];
-/// The Light combo ceiling — the depth-4 within-chain corpus median.
-pub const LIGHT_COMBO_CAP: f32 = 2.30;
+/// **Was 4.12, and that number was an artifact.** The s506 series it came from is
+/// damage Flappety RECEIVED — `netObjectId` on an op50 is the victim — dealt by Blank
+/// wielding **Serpentstrike, a VERSATILE weapon**, and the deep values were inflated
+/// by `StaggeredWeakness` (the Powerful Block enchantment). Re-measuring that same
+/// session with the contaminated chain excluded gives 113.8 → 165.1 = **1.451**,
+/// twice and identically, which is the Versatile population median (1.443) — not a
+/// light ramp at all. The contaminated chain reproduces the old 2.652 and 4.124
+/// exactly, which is what identified them.
+pub const LIGHT_COMBO_CAP: f32 = 1.99;
 
 /// The combo multiplier for a normal swing at chain depth `count` (0 = fresh).
+/// The combo multiplier at chain depth `count` (0 = the fresh post-reset swing).
+///
+/// **The ramp is ONE STEP, then flat.** A chained swing is worth its class's factor
+/// from depth 1 onward and does not keep climbing. Measured from 46 retail sessions
+/// by the paired, within-chain step ratio `p(d)/p(d-1)` on ADJACENT hits of the same
+/// chain:
+///
+/// | class     | 0→1                     | 1→2            | 2→3   | 3→4   |
+/// |-----------|-------------------------|----------------|-------|-------|
+/// | Light     | 2.01 (n=123, CI 1.89-2.18) | 1.000 (n=44) | 1.000 | —     |
+/// | Versatile | 1.428 (n=296, CI 1.40-1.48) | 1.000 (n=87) | 1.000 | 1.000 |
+/// | Heavy     | 1.285 (n=50, CI 1.24-1.34)  | 1.000 (n=19) | 1.000 | —     |
+///
+/// Every step past the first has a bootstrap CI of exactly **[1.00, 1.00]**. The
+/// apparent rise at depth 2+ in a naive per-depth table is pure selection — chains
+/// that survive to depth 2 are the ones that happened to take a bigger first step —
+/// and the paired test removes it. This is why the old geometric curves and the
+/// 5-entry `LIGHT_COMBO_RAMP` are gone rather than re-tuned.
+///
+/// Ratios are of the PHYSICAL component only: across 396 in-chain pairs with a real
+/// physical change, the elemental component was unchanged in 293 and tracked the
+/// physical ratio in 7. Enchantment damage does not combo.
 pub fn combo_factor(weight: Weight, count: u32) -> f32 {
-    if weight == Weight::Light {
-        return LIGHT_COMBO_RAMP
-            .get(count as usize)
-            .copied()
-            .unwrap_or(LIGHT_COMBO_CAP);
+    if count == 0 {
+        return 1.0;
     }
-    let (step, cap) = weight.combo_step_cap();
-    (step.powi(count as i32)).min(cap)
+    match weight {
+        // n=63 chains / 123 step-pairs, 14 sessions, 33 fighter-streams. The widest
+        // band of the three (IQR 1.52-2.46) and 40 of its 63 chains come from one
+        // weapon, so the value may move — but Light is unambiguously the largest of
+        // the three, so the class ORDER is safe. Tightening it needs more light-weapon
+        // retail captures, not more filtering.
+        Weight::Light => 1.99,
+        // The best-evidenced of the three: n=206 chains / 296 step-pairs, 28 sessions,
+        // 92 fighter-streams, 19 distinct weapons clustering 1.25-1.60.
+        Weight::Versatile => 1.44,
+        // n=33 chains / 50 step-pairs, 13 sessions, 22 fighter-streams, 10 weapons.
+        Weight::Heavy => 1.29,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -588,35 +556,38 @@ mod tests {
         assert_eq!(enchant_damage(POISON, 3), None);
     }
 
-    /// The Light combo ramp.
-    ///
-    /// Only depth 0 and depth 1 are pinned to a recorded wire value — they are the two
-    /// clean, zero-status, replicated s506 events. Depths 2-4 are within-chain corpus
-    /// medians with n = 86 / 17 / 5, so they are asserted as a SHAPE (monotonic, under
-    /// the cap) rather than as exact anchors we do not have the evidence to defend.
-    ///
-    /// This test used to assert 1.50 / 2.65 / 4.12 at depths 2/3/4. Those came from a
-    /// circular row and two StaggeredWeakness-amplified events that the wire indexes
-    /// as combo 1 and 2 — see the note on `LIGHT_COMBO_RAMP`.
+    /// The combo ramp is ONE STEP, then flat — measured by the paired within-chain
+    /// step ratio, where every step past the first has a bootstrap CI of exactly
+    /// [1.00, 1.00]. This replaces a per-depth table whose deeper entries were a
+    /// selection artefact.
     #[test]
-    fn light_combo_ramp_is_pinned_at_its_measured_depths() {
-        assert_eq!(combo_factor(Weight::Light, 0), 1.0);
-        assert!(
-            (combo_factor(Weight::Light, 1) - 1.45).abs() < 1e-3,
-            "depth 1 is the one exactly-replicated wire measurement (113.82 -> 165.07)"
-        );
-        // Shape, not anchors: monotonic and capped.
-        for c in 0..8 {
-            assert!(combo_factor(Weight::Light, c + 1) >= combo_factor(Weight::Light, c));
-            assert!(combo_factor(Weight::Light, c) <= LIGHT_COMBO_CAP);
+    fn the_combo_ramp_is_a_single_step_then_flat() {
+        for w in [Weight::Light, Weight::Versatile, Weight::Heavy] {
+            assert_eq!(combo_factor(w, 0), 1.0, "{w:?} depth 0 is the fresh swing");
+            let step = combo_factor(w, 1);
+            assert!(step > 1.0, "{w:?} must gain something on the first chained swing");
+            for d in 2..10 {
+                assert_eq!(
+                    combo_factor(w, d),
+                    step,
+                    "{w:?} depth {d} must equal depth 1 — the ramp does not keep climbing"
+                );
+            }
         }
-        assert_eq!(combo_factor(Weight::Light, 9), LIGHT_COMBO_CAP);
-        assert!(
-            LIGHT_COMBO_CAP < 3.0,
-            "the old 4.12 ceiling was a status amplifier, not a combo factor"
-        );
     }
 
+    /// The class ORDER is the robust part of the measurement: Light gains most on the
+    /// chained swing, Heavy least. Asserted as an ordering so it survives the point
+    /// estimates moving (Light's band is the widest of the three).
+    #[test]
+    fn heavier_weapons_gain_less_from_a_combo() {
+        let l = combo_factor(Weight::Light, 1);
+        let v = combo_factor(Weight::Versatile, 1);
+        let h = combo_factor(Weight::Heavy, 1);
+        assert!(l > v && v > h, "expected Light {l} > Versatile {v} > Heavy {h}");
+        assert!(h > 1.0, "even Heavy gains something");
+        assert!(l < 3.0, "and nothing approaches the old 4.12, which was a status artefact");
+    }
     #[test]
     fn fallback_surface_still_available_for_bots() {
         assert_eq!(fallback::heavy_base(10), 165.0);

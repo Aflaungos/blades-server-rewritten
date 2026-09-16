@@ -910,9 +910,18 @@ fn drive_live_fight_gmids() -> Vec<(u64, i64)> {
     let (mut m, _t0, live) = super::engine::tests::live_inst_at(2);
     let mut log: Vec<(u64, i64)> = Vec::new();
     let step = Duration::from_millis(10);
-    // ~3 s of round time: long enough for several swings at the starter weapon's
-    // cadence, and for each swing's scheduled beats to come due on the tick.
-    for i in 0..300u64 {
+    // ~12 s of round time: long enough for several swings at the starter weapon's
+    // cadence, for each swing's scheduled beats to come due on the tick, AND for the
+    // round to reach a death.
+    //
+    // It was 3 s, and that was only ever enough because the combo ramp was inflated
+    // — a depth-4 swing was worth x2.44 (versatile) or x4.12 (light). With the ramp
+    // corrected to a single ~1.3-2.0x step, 3 s no longer kills anyone, and this test
+    // silently lost its coverage of gmids 29 (death), 39 (PlayerStateChange) and 48:
+    // the histogram went from {29:2, 39:2, 48:2, ...} to those three absent. The
+    // assertion below is about the ANIMATION classes, so the fix is to give the fight
+    // time to produce them rather than to weaken the assertion.
+    for i in 0..1200u64 {
         let now = live + step * i as u32;
         // Slot 0 presses and releases every 400 ms (past the swing cooldown), so the
         // full AutoAttack → FollowThrough → Recovery → Idle walk runs repeatedly.
