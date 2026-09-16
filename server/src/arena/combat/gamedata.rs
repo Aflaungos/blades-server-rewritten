@@ -44299,8 +44299,18 @@ mod tests {
             let got = sha256_hex(&bytes);
             assert_eq!(
                 &got, expected,
-                "\n{} changed but gamedata.rs was not regenerated.\n\
-                 Run: blades-capture/reference/game-defs/extract/gen_gamedata_rs.py\n",
+                "\n{} does not match the hash gamedata.rs was generated against.\n\n\
+                 FIRST check that the capture repo is up to date:\n\
+                 \x20   git -C <blades-capture> pull\n\
+                 A checkout behind origin/main produces exactly this failure, and is\n\
+                 by far the likeliest cause.\n\n\
+                 Only if it IS current did someone re-extract; then regenerate:\n\
+                 \x20   blades-capture/reference/game-defs/extract/gen_gamedata_rs.py\n\n\
+                 Do NOT regenerate against a stale checkout. The older items.json\n\
+                 lacks the per-weapon combat-timing fields, so the result is a\n\
+                 gamedata.rs ~4,500 lines smaller that still compiles and still\n\
+                 passes this very test — because this test hashes whatever JSON was\n\
+                 just read, so a stale source validates itself.\n",
                 path.display()
             );
         }
