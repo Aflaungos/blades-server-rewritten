@@ -858,6 +858,15 @@ pub struct Loadout {
     /// bonus into the next auto-attack.
     pub maneuver_bonus_damage: f32,
 
+    /// **Powerful Block** — `PowerfulBlockPropertyLogic`, enchantment
+    /// `f8e9dec5-c6e7-4976-b24b-2155f1921692`.
+    ///
+    /// "Target stunned by a blocked attack takes {0} extra damage while stunned."
+    /// This is the WEAKNESS RATING the wearer inflicts on an attacker whose swing
+    /// their block stunned — it is NOT block rating, which is what it was being
+    /// parsed as. Tier magnitudes 18.0 .. 50.4.
+    pub powerful_block: f32,
+
     /// Multiplier on POISON damage for the maneuver being resolved — Venom Strikes'
     /// `_poisonEffectIncrease` (0.08 = +8%), which was read by nobody, so the
     /// maneuver was a plain strike with a misleading name.
@@ -1325,6 +1334,14 @@ pub struct Fighter {
     pub echo_bonus: f32,
     pub echo_delay: f32,
 
+    /// Weakness rating this fighter is currently suffering from
+    /// `StatusEffectType::StaggeredWeakness` — the attacker holds it, and it
+    /// amplifies damage it TAKES. Zero when the status is not active.
+    ///
+    /// The status has no duration of its own (every captured op51 carries 0.0) and is
+    /// removed with the Staggered that produced it, so this is cleared there.
+    pub weakness_rating: f32,
+
     pub reflect_until: Option<Instant>,
     /// Remaining redirect budget for the current Reflecting Bash window.
     pub reflect_remaining: f32,
@@ -1536,6 +1553,7 @@ impl Fighter {
             echo_until: None,
             echo_bonus: 0.0,
             echo_delay: 0.0,
+            weakness_rating: 0.0,
             reflect_until: None,
             reflect_remaining: 0.0,
             magicka_surge_until: None,
@@ -1770,6 +1788,12 @@ impl Fighter {
     /// broken — so this reuses the capture-validated stagger path with the ability's
     /// real duration. If a real Stun id turns up in the dump, this is the one place to
     /// change.
+    /// Is this fighter under `StaggeredWeakness` right now? It lives exactly as long
+    /// as the Staggered that produced it — the status ships no duration of its own.
+    pub fn has_staggered_weakness(&self, now: Instant) -> bool {
+        self.weakness_rating > 0.0 && self.is_staggered(now)
+    }
+
     pub fn apply_stagger_for(&mut self, now: Instant, secs: f32) {
         // Reckless Fury cannot be stunned. This is the guard whose absence let the
         // production stun in match fffe01ca land 2 s into a 5 s Fury.
@@ -2081,13 +2105,24 @@ impl Fighter {
     /// a flat damage INCREASE (`increasePerWeaknessRating`), capped at
     /// `maximumWeaknessEffect`. Kept separate from resistance: netting the two (as the
     /// old model did) hid the cap and made a weakness silently cancel a resist.
-    pub fn weakness_rating_against(&self, ty: DamageType) -> f32 {
-        self.loadout
+    pub fn weakness_rating_against(&self, ty: DamageType, now: Instant) -> f32 {
+        let gear: f32 = self
+            .loadout
             .weaknesses
             .iter()
             .filter(|(t, _)| *t == ty)
             .map(|(_, v)| *v)
-            .sum()
+            .sum();
+        // `StaggeredWeakness` (Powerful Block) is TYPE-AGNOSTIC: the client's
+        // `GetWeakness(DamageType)` is two instructions and never reads its argument,
+        // and the capture agrees — one identical delta across Slashing, Shock and
+        // Magicka on the same hit, and across Slashing and Poison on another.
+        let staggered = if self.has_staggered_weakness(now) {
+            self.weakness_rating
+        } else {
+            0.0
+        };
+        gear + staggered
     }
 
     /// Combined flat resistance including transient Resist-Elements buffs (timed via
@@ -3028,8 +3063,8 @@ mod tests {
         // netting them hid the cap and let a weakness silently cancel a resist.
         f.loadout.weaknesses = vec![(DamageType::Poison, 50.0)];
         assert_eq!(f.resistance_against(DamageType::Poison, 0.0), 40.0, "resistance is untouched by weakness");
-        assert_eq!(f.weakness_rating_against(DamageType::Poison), 50.0);
-        assert_eq!(f.weakness_rating_against(DamageType::Slashing), 0.0);
+        assert_eq!(f.weakness_rating_against(DamageType::Poison, Instant::now()), 50.0);
+        assert_eq!(f.weakness_rating_against(DamageType::Slashing, Instant::now()), 0.0);
         // Elemental-Resistance-PIERCING can also be a RATING subtraction (Phase 3.4).
         assert_eq!(f.resistance_rating_against(DamageType::Poison, 0.0, 15.0), 25.0);
         assert_eq!(f.resistance_rating_against(DamageType::Poison, 0.0, 999.0), 0.0, "never negative");
@@ -3460,6 +3495,57 @@ mod absorb_fraction_tests {
         assert_eq!(r.heal, 0.0);
         assert_eq!(r.restore_magicka, 0.0);
         assert_eq!(r.restore_cooldown_secs, 0.0);
+    }
+
+    /// **Powerful Block / StaggeredWeakness.** The attacker holds the status and it
+    /// amplifies damage they TAKE, by a FLAT amount shared by every damage type of
+    /// the hit — the client's `GetWeakness(DamageType)` is two instructions and never
+    /// reads its type argument.
+    #[test]
+    fn staggered_weakness_is_flat_and_type_agnostic() {
+        let now = Instant::now();
+        let mut f = Fighter::new(0, 1, loadout::starter(), now);
+        f.weakness_rating = 50.4; // tier 10
+        f.apply_stagger_for(now, 2.5);
+        assert!(f.has_staggered_weakness(now));
+        for ty in [DamageType::Slashing, DamageType::Poison, DamageType::Shock] {
+            assert_eq!(
+                f.weakness_rating_against(ty, now),
+                50.4,
+                "{ty:?} must see the same flat rating — the effect is type-agnostic"
+            );
+        }
+    }
+
+    /// It has NO duration of its own (every captured op51 carries 0.0) and lives
+    /// exactly as long as the Staggered that produced it.
+    #[test]
+    fn staggered_weakness_dies_with_the_stagger() {
+        let now = Instant::now();
+        let mut f = Fighter::new(0, 1, loadout::starter(), now);
+        f.weakness_rating = 50.4;
+        f.apply_stagger_for(now, 2.5);
+        assert!(f.has_staggered_weakness(now));
+        let after = now + std::time::Duration::from_secs_f32(2.6);
+        assert!(!f.is_staggered(after), "precondition: the stagger has lapsed");
+        assert!(
+            !f.has_staggered_weakness(after),
+            "the weakness must lapse with it, not outlive it"
+        );
+        assert_eq!(f.weakness_rating_against(DamageType::Slashing, after), 0.0);
+    }
+
+    /// A fighter with no Powerful Block on the other side is never weakened — the
+    /// negative control that stops this firing on every stagger. Only 10 of 245
+    /// block-recoil staggers in the retail corpus carry the status.
+    #[test]
+    fn an_ordinary_stagger_carries_no_weakness() {
+        let now = Instant::now();
+        let mut f = Fighter::new(0, 1, loadout::starter(), now);
+        f.apply_stagger_for(now, 2.5);
+        assert!(f.is_staggered(now));
+        assert!(!f.has_staggered_weakness(now), "a plain stagger does not amplify");
+        assert_eq!(f.weakness_rating_against(DamageType::Slashing, now), 0.0);
     }
 
     /// Absorb is NOT element-scoped and has no overflow clause — the additivity proof

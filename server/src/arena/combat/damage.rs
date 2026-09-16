@@ -854,7 +854,29 @@ fn finish_resolved(
     //    A CHANNELLED spell (`ContinuousSpell`) is excluded for the same reason as
     //    a DoT: it re-enters here once per 0.2 s tick, so a per-tick flat bonus would
     //    pay the perk 15 times for one cast.
-    let single_impact = !continuous && source != DamageSource::ContinuousSpell;
+    // A CONTINUOUS tick DOES pay the Augmented* perks and Fortify gear — it is simply
+    // scaled down hard. Walked in the client:
+    //   AbilityContinuousDamage.Tick -> CombatManager.ResolveGenericDamage
+    //     -> Actor.ResolveDamageBonuses -> ResolvePermanentDamageBonuses
+    // and `ResolvePermanentDamageBonuses` never compares `damageSource` at all
+    // (control: `Damage.CalculateAttackTypeFactor`, which DOES branch on it, shows the
+    // `cmp` instructions this one lacks). The `PermanentFortifyDamage` list runs for
+    // every source.
+    //
+    // The scaling is in `<ResolvePermanentDamageBonuses>b__0`: for a PERIODIC source
+    // (`IsPeriodic` is true for StatusEffect, ContinuousAttack and ContinuousSpell)
+    // the accumulated bonus is multiplied by `_continuousDamageFortifyEffectiveness`
+    // (0.75) AND by `_globalTickInterval` (0.1) before it is added.
+    //
+    // So a tick pays `bonusValue * 0.075`, not the full value. Over a 15-tick 3 s
+    // channel that is 22.5 -> 25.3 total at Augmented Flames rank 11, about 10% of
+    // Consuming Inferno's own output — not the 337.5 that paying it in full per tick
+    // would give. Paying ZERO, which is what we did, was also wrong.
+    const PERIODIC_FORTIFY_SCALE: f32 = combat_params::CONTINUOUS_DAMAGE_FORTIFY_EFFECTIVENESS
+        * combat_params::GLOBAL_TICK_INTERVAL;
+    let fortify_scale = if continuous { PERIODIC_FORTIFY_SCALE } else { 1.0 };
+    // Kept only to preserve the existing name at the use site below.
+    let single_impact = true;
     // `Fortify <Element> Damage` gear joins the Augmented* perks here. Same shipped
     // shape ("Increases frost damage by {0}", no percent), so same treatment: a flat
     // add, once per hit, on the SHARED path — which is the fix. It used to be read in
@@ -878,7 +900,8 @@ fn finish_resolved(
     if single_impact {
         for (ty, v) in components.iter_mut() {
             if is_elemental(*ty) && *v > 0.0 {
-                *v += attacker.perks.element_bonus(*ty) + fortify_for(attacker, *ty);
+                *v += (attacker.perks.element_bonus(*ty) + fortify_for(attacker, *ty))
+                    * fortify_scale;
             }
         }
     }
@@ -914,7 +937,12 @@ fn finish_resolved(
         ) + target.transient_resistance_against(*ty, now);
         let resisted =
             tables::resistance_reduction(before, rating * resistance_scale, continuous);
-        let gained = tables::weakness_increase(before, target.weakness_rating_against(*ty), continuous);
+        let gained = tables::weakness_increase(
+            before,
+            target.weakness_rating_against(*ty, now),
+            rating * resistance_scale,
+            continuous,
+        );
         *v = (before - resisted + gained).max(0.0);
         if resisted > 0.0 && is_elemental(*ty) {
             let frac = resisted.min(before) / before;
@@ -1683,6 +1711,47 @@ mod every_cast_does_something {
             "these abilities are routed to the damage path but deal NOTHING — a player \
              spends the resource and sees no effect:\n  {}",
             dead.join("\n  "),
+        );
+    }
+}
+#[cfg(test)]
+mod periodic_fortify_tests {
+    use super::*;
+
+    /// A channelled tick pays the Augmented perks and Fortify gear, but scaled by
+    /// `continuousDamageFortifyEffectiveness * globalTickInterval` = 0.075. Paying it
+    /// in full per tick would be ~13x too much; paying zero — which is what we did —
+    /// was also wrong.
+    #[test]
+    fn a_periodic_tick_pays_a_scaled_fortify_bonus() {
+        let scale = combat_params::CONTINUOUS_DAMAGE_FORTIFY_EFFECTIVENESS
+            * combat_params::GLOBAL_TICK_INTERVAL;
+        assert!((scale - 0.075).abs() < 1e-6, "0.75 x 0.1 = 0.075, got {scale}");
+
+        // Augmented Flames rank 11 over a 15-tick, 3 s channel.
+        let bonus = 22.5_f32;
+        let per_tick = bonus * scale;
+        assert!((per_tick - 1.6875).abs() < 1e-4);
+        let whole_channel = per_tick * 15.0;
+        assert!(
+            (whole_channel - 25.3125).abs() < 1e-3,
+            "a full channel adds ~25, not the 337.5 an unscaled per-tick payout gives"
+        );
+        assert!(whole_channel < bonus * 2.0, "and nowhere near 15x the printed value");
+    }
+
+    /// The scaling uses `_globalTickInterval` (0.1), NOT `_globalPvPTickInterval`
+    /// (0.2), even though PvP ticks at 0.2. That is what the binary does and it is
+    /// deliberately reproduced rather than "corrected" — see the note at the use site.
+    #[test]
+    fn the_scale_uses_the_global_tick_not_the_pvp_tick() {
+        assert!(
+            (combat_params::GLOBAL_TICK_INTERVAL - 0.1).abs() < 1e-6,
+            "the fortify scale is pinned to the global tick"
+        );
+        assert!(
+            combat_params::GLOBAL_TICK_INTERVAL < combat_params::GLOBAL_PVP_TICK_INTERVAL,
+            "the two differ; using the PvP one would double the bonus"
         );
     }
 }

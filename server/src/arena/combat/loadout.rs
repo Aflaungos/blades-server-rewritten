@@ -386,8 +386,14 @@ fn apply_enchant(lo: &mut Loadout, id: &Uuid, tier: u8) {
         | "BlockReductionSlashingPropertyLogic"
         | "BlockReductionCleavingPropertyLogic"
         | "BlockReductionBashingPropertyLogic"
-        | "BlockReductionTemplarPropertyLogic"
-        | "PowerfulBlockPropertyLogic" => lo.block_rating += magnitude,
+        | "BlockReductionTemplarPropertyLogic" => lo.block_rating += magnitude,
+
+        // Powerful Block is NOT block rating. Its shipped tooltip is "Target stunned
+        // by a blocked attack takes {0} extra damage while stunned", and in the client
+        // the ONLY thing that constructs a `CombatStatusStaggeredWeaknessEffect` is
+        // `PowerfulBlockBonusInstance.CausedStagger`. Adding it to block rating made
+        // every point of it reduce incoming damage instead of punishing the attacker.
+        "PowerfulBlockPropertyLogic" => lo.powerful_block += magnitude,
 
         // ---- piercing ------------------------------------------------------
         "ResistancePiercingElementalPropertyLogic" => lo.elem_resist_piercing_rating += magnitude,
@@ -1220,10 +1226,20 @@ mod tests {
         let want = gamedata::enchant_magnitude(POWERFUL_BLOCK, top)
             .expect("Powerful Block ships a magnitude table");
         assert!(want < raw / 10.0, "the shipped magnitude is nothing like the raw curve");
+        // Powerful Block lands on `powerful_block`, NOT `block_rating`. Its shipped
+        // tooltip is "Target stunned by a blocked attack takes {0} extra damage while
+        // stunned", and in the client the only thing constructing a
+        // `CombatStatusStaggeredWeaknessEffect` is `PowerfulBlockBonusInstance
+        // .CausedStagger`. Parsing it as block rating made every point of it reduce
+        // incoming damage instead of punishing the attacker.
+        //
+        // What this test is FOR is unchanged: the raw 7591 curve value must never
+        // reach the loadout.
+        assert_eq!(l.block_rating, 0.0, "Powerful Block is not block rating");
         assert!(
-            (l.block_rating - want).abs() < 1e-3,
-            "block rating {} should be the scaled magnitude {want} (raw curve {raw})",
-            l.block_rating,
+            (l.powerful_block - want).abs() < 1e-3,
+            "weakness rating {} should be the scaled magnitude {want} (raw curve {raw})",
+            l.powerful_block,
         );
         assert!(
             l.block_rating < raw / 10.0,

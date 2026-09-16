@@ -312,7 +312,12 @@ pub fn resistance_reduction(incoming: f32, resistance_rating: f32, continuous: b
 /// `rating × increasePerWeaknessRating`, capped at `maximumWeaknessEffect` (×1.0,
 /// i.e. at most doubling). `continuous` applies
 /// `continuousDamageWeaknessEffectiveness` (0.75).
-pub fn weakness_increase(incoming: f32, weakness_rating: f32, continuous: bool) -> f32 {
+pub fn weakness_increase(
+    incoming: f32,
+    weakness_rating: f32,
+    resistance_rating: f32,
+    continuous: bool,
+) -> f32 {
     if incoming <= 0.0 || weakness_rating <= 0.0 {
         return 0.0;
     }
@@ -321,8 +326,15 @@ pub fn weakness_increase(incoming: f32, weakness_rating: f32, continuous: bool) 
     } else {
         1.0
     };
-    (weakness_rating * combat_params::INCREASE_PER_WEAKNESS_RATING * eff)
-        .min(incoming * combat_params::MAXIMUM_WEAKNESS_EFFECT)
+    // The client nets the weakness against the victim's resistance for that type
+    // BEFORE applying it: `amount += min(amount, max(0, w - resistance))`. A target
+    // with the matching Resist up therefore takes a reduced amplification, or none —
+    // observed in a capture where a victim holding all four Resist statuses took a
+    // visibly smaller delta than the enchantment's tier would otherwise give.
+    let net = (weakness_rating * combat_params::INCREASE_PER_WEAKNESS_RATING
+        - resistance_rating.max(0.0))
+    .max(0.0);
+    (net * eff).min(incoming * combat_params::MAXIMUM_WEAKNESS_EFFECT)
 }
 
 /// The FRACTION of a hit a Block Rating removes.
@@ -612,6 +624,34 @@ mod tests {
         assert!(fallback::weapon_base_for_level(30, Weight::Light) > 0.0);
     }
 }
+#[cfg(test)]
+mod weakness_tests {
+    use super::*;
 
+    /// Flat, capped at +100% of the hit, and netted against the victim's resistance
+    /// first — `amount += min(amount, max(0, w - resistance))`.
+    #[test]
+    fn weakness_is_flat_capped_and_net_of_resistance() {
+        // Plain: the full rating lands.
+        assert!((weakness_increase(100.0, 50.4, 0.0, false) - 50.4).abs() < 1e-3);
+        // Capped at +100% of the incoming hit, never more.
+        assert!((weakness_increase(20.0, 50.4, 0.0, false) - 20.0).abs() < 1e-3);
+        // Resistance is subtracted from the WEAKNESS before it is applied.
+        assert!((weakness_increase(100.0, 50.4, 20.0, false) - 30.4).abs() < 1e-3);
+        // Enough resistance cancels it outright — never negative.
+        assert_eq!(weakness_increase(100.0, 50.4, 80.0, false), 0.0);
+        // No rating, no effect.
+        assert_eq!(weakness_increase(100.0, 0.0, 0.0, false), 0.0);
+    }
 
-
+    /// A periodic tick pays the shipped `continuousDamageWeaknessEffectiveness`.
+    #[test]
+    fn a_continuous_tick_pays_the_reduced_effectiveness() {
+        let one = weakness_increase(1000.0, 50.4, 0.0, false);
+        let tick = weakness_increase(1000.0, 50.4, 0.0, true);
+        assert!(tick < one);
+        assert!(
+            (tick - one * combat_params::CONTINUOUS_DAMAGE_WEAKNESS_EFFECTIVENESS).abs() < 1e-3
+        );
+    }
+}
