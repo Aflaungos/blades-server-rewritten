@@ -1542,7 +1542,18 @@ fn apply_ability_impact(
             // (`_damageToCauseParalyze` / `_duration`), applied by
             // `apply_status_conditioning` via the caster's `paralyze_rank`.
             if tag == AbilityTag::Paralyze {
-                out.extend(try_paralyze(combat, sender, target_slot, level, now));
+                // Threshold is checked against the Poison THIS CAST actually landed
+                // (post-negation — `resolved.components` is what survived Ward/Absorb),
+                // not the sliding window. See `try_paralyze`.
+                let cast_poison: f32 = resolved
+                    .components
+                    .iter()
+                    .filter(|(t, _)| *t == super::state::DamageType::Poison)
+                    .map(|(_, v)| *v)
+                    .sum();
+                out.extend(try_paralyze(
+                    combat, sender, target_slot, level, cast_poison, now,
+                ));
             }
             // `_damageToCauseStagger` used to be handled HERE, inside this arm. It is
             // now in `apply_shipped_effects` below, which every arm reaches — the two
@@ -1844,6 +1855,8 @@ fn apply_shipped_effects(
                 expires_at: until_consumed,
                 restoration_factor: 0.0,
                 absorb_fraction: 1.0,
+                elemental_only: false,
+                consumes_overflow: false,
             });
             let obj = combat.fighters[caster].net_object_id;
             info!("combat: slot {caster} dodge pool +{cap:.1} ({ability_uuid})");
@@ -1872,6 +1885,10 @@ fn apply_shipped_effects(
                 expires_at: until_consumed,
                 restoration_factor: 0.0,
                 absorb_fraction: absorb,
+                // Storm-armor shields are not element-scoped and have no overflow
+                // clause in their description — only Ward does.
+                elemental_only: false,
+                consumes_overflow: false,
             });
             let obj = combat.fighters[caster].net_object_id;
             info!("combat: slot {caster} storm-armor shield +{shield:.1} ({ability_uuid})");
@@ -2039,25 +2056,32 @@ fn apply_shipped_effects(
 
 /// Land `Paralyzed` on `target_slot` when the caster's Paralyze rank says the hit is
 /// strong enough. The threshold is the **absolute** shipped `_damageToCauseParalyze`
-/// (32.7 @ R1) checked against the target's accumulated poison in the sliding window,
-/// and the lock lasts the rank's own `_duration` (2.0 s @ R1). [Phase 3.9]
+/// (32.7 @ R1), and the lock lasts the rank's own `_duration` (2.0 s @ R1). [Phase 3.9]
+///
+/// `cast_poison` is the Poison damage THIS Paralyze cast actually delivered, AFTER
+/// negation. It used to be `recent_element_damage(Poison)` — every poison point the
+/// target had taken in the 5 s window, from any source. That was wrong twice over:
+/// a Paralyze fully eaten by a Ward still paralysed (it contributed 0 damage but the
+/// window was already over threshold), and a Poison Cloud ticking in the background
+/// could arm someone else's Paralyze. Both make the lock land when the spell that is
+/// supposed to cause it did nothing.
 fn try_paralyze(
     combat: &mut MatchCombat,
     _caster: usize,
     target_slot: usize,
     rank: u8,
+    cast_poison: f32,
     now: Instant,
 ) -> Vec<(usize, Vec<u8>)> {
-    use super::state::{ActorStateType, DamageType, StatusEffectType};
+    use super::state::{ActorStateType, StatusEffectType};
     let mut out = Vec::new();
     if !combat.fighters[target_slot].can_be_paralyzed
         || combat.fighters[target_slot].actor_state() == ActorStateType::Paralyzed
     {
         return out;
     }
-    let recent = combat.fighters[target_slot].recent_element_damage(DamageType::Poison);
     let threshold = super::state::paralyze_damage_threshold(rank);
-    if recent < threshold {
+    if cast_poison < threshold {
         return out;
     }
     let secs = super::state::paralyze_duration_secs(rank);
@@ -2074,7 +2098,7 @@ fn try_paralyze(
     f.paralyze_secs = secs;
     let obj = f.net_object_id;
     info!(
-        "combat status: gsid={} target_slot={target_slot} target={} status=Paralyzed poison_window={recent:.1} threshold={threshold:.1} duration={secs}",
+        "combat status: gsid={} target_slot={target_slot} target={} status=Paralyzed cast_poison={cast_poison:.1} threshold={threshold:.1} duration={secs}",
         combat.game_session_id,
         combat.fighters[target_slot].loadout.display_name,
     );
@@ -2851,6 +2875,11 @@ fn apply_ward(
         expires_at: ward_expires,
         restoration_factor: 0.0, // Ward: pure negation, no heal-back
         absorb_fraction: 1.0,    // Ward swallows a hit whole until exhausted
+        // `Ability.Spell.Ward.Description`: "negates up to {1} ELEMENTAL damage,
+        // plus any EXCESS damage from the attack that destroys it". Ward's physical
+        // protection is the Armor Rating pushed below, not this pool.
+        elemental_only: true,
+        consumes_overflow: true,
     });
     // Add transient flat physical armor (subtracted from incoming physical as a
     // transient resistance on the caster — `DamageType::Health` is NOT physical;
@@ -2902,7 +2931,9 @@ fn apply_absorb(
         remaining: amount,
         expires_at: now + Duration::from_secs_f32(duration),
         restoration_factor: restoration,
-                absorb_fraction: 1.0,
+        absorb_fraction: 1.0,
+        elemental_only: false,
+        consumes_overflow: false,
     });
     let obj = f.net_object_id;
     info!("combat: slot {caster_slot} ABSORB r{rank} applied (pool {amount:.2}, heal ×{restoration}, {duration}s)");
@@ -6525,9 +6556,10 @@ mod shipped_effects_tests {
         let paralyse_at = |rank: u8| -> f32 {
             let now = Instant::now();
             let mut c = combat2(now);
-            // Enough accumulated poison to clear even the top rank's threshold.
+            // A cast_poison well above even the top rank's threshold: these tests are
+            // about the DURATION of the lock, not about what arms it.
             c.fighters[1].record_element_damage(DamageType::Poison, 500.0, now);
-            let out = try_paralyze(&mut c, 0, 1, rank, now);
+            let out = try_paralyze(&mut c, 0, 1, rank, 1_000.0, now);
             assert!(!out.is_empty(), "rank {rank} did not paralyse — the test would be vacuous");
             assert!(c.fighters[1].is_paralyzed(), "rank {rank} target not locked");
             c.fighters[1].paralyze_secs
@@ -6551,7 +6583,7 @@ mod shipped_effects_tests {
         let now = Instant::now();
         let mut c = combat2(now);
         c.fighters[1].record_element_damage(DamageType::Poison, 500.0, now);
-        try_paralyze(&mut c, 0, 1, 12, now);
+        try_paralyze(&mut c, 0, 1, 12, 1_000.0, now);
 
         // 2.5 s in: rank 1's window has long lapsed, rank 12's has not.
         reconcile_paralysis(&mut c.fighters[1], now + Duration::from_millis(2500));
@@ -6613,11 +6645,49 @@ mod shipped_effects_tests {
         c.fighters[1].paralyze_secs = 99.0;
         c.fighters[1].record_element_damage(DamageType::Poison, 500.0, now);
 
-        try_paralyze(&mut c, 0, 1, 1, now);
+        try_paralyze(&mut c, 0, 1, 1, 1_000.0, now);
         assert!(
             (c.fighters[1].paralyze_secs - 2.0).abs() < 0.001,
             "rank 1 must set its OWN 2.0s, not keep the stale 99.0"
         );
+    }
+
+    /// A Paralyze that a Ward ate must NOT paralyse. The threshold used to be checked
+    /// against `recent_element_damage(Poison)` — every poison point taken in the 5 s
+    /// window from any source — so a cast that delivered literally zero damage still
+    /// landed the lock as long as the victim happened to be poisoned already.
+    ///
+    /// Fails on the old code: the 500 seeded into the window armed it.
+    #[test]
+    fn a_fully_negated_paralyze_does_not_paralyze() {
+        use super::super::state::DamageType;
+        let now = Instant::now();
+        let mut c = combat2(now);
+        // The victim is already poisoned — the window is way over any threshold.
+        c.fighters[1].record_element_damage(DamageType::Poison, 500.0, now);
+        // …but THIS cast was fully negated, so it delivered nothing.
+        try_paralyze(&mut c, 0, 1, 1, 0.0, now);
+        assert!(
+            !c.fighters[1].is_paralyzed(),
+            "a cast that dealt no poison must not paralyse, however poisoned the target is"
+        );
+    }
+
+    /// The complement: background poison alone must not arm someone else's Paralyze.
+    /// A cast landing UNDER the rank's own `_damageToCauseParalyze` does nothing even
+    /// when the sliding window is saturated.
+    #[test]
+    fn background_poison_does_not_arm_a_weak_paralyze() {
+        use super::super::state::DamageType;
+        let now = Instant::now();
+        let mut c = combat2(now);
+        c.fighters[1].record_element_damage(DamageType::Poison, 500.0, now);
+        let threshold = super::super::state::paralyze_damage_threshold(1);
+        try_paralyze(&mut c, 0, 1, 1, threshold - 1.0, now);
+        assert!(!c.fighters[1].is_paralyzed(), "under its own threshold: no lock");
+        // …and one point over it does land, so the test cannot pass vacuously.
+        try_paralyze(&mut c, 0, 1, 1, threshold + 1.0, now);
+        assert!(c.fighters[1].is_paralyzed(), "over its own threshold: locked");
     }
 
     /// FlashFreeze locks the TARGET, not the caster, for the rank's own duration.
@@ -7563,7 +7633,7 @@ mod report_31_high_block_stun {
             500.0,
             now,
         );
-        let _ = super::try_paralyze(&mut c, 0, 1, 12, now);
+        let _ = super::try_paralyze(&mut c, 0, 1, 12, 1_000.0, now);
         assert!(c.fighters[1].is_paralyzed());
 
         super::on_tick(&mut c, now + Duration::from_millis(10), false);
@@ -7600,7 +7670,7 @@ mod report_31_high_block_stun {
             500.0,
             now + Duration::from_millis(5),
         );
-        let _ = super::try_paralyze(&mut c, 0, 1, 12, now + Duration::from_millis(5));
+        let _ = super::try_paralyze(&mut c, 0, 1, 12, 1_000.0, now + Duration::from_millis(5));
         assert!(c.fighters[1].is_paralyzed());
         assert_eq!(c.pending_hits.len(), 1, "paralysis must retain a committed hit");
 
