@@ -410,6 +410,58 @@ async fn main() -> Result<()> {
                 dev_login_user_id,
             });
 
+            // `guilds.trophies` drives the guild leaderboard and every guild card.
+            // Recompute it once at startup so a cold database is correct immediately
+            // and so membership changes (which a per-match delta cannot see) cannot
+            // let the column drift. A failure here must not stop the server booting —
+            // a stale ladder is much better than no server.
+            {
+                let pool = server_global.db_pool.clone();
+                actix_web::rt::spawn(async move {
+                    use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
+                    use diesel_async::RunQueryDsl;
+                    use crate::schema::arena_seasons;
+                    match pool.get().await {
+                        Ok(mut c) => {
+                            let active: Option<crate::arena::season_store::SeasonRow> =
+                                arena_seasons::table
+                                    .filter(arena_seasons::status.eq("active"))
+                                    .select(
+                                        crate::arena::season_store::SeasonRow::as_select(),
+                                    )
+                                    .order(arena_seasons::starts_at.desc())
+                                    .first(&mut c)
+                                    .await
+                                    .optional()
+                                    .unwrap_or(None);
+                            match active {
+                                Some(season) => {
+                                    match crate::guild::recompute_guild_trophies(&mut c, &season)
+                                        .await
+                                    {
+                                        Ok(n) => log::info!(
+                                            "guild trophies recomputed for {n} guild(s) \
+                                             (season {})",
+                                            season.id
+                                        ),
+                                        Err(e) => {
+                                            log::warn!("guild trophy recompute failed: {e}")
+                                        }
+                                    }
+                                }
+                                // No active season means no season trophies to total.
+                                // Leaving the column alone is right: it already reads 0
+                                // after the previous season's reset.
+                                None => log::info!(
+                                    "guild trophy recompute skipped: no active season"
+                                ),
+                            }
+                        }
+                        Err(e) => log::warn!("guild trophy recompute: no db connection: {e}"),
+                    }
+                });
+            }
+
             // Live arena ENet host (real-client path) — needs the shared Arc.
             let enet_globals = server_global.clone();
             actix_web::rt::spawn(async move {

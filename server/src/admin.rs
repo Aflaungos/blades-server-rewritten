@@ -1737,6 +1737,21 @@ pub async fn end_arena_season(
                 BladeApiError::new(StatusCode::INTERNAL_SERVER_ERROR, IMPORT_SERVICE_ID, 27)
             })?;
     }
+
+    // A guild's trophies RESET with the season, exactly like a player's cups. The
+    // season's final standing has just been frozen into `arena_season_guild_standings`
+    // above, so the live column is cleared here and starts the next season at zero.
+    //
+    // Inside the same transaction as the freeze: if any later stage fails, the reset
+    // rolls back with it, so a guild can never lose its total to a half-applied
+    // rollover.
+    diesel::sql_query("UPDATE guilds SET trophies = 0")
+        .execute(&mut conn)
+        .await
+        .map_err(|e| {
+            warn!("season end: guild trophy reset failed: {e}");
+            BladeApiError::new(StatusCode::INTERNAL_SERVER_ERROR, IMPORT_SERVICE_ID, 27)
+        })?;
     for chunk in awards.chunks(500) {
         diesel::insert_into(crate::schema::arena_season_awards::table)
             .values(chunk)

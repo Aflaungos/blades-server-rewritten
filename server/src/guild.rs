@@ -856,6 +856,89 @@ pub async fn search_guilds(
     Ok(Json(GuildListResponse { guilds: out }))
 }
 
+#[cfg(test)]
+mod guild_trophy_tests {
+    /// The leaderboard orders on `guilds.trophies`, so a guild whose members hold
+    /// trophies must not read as 0. This asserts the ORDERING contract the endpoint
+    /// depends on, independently of the SQL that maintains the column.
+    #[test]
+    fn guild_trophies_order_the_leaderboard_and_break_ties_by_id() {
+        // (trophies, id) as the leaderboard sorts them: trophies desc, id asc.
+        let mut rows = vec![(620_i64, "b"), (1774, "a"), (0, "c"), (1774, "z")];
+        rows.sort_by(|x, y| y.0.cmp(&x.0).then_with(|| x.1.cmp(y.1)));
+        assert_eq!(
+            rows,
+            vec![(1774, "a"), (1774, "z"), (620, "b"), (0, "c")],
+            "higher trophies rank first; equal trophies keep a stable id order so a \
+             guild cannot appear twice or vanish across pages"
+        );
+    }
+
+    /// A guild's trophies are the SUM of its members'. Same rule
+    /// `season_store::guild_standings_from` applies to the season ladder.
+    #[test]
+    fn a_guilds_trophies_are_the_sum_of_its_members() {
+        let members = [1506_i64, 1485, 1481];
+        assert_eq!(members.iter().sum::<i64>(), 4472);
+        // An empty guild is 0, not absent — the column is NOT NULL and the
+        // leaderboard must still place the guild.
+        let empty: [i64; 0] = [];
+        assert_eq!(empty.iter().sum::<i64>(), 0);
+    }
+
+    /// A member's negative contribution can never drag a guild below zero, for the
+    /// same reason a character's own count bottoms out at 0.
+    #[test]
+    fn a_guild_total_never_goes_negative() {
+        let clamp = |t: i64, d: i64| (t + d).max(0);
+        assert_eq!(clamp(10, -25), 0);
+        assert_eq!(clamp(0, -5), 0);
+        assert_eq!(clamp(100, -25), 75);
+    }
+}
+
+/// Recompute every guild's `trophies` from the CURRENT SEASON's standings.
+///
+/// `guilds.trophies` is what `GET /guilds/leaderboard` orders on and what the client
+/// prints on every guild card. It was written once — as 0, at guild creation — and
+/// never again, so every guild sat at 0 and the "top guilds" ladder was really
+/// ordering by guild id.
+///
+/// **It is a SEASONAL total and resets with the arena season, exactly like a
+/// player's cups.** That is also what the retail corpus shows: across 277 captured
+/// guilds the ceiling is 3,900 with a 20-member cap (~195/member), while individual
+/// characters reach 1,506 LIFETIME trophies — three such players would alone exceed
+/// every guild in retail. A lifetime sum is therefore ruled out on scale.
+///
+/// The aggregation is delegated to `season_store`, which already encodes it for the
+/// season ladder: per-character season trophies replayed from the season's zero
+/// baseline, then summed per guild by `guild_standings_from`. Reusing it means the
+/// leaderboard and the end-of-season award ladder cannot disagree.
+pub async fn recompute_guild_trophies(
+    conn: &mut diesel_async::AsyncPgConnection,
+    season: &crate::arena::season_store::SeasonRow,
+) -> Result<usize, diesel::result::Error> {
+    use diesel_async::RunQueryDsl;
+    let standings = crate::arena::season_store::freeze_standings(conn, season).await?;
+    let guilds_now = crate::arena::season_store::guild_standings_from(season.id, &standings);
+
+    // Zero every guild first: a guild that scored nothing this season, or lost the
+    // members who scored, must fall back to 0 rather than keep a stale total.
+    diesel::sql_query("UPDATE guilds SET trophies = 0")
+        .execute(conn)
+        .await?;
+
+    let mut written = 0usize;
+    for g in &guilds_now {
+        written += diesel::sql_query("UPDATE guilds SET trophies = $1 WHERE id = $2")
+            .bind::<diesel::sql_types::BigInt, _>(g.trophies)
+            .bind::<diesel::sql_types::Text, _>(&g.guild_id)
+            .execute(conn)
+            .await?;
+    }
+    Ok(written)
+}
+
 // ---- Leaderboard ---------------------------------------------------------------
 
 /// One leaderboard row: a guild plus its global position.

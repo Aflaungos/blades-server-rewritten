@@ -33,7 +33,7 @@ use std::sync::OnceLock;
 
 use blades_lib::economy::{RewardGrant, apply_reward, grant_chest};
 use blades_lib::user_data::InventoryChangeTracker;
-use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
+use diesel::{ExpressionMethods, OptionalExtension, QueryDsl, SelectableHelper};
 use diesel_async::{AsyncConnection, RunQueryDsl, scoped_futures::ScopedFutureExt};
 use log::{error, info, warn};
 use tokio::sync::mpsc::{UnboundedSender, unbounded_channel};
@@ -314,6 +314,39 @@ async fn persist(pool: &DbPool, outcome: &MatchEconomyOutcome) -> Result<(), any
                     .set(entry)
                     .execute(&mut conn)
                     .await?;
+            }
+
+            // GUILD TROPHIES. `guilds.trophies` is the guild's running trophy
+            // total — it is what `GET /guilds/leaderboard` orders on and what the
+            // client shows on every guild card. It was written once, as 0, at guild
+            // creation and never again, so every guild sat at 0 and the "top guilds"
+            // ladder was really ordering by guild id.
+            //
+            // The aggregation rule is the one `season_store::guild_standings_from`
+            // already encodes: a guild's trophies are the SUM of its members'
+            // trophies. Applied here as the same delta the character just took, so
+            // the total tracks play without a full re-scan on every match.
+            //
+            // Clamped at 0 for the same reason the character's own count is:
+            // retail cards bottom out at zero and never go negative.
+            if o.trophy_delta != 0 {
+                use crate::schema::{guild_members, guilds};
+                let guild_of: Option<String> = guild_members::table
+                    .filter(guild_members::character_id.eq(character_id))
+                    .select(guild_members::guild_id)
+                    .first(&mut conn)
+                    .await
+                    .optional()?;
+                if let Some(gid) = guild_of {
+                    let _ = guilds::table; // keep the import meaningful for the reader
+                    diesel::sql_query(
+                        "UPDATE guilds SET trophies = GREATEST(trophies + $1, 0) WHERE id = $2",
+                    )
+                    .bind::<diesel::sql_types::BigInt, _>(o.trophy_delta)
+                    .bind::<diesel::sql_types::Text, _>(&gid)
+                    .execute(&mut conn)
+                    .await?;
+                }
             }
 
             Ok(Some(AppliedOutcome {
