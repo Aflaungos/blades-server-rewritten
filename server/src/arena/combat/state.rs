@@ -824,6 +824,20 @@ pub struct Loadout {
     /// Armor Rating before the physical reduction. [Phase 3.3]
     pub armor_piercing_rating: f32,
 
+    /// Flat bonus damage contributed by the MANEUVER being resolved, already scaled
+    /// by the grip multiplier. Zero for an ordinary swing.
+    ///
+    /// Every maneuver rank ships `parameters.bonusDamage` plus
+    /// `oneHandedMultiplier` / `twoHandedMultiplier`, and NOTHING read them — the
+    /// generated tables carried the numbers and the resolver never looked. That is
+    /// why every maneuver resolved to a plain Middle weapon hit: Power Attack's
+    /// 75.33, Skullcrusher's 100.09, Guardbreaker's 131.15 were all silently 0.
+    ///
+    /// Set on a CLONE of the attacker's loadout for the duration of one cast (the
+    /// same trick the piercing ratings already use), so a maneuver cannot leak its
+    /// bonus into the next auto-attack.
+    pub maneuver_bonus_damage: f32,
+
     /// Resolved perk bonuses, computed once at parse time. `Default` (every
     /// field zero) for a fighter with no perks, which every application site
     /// treats as a no-op.
@@ -1227,6 +1241,22 @@ pub struct Fighter {
     /// like `Paralyzed`, and the actor-state is `Staggered`. [Phase 3.13]
     pub staggered_until: Option<Instant>,
 
+    /// **Reckless Fury** is active until this instant. `RecklessFuryAbility`
+    /// serializes only `_bonusDamages` and `_duration` (5.0 s at every rank), so the
+    /// four headline behaviours its description promises — cannot be stunned, cannot
+    /// die, cannot block, cannot use skills — are boolean state tied to
+    /// `StatusEffectType::RecklessFury (11)` for that window, not numbers to read.
+    ///
+    /// Before this existed the ability had NO persistent implementation at all: it
+    /// was resolved as one ordinary Middle weapon hit. That is the whole of the
+    /// production report in match fffe01ca — the AI cast Fury and was stunned 2 s
+    /// later, inside the window that is supposed to make it un-stunnable.
+    pub reckless_fury_until: Option<Instant>,
+    /// Flat bonus damage Fury adds to each swing while active, chosen by the
+    /// wielder's WEAPON CLASS from the rank's `bonusDamages` table
+    /// (Light 11.24 / Balanced 14.17 / Heavy 17.86 at rank 1).
+    pub reckless_fury_bonus: f32,
+
     /// Statuses we have told the clients are ACTIVE on this fighter, as of the
     /// last tick.
     ///
@@ -1295,6 +1325,44 @@ pub struct NegationPool {
     /// hit until their 116-158 pool drains. Treating them as full absorbers made them
     /// twice as strong per hit and drained them twice as fast.
     pub absorb_fraction: f32,
+    /// Restrict this pool to ELEMENTAL damage (Fire/Frost/Shock/Poison).
+    ///
+    /// **True for Ward only.** The shipped description is explicit —
+    /// `Ability.Spell.Ward.Description`: *"increases Armor Rating by {0} and negates
+    /// up to {1} elemental damage, plus any excess damage from the attack that
+    /// destroys it."* Ward's physical protection is the Armor Rating term (the
+    /// `transient_resistances` this spell also pushes), NOT the pool. Letting the pool
+    /// eat Slashing / Cleaving / Bashing spent the elemental budget on weapon swings
+    /// and left nothing for the spell it was cast to stop — the defect behind the
+    /// production event where a 120.54 Ward pool still let 112.37 poison through:
+    /// the physical hits had already drained it.
+    ///
+    /// False for Absorb / Dodge / the storm-armor shields, which are not
+    /// element-scoped — so the default is behaviour-preserving.
+    pub elemental_only: bool,
+    /// When this pool is exhausted BY a hit, also negate the remainder of that same
+    /// hit — within the component set this pool was eligible for.
+    ///
+    /// **True for Ward only** — the "plus any excess damage from the attack that
+    /// destroys it" clause above. Without it the breaking hit's overflow leaks, making
+    /// Ward strictly weaker than its own description at precisely the moment it is
+    /// supposed to pay off. Scoped to the eligible components so an elemental-only
+    /// Ward cannot swallow a physical component it was never allowed to touch.
+    pub consumes_overflow: bool,
+    /// Granted ONCE if this pool actually absorbs damage — the dodge maneuvers'
+    /// reward for a dodge that connected. `(health, magicka, cooldown_seconds)`
+    /// from `_maximumHealthRestored` (Adrenaline Dodge, 43.5),
+    /// `_maximumMagickaRestored` (Renewing Dodge, 338) and
+    /// `_maximumCooldownReduction` (Focusing Dodge, 4.0 s).
+    ///
+    /// All three were read by nobody, so those three maneuvers were identical to a
+    /// plain Dodging Strike — they cost their stamina and gave only the dodge.
+    ///
+    /// These are authored as CAPS. The shipped data has no proximity curve ("the
+    /// closer you are to being hit, the more you get"), so the cap is granted whole
+    /// on a dodge that connects: it is the only number the data actually contains,
+    /// and awarding nothing was the bug.
+    pub on_absorb_restore: (f32, f32, f32),
 }
 
 /// The sliding damage-history window length (`ElementalStatusEffectData._duration` ≈ 5 s
@@ -1368,6 +1436,8 @@ impl Fighter {
         Fighter {
             slot,
             net_object_id,
+            reckless_fury_until: None,
+            reckless_fury_bonus: 0.0,
             player_net_object_id: 0, // assigned by MatchInstance::new
             ability_net_object_id: 0, // assigned by MatchInstance::new
             health: max_health,
@@ -1596,6 +1666,11 @@ impl Fighter {
     /// real duration. If a real Stun id turns up in the dump, this is the one place to
     /// change.
     pub fn apply_stagger_for(&mut self, now: Instant, secs: f32) {
+        // Reckless Fury cannot be stunned. This is the guard whose absence let the
+        // production stun in match fffe01ca land 2 s into a 5 s Fury.
+        if self.has_reckless_fury(now) {
+            return;
+        }
         self.staggered_until =
             Some(now + std::time::Duration::from_secs_f32(secs.max(0.05)));
         self.set_actor_state(ActorStateType::Staggered, now);
@@ -1781,10 +1856,35 @@ impl Fighter {
         self.health == 0
     }
 
+    /// Is Reckless Fury active right now?
+    pub fn has_reckless_fury(&self, now: Instant) -> bool {
+        self.reckless_fury_until.is_some_and(|t| now < t)
+    }
+
     /// Apply `amount` raw damage to health, clamped at 0, and bump the stats seq.
+    ///
+    /// While Reckless Fury is up the fighter CANNOT DIE: health floors at 1 instead
+    /// of 0. Use [`Fighter::take_damage_at`] to get that protection — this entry
+    /// point has no clock and so cannot check the window.
     pub fn take_damage(&mut self, amount: u32) {
         self.health = self.health.saturating_sub(amount);
         self.stats_seq = self.stats_seq.wrapping_add(1);
+    }
+
+    /// `take_damage` with Reckless Fury's death prevention applied.
+    ///
+    /// Fury's description promises the wielder cannot be killed for its duration; the
+    /// ability had no persistent state at all, so this never held. Floors at 1 HP
+    /// rather than 0 — the fighter survives the window and dies normally afterwards
+    /// if the damage keeps coming.
+    pub fn take_damage_at(&mut self, amount: u32, now: Instant) {
+        if self.has_reckless_fury(now) {
+            let floor = 1;
+            self.health = self.health.saturating_sub(amount).max(floor.min(self.health));
+            self.stats_seq = self.stats_seq.wrapping_add(1);
+            return;
+        }
+        self.take_damage(amount);
     }
 
     /// Apply the **non-health** damage components of a hit to their pools:
@@ -1981,7 +2081,12 @@ impl Fighter {
     /// current instant through [`Self::prune_negation_pools`] first).
     pub fn apply_negation_pools(&mut self, components: &mut [(DamageType, f32)]) -> NegationResult {
         if self.negation_pools.is_empty() {
-            return NegationResult { negated: false, heal: 0.0 };
+            return NegationResult {
+                negated: false,
+                heal: 0.0,
+                restore_magicka: 0.0,
+                restore_cooldown_secs: 0.0,
+            };
         }
         let health_before: f32 = components
             .iter()
@@ -1989,16 +2094,32 @@ impl Fighter {
             .map(|(_, v)| *v)
             .sum();
         if health_before <= 0.0 {
-            return NegationResult { negated: false, heal: 0.0 };
+            return NegationResult {
+                negated: false,
+                heal: 0.0,
+                restore_magicka: 0.0,
+                restore_cooldown_secs: 0.0,
+            };
         }
         let mut heal = 0.0;
+        let mut restore_magicka = 0.0;
+        let mut restore_cooldown_secs = 0.0;
         for pool in self.negation_pools.iter_mut() {
             if pool.remaining <= 0.0 {
                 continue;
             }
-            // Drain this pool across the remaining health components (in order).
+            // Which components may this pool touch at all? Ward is elemental-only
+            // (see `NegationPool::elemental_only`); everything else keeps the old
+            // "any health component" reach.
+            let eligible_ty = |t: DamageType| {
+                super::damage::is_health_type(t)
+                    && (!pool.elemental_only || super::damage::is_elemental(t))
+            };
+            // Did this hit exhaust the pool? Only then does the overflow clause fire.
+            let had_budget = pool.remaining > 0.0;
+            // Drain this pool across the eligible health components (in order).
             for (ty, v) in components.iter_mut() {
-                if !super::damage::is_health_type(*ty) || *v <= 0.0 || pool.remaining <= 0.0 {
+                if !eligible_ty(*ty) || *v <= 0.0 || pool.remaining <= 0.0 {
                     continue;
                 }
                 // Only `absorb_fraction` of this component is eligible (1.0 for
@@ -2008,6 +2129,26 @@ impl Fighter {
                 *v -= eaten;
                 pool.remaining -= eaten;
                 heal += eaten * pool.restoration_factor;
+                if eaten > 0.0 {
+                    // This pool connected: pay its one-off restoration and disarm it
+                    // so a multi-component hit cannot pay it several times.
+                    let (h, m, c) = std::mem::take(&mut pool.on_absorb_restore);
+                    heal += h;
+                    restore_magicka += m;
+                    restore_cooldown_secs += c;
+                }
+            }
+            // "…plus any excess damage from the attack that destroys it." The pool
+            // ran out DURING this hit, so the rest of the hit it was allowed to see
+            // is negated too. Deliberately NOT healed back: the restoration factor is
+            // paid on what the pool actually absorbed, and Ward (the only user of
+            // this flag) heals nothing anyway.
+            if pool.consumes_overflow && had_budget && pool.remaining <= 0.0 {
+                for (ty, v) in components.iter_mut() {
+                    if eligible_ty(*ty) && *v > 0.0 {
+                        *v = 0.0;
+                    }
+                }
             }
         }
         self.negation_pools.retain(|p| p.remaining > 0.0);
@@ -2016,7 +2157,12 @@ impl Fighter {
             .filter(|(t, _)| super::damage::is_health_type(*t))
             .map(|(_, v)| *v)
             .sum();
-        NegationResult { negated: health_after <= 0.0, heal }
+        NegationResult {
+            negated: health_after <= 0.0,
+            heal,
+            restore_magicka,
+            restore_cooldown_secs,
+        }
     }
 
     /// Drop negation pools whose duration has lapsed (call on tick / before a hit).
@@ -2065,6 +2211,12 @@ pub enum RoundOutcome {
 pub struct NegationResult {
     pub negated: bool,
     pub heal: f32,
+    /// Magicka restored by a dodge that actually absorbed something
+    /// (Renewing Dodge's `_maximumMagickaRestored`).
+    pub restore_magicka: f32,
+    /// Seconds to take off the dodger's own cooldowns
+    /// (Focusing Dodge's `_maximumCooldownReduction`).
+    pub restore_cooldown_secs: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -2921,6 +3073,9 @@ mod absorb_fraction_tests {
             expires_at: Instant::now() + std::time::Duration::from_secs(60),
             restoration_factor: 0.0,
             absorb_fraction: fraction,
+            elemental_only: false,
+            consumes_overflow: false,
+            on_absorb_restore: (0.0, 0.0, 0.0),
         }
     }
 
@@ -2962,5 +3117,180 @@ mod absorb_fraction_tests {
         f.apply_negation_pools(&mut c);
         assert_eq!(c[0].1, 90.0, "only the 10 it had left is absorbed");
         assert!(f.negation_pools.is_empty(), "an exhausted pool is dropped");
+    }
+
+    /// A real Ward: elemental-scoped, and it eats the breaking hit's overflow.
+    fn ward_pool(remaining: f32) -> NegationPool {
+        NegationPool {
+            source: DamageNegationSource::Ward,
+            remaining,
+            expires_at: Instant::now() + std::time::Duration::from_secs(60),
+            restoration_factor: 0.0,
+            absorb_fraction: 1.0,
+            elemental_only: true,
+            consumes_overflow: true,
+            on_absorb_restore: (0.0, 0.0, 0.0),
+        }
+    }
+
+    /// THE PRODUCTION BUG. `Ability.Spell.Ward.Description` says Ward negates
+    /// "elemental damage" — its physical protection is the separate Armor Rating
+    /// term. The pool used to drain on ANY health component, so weapon swings spent
+    /// the elemental budget. In match dafb1378 a 120.54 Ward pool had been chewed up
+    /// by physical hits and then let 112.37 poison through — damage it had more than
+    /// enough nominal budget to stop.
+    ///
+    /// Fails on the old code: Slashing drained the pool to 20.
+    #[test]
+    fn a_ward_is_not_drained_by_physical_damage() {
+        let now = Instant::now();
+        let mut f = Fighter::new(0, 1, loadout::starter(), now);
+        f.negation_pools.push(ward_pool(120.54));
+        let mut c = vec![(DamageType::Slashing, 100.0)];
+        f.apply_negation_pools(&mut c);
+        assert_eq!(c[0].1, 100.0, "physical must pass through a Ward untouched");
+        assert_eq!(
+            f.negation_pools[0].remaining, 120.54,
+            "and must not spend one point of the elemental budget"
+        );
+    }
+
+    /// The other half of the same production event: having survived the swings, the
+    /// Ward must then actually stop the poison it was cast for.
+    #[test]
+    fn a_ward_still_stops_the_poison_after_taking_physical_hits() {
+        let now = Instant::now();
+        let mut f = Fighter::new(0, 1, loadout::starter(), now);
+        f.negation_pools.push(ward_pool(120.54));
+        let mut swing = vec![(DamageType::Slashing, 100.0)];
+        f.apply_negation_pools(&mut swing);
+        let mut spell = vec![(DamageType::Poison, 112.37)];
+        let r = f.apply_negation_pools(&mut spell);
+        assert_eq!(spell[0].1, 0.0, "the poison must be fully negated");
+        assert!(r.negated);
+    }
+
+    /// "…plus any excess damage from the attack that destroys it." A 176.59 Ward hit
+    /// for 300 Fire must negate all 300, not leak 123.41.
+    ///
+    /// Fails on the old code: 123.41 landed.
+    #[test]
+    fn a_ward_negates_the_overflow_of_the_hit_that_breaks_it() {
+        let now = Instant::now();
+        let mut f = Fighter::new(0, 1, loadout::starter(), now);
+        f.negation_pools.push(ward_pool(176.59));
+        let mut c = vec![(DamageType::Fire, 300.0)];
+        let r = f.apply_negation_pools(&mut c);
+        assert_eq!(c[0].1, 0.0, "the breaking hit's excess is negated too");
+        assert!(r.negated, "so the hit reports as fully negated");
+        assert!(f.negation_pools.is_empty(), "and the spent Ward is gone");
+    }
+
+    /// The overflow clause is scoped to what the pool could touch. A mixed hit on an
+    /// elemental-only Ward must still let the PHYSICAL half land — otherwise the
+    /// overflow fix would hand Ward the physical immunity it never had.
+    #[test]
+    fn a_broken_ward_does_not_swallow_the_physical_half_of_a_mixed_hit() {
+        let now = Instant::now();
+        let mut f = Fighter::new(0, 1, loadout::starter(), now);
+        f.negation_pools.push(ward_pool(50.0));
+        let mut c = vec![(DamageType::Fire, 300.0), (DamageType::Slashing, 80.0)];
+        let r = f.apply_negation_pools(&mut c);
+        assert_eq!(c[0].1, 0.0, "all Fire is negated (budget + overflow)");
+        assert_eq!(c[1].1, 80.0, "but the physical component is untouched");
+        assert!(!r.negated, "and the hit is NOT a full negation");
+    }
+
+    /// The overflow clause must not fire on a pool that was ALREADY empty before the
+    /// hit — only on the hit that destroys it. (An already-drained pool is retained
+    /// only until the retain() below; this guards the ordering.)
+    #[test]
+    fn an_already_spent_ward_does_not_negate_a_later_hit() {
+        let now = Instant::now();
+        let mut f = Fighter::new(0, 1, loadout::starter(), now);
+        f.negation_pools.push(ward_pool(50.0));
+        let mut first = vec![(DamageType::Fire, 300.0)];
+        f.apply_negation_pools(&mut first);
+        assert!(f.negation_pools.is_empty(), "precondition: the Ward is spent");
+        let mut second = vec![(DamageType::Fire, 200.0)];
+        let r = f.apply_negation_pools(&mut second);
+        assert_eq!(second[0].1, 200.0, "the next hit lands in full");
+        assert!(!r.negated);
+    }
+
+    /// Adrenaline / Renewing / Focusing Dodge each ship a restoration the server read
+    /// from nobody, so all three were identical to a plain Dodging Strike: they cost
+    /// their stamina and gave only the dodge. The payout is conditional on the dodge
+    /// CONNECTING, and is paid once per dodge, not once per damage component.
+    #[test]
+    fn a_connecting_dodge_pays_its_authored_restoration_exactly_once() {
+        let now = Instant::now();
+        let mut f = Fighter::new(0, 1, loadout::starter(), now);
+        f.negation_pools.push(NegationPool {
+            source: DamageNegationSource::Dodge,
+            remaining: 500.0,
+            expires_at: now + std::time::Duration::from_secs(1),
+            restoration_factor: 0.0,
+            absorb_fraction: 1.0,
+            elemental_only: false,
+            consumes_overflow: false,
+            on_absorb_restore: (43.5, 338.0, 4.0),
+        });
+        // A multi-component hit: the restoration must NOT be paid per component.
+        let mut c = vec![
+            (DamageType::Slashing, 40.0),
+            (DamageType::Fire, 30.0),
+            (DamageType::Poison, 20.0),
+        ];
+        let r = f.apply_negation_pools(&mut c);
+        assert!((r.heal - 43.5).abs() < 1e-3, "health paid once, got {}", r.heal);
+        assert!((r.restore_magicka - 338.0).abs() < 1e-3, "magicka paid once");
+        assert!((r.restore_cooldown_secs - 4.0).abs() < 1e-3, "cooldown paid once");
+    }
+
+    /// A dodge that never connects pays nothing — the reward is for a dodge that
+    /// actually absorbed a hit, not for casting.
+    #[test]
+    fn a_dodge_that_absorbs_nothing_pays_nothing() {
+        let now = Instant::now();
+        let mut f = Fighter::new(0, 1, loadout::starter(), now);
+        f.negation_pools.push(NegationPool {
+            source: DamageNegationSource::Dodge,
+            remaining: 500.0,
+            expires_at: now + std::time::Duration::from_secs(1),
+            restoration_factor: 0.0,
+            absorb_fraction: 1.0,
+            elemental_only: false,
+            consumes_overflow: false,
+            on_absorb_restore: (43.5, 338.0, 4.0),
+        });
+        // Only a Magicka drain — not a health-type component, so nothing is absorbed.
+        let mut c = vec![(DamageType::Magicka, 100.0)];
+        let r = f.apply_negation_pools(&mut c);
+        assert_eq!(r.heal, 0.0);
+        assert_eq!(r.restore_magicka, 0.0);
+        assert_eq!(r.restore_cooldown_secs, 0.0);
+    }
+
+    /// Absorb is NOT element-scoped and has no overflow clause — the additivity proof
+    /// that the two new flags changed nothing for the other pool kinds.
+    #[test]
+    fn an_absorb_pool_still_eats_physical_and_still_leaks_overflow() {
+        let now = Instant::now();
+        let mut f = Fighter::new(0, 1, loadout::starter(), now);
+        f.negation_pools.push(NegationPool {
+            source: DamageNegationSource::Absorb,
+            remaining: 50.0,
+            expires_at: now + std::time::Duration::from_secs(60),
+            restoration_factor: 1.0,
+            absorb_fraction: 1.0,
+            elemental_only: false,
+            consumes_overflow: false,
+            on_absorb_restore: (0.0, 0.0, 0.0),
+        });
+        let mut c = vec![(DamageType::Slashing, 130.0)];
+        let r = f.apply_negation_pools(&mut c);
+        assert_eq!(c[0].1, 80.0, "Absorb eats physical, and the excess still lands");
+        assert!((r.heal - 50.0).abs() < 1e-3, "and heals back what it ate");
     }
 }

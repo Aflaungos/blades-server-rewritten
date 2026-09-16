@@ -610,6 +610,12 @@ pub fn on_c2s_input(
     if messages::is_player_blocking_state_change(user_data) {
         if sender < combat.fighters.len() {
             let side = messages::blocking_active_side(user_data).unwrap_or(ActiveSide::Middle);
+            // Reckless Fury cannot block — the trade its description makes for the
+            // damage and the immunity. Drop the request rather than raising a guard.
+            if combat.fighters[sender].has_reckless_fury(now) {
+                debug!("combat: slot {sender} cannot block during Reckless Fury");
+                return Vec::new();
+            }
             let f = &mut combat.fighters[sender];
             // Record block-raise instant for OPTIMAL→LATE timeout logic.
             // If the fighter re-raises within the recovery window (`last_block_dropped_at`
@@ -975,7 +981,15 @@ fn land_due_hits(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8>)
         if combat.fighters[h.target].is_dead() || combat.fighters[h.sender].is_dead() {
             continue;
         }
-        let attacker_loadout = combat.fighters[h.sender].loadout.clone();
+        let mut attacker_loadout = combat.fighters[h.sender].loadout.clone();
+        // Reckless Fury adds its weapon-class bonus to every swing for its window
+        // (`_bonusDamages`: Light 11.24 / Versatile 14.17 / Heavy 17.86 at rank 1).
+        // Ride the maneuver channel — same "flat additive on the physical base"
+        // treatment, on a clone so it expires with the buff rather than sticking.
+        if combat.fighters[h.sender].has_reckless_fury(now) {
+            attacker_loadout.maneuver_bonus_damage +=
+                combat.fighters[h.sender].reckless_fury_bonus;
+        }
         let resolved = RetailDamageModel.resolve_attack(
             &attacker_loadout,
             &combat.fighters[h.target],
@@ -1286,17 +1300,52 @@ pub(super) fn resolve_ability_cast(
             )
         })
     } else {
-        let channel_secs = super::gamedata::ability_rank_clamped(&ea.ability_uuid, level as u16)
-            .and_then(|r| r.channel_duration())
-            .unwrap_or(0.0);
-        Some(messages::player_channeling_state_change(
-            combat.fighters[sender].net_object_id,
-            combat.fighters[sender].packed_stats(),
-            combat.fighters[target_slot].packed_stats(),
-            channel_secs,
-            &ea.ability_uuid,
-            None, // propId 7: unmodelled in the corpus — omitted, never invented
-        ))
+        // An INSTANT buff is not a channelled cast either. The same rule that
+        // excludes bashes excludes these: op53 announces a channel, and an ability
+        // that ships no `_channelDuration` has none to announce.
+        //
+        // Ward, Absorb, Magicka Surge and Blizzard Armor all ship NO channelDuration,
+        // so they were going out as a `PlayerChannelingStateChange` of 0.0 s — the
+        // same malformed frame that made bashes animate wrongly (report #24), and a
+        // value retail essentially never sends (12 of 2,860 captured op53 floats are
+        // 0.0). The corpus is explicit that retail sends nothing here at all: across
+        // 144 captured Ward cast echoes and 30 Absorb cast echoes there is not one
+        // op53 or op58 between them.
+        //
+        // That is the "spell pose appears with no spell text" report: the pose was
+        // spurious: a generic cast animation for an instant buff whose brief label
+        // had already gone. The op38 echo above still identifies the cast, which is
+        // where the client gets the spell's name from.
+        super::gamedata::ability_rank_clamped(&ea.ability_uuid, level as u16)
+            .filter(|r| {
+                // "Does this ability channel at all?" — NOT "does it ship
+                // `_channelDuration`". Frostbite and Consuming Inferno carry their
+                // channel on `_channelMaxLength` instead and ship no
+                // `_channelDuration`, yet retail demonstrably sends op53 for both.
+                //
+                // Checked against the measured corpus: this predicate agrees with
+                // observed behaviour on all 14 player abilities whose op53 status is
+                // known — the ten carriers (Resist Elements, Lightning Bolt, Fireball,
+                // Ice Spike, Frostbite, Paralyze, Poison Cloud, Delayed Lightning
+                // Bolt, Blind, Consuming Inferno) and the four that send nothing
+                // (Ward, Absorb, Magicka Surge, Blizzard Armor).
+                r.channel_duration().is_some_and(|v| v > 0.0)
+                    || r.get(super::gamedata::AbilityField::ChannelMaxLength)
+                        .is_some_and(|v| v > 0.0)
+            })
+            .map(|r| {
+                // The wire float stays `_channelDuration` (0.0 when absent), exactly
+                // as before — only WHETHER the frame is sent has changed.
+                let channel_secs = r.channel_duration().unwrap_or(0.0);
+                messages::player_channeling_state_change(
+                    combat.fighters[sender].net_object_id,
+                    combat.fighters[sender].packed_stats(),
+                    combat.fighters[target_slot].packed_stats(),
+                    channel_secs,
+                    &ea.ability_uuid,
+                    None, // propId 7: unmodelled in the corpus — omitted, never invented
+                )
+            })
     };
     if let Some(f) = state_frame {
         out.push((sender, f.clone()));
@@ -1382,6 +1431,123 @@ pub(super) fn resolve_ability_cast(
 /// Swings already work this way: [`resolve_swing`] queues a `PendingHit` and
 /// [`land_due_hits`] delivers it after `FOLLOW_THROUGH_DELAY`. This is the same
 /// pattern for casts.
+
+/// Apply a **Reckless Fury** cast to `caster_slot`: start the 5 s window, pick the
+/// weapon-class bonus, and announce `StatusEffectType::RecklessFury (11)`.
+///
+/// Fury had NO persistent implementation. It is tagged `Maneuver`, so it fell into
+/// the generic maneuver arm and was resolved as one ordinary Middle weapon hit —
+/// which is both a phantom attack it should never make (`parameters.bonusDamage` is
+/// 0 with both grip multipliers 0: it swings nothing) and a complete absence of the
+/// five behaviours it exists for. Production match fffe01ca has the AI casting Fury
+/// at 18:38:48 and being stunned at 18:38:50, two seconds inside a window that is
+/// supposed to make stunning impossible.
+///
+/// `RecklessFuryAbility` serializes only `_bonusDamages` and `_duration`, so the
+/// damage numbers are read from the asset and the four boolean behaviours (no stun,
+/// no death, no block, no skills) are modelled as state for the window. They are NOT
+/// invented magnitudes — they have none to invent.
+fn apply_reckless_fury(
+    combat: &mut MatchCombat,
+    caster_slot: usize,
+    rank: u8,
+    now: Instant,
+) -> Vec<(usize, Vec<u8>)> {
+    use super::state::StatusEffectType;
+    let mut out = Vec::new();
+    if caster_slot >= combat.fighters.len() {
+        return out;
+    }
+    let Some(r) = super::gamedata::ability_rank_clamped(uuid_reckless_fury(), u16::from(rank.max(1)))
+    else {
+        return out;
+    };
+    let secs = r.get(super::gamedata::AbilityField::Duration).unwrap_or(5.0);
+    // Pick the bonus for the wielder's weapon class, falling back to the class-0
+    // "None" entry the asset ships for exactly this purpose.
+    let class_raw = combat.fighters[caster_slot]
+        .loadout
+        .weapon_template
+        .map(|w| w.weapon_class as u8)
+        .unwrap_or(0);
+    let bonus = r
+        .bonus_damages
+        .iter()
+        .find(|(c, _)| *c == class_raw)
+        .or_else(|| r.bonus_damages.iter().find(|(c, _)| *c == 0))
+        .map(|(_, v)| *v)
+        .unwrap_or(0.0);
+
+    let f = &mut combat.fighters[caster_slot];
+    f.reckless_fury_until = Some(now + Duration::from_secs_f32(secs));
+    f.reckless_fury_bonus = bonus;
+    // Fury cannot block: drop any guard already up, and `can_block` keeps it down.
+    f.blocking_until = None;
+    f.block_raised_at = None;
+    let obj = f.net_object_id;
+    info!(
+        "combat: slot {caster_slot} RECKLESS FURY r{rank} for {secs:.2}s \
+         (+{bonus:.2} dmg, weapon class {class_raw}, no stun / no death / no block)"
+    );
+    let frame =
+        messages::change_combat_status_effect(obj, true, StatusEffectType::RecklessFury, secs);
+    for v in 0..combat.fighters.len() {
+        out.push((v, frame.clone()));
+    }
+    out
+}
+
+/// Reckless Fury's uuid, resolved from the shipped table rather than hardcoded.
+fn uuid_reckless_fury() -> &'static str {
+    super::gamedata::ABILITIES
+        .iter()
+        .find(|a| a.editor_name == "RecklessFury")
+        .map(|a| a.uuid)
+        .unwrap_or("")
+}
+
+/// The flat bonus damage a MANEUVER rank contributes to its swing, grip applied.
+///
+/// Every maneuver rank ships `parameters.bonusDamage` together with
+/// `oneHandedMultiplier` / `twoHandedMultiplier`, and until now **nothing read
+/// them** — the generated tables carried the numbers and the resolver never looked.
+/// That is why all 17 maneuvers resolved to the same plain Middle weapon hit:
+/// Guardbreaker's 131.15 and Quick Strikes' 13.78 produced identical damage.
+///
+/// The three authored families:
+///
+/// | family        | 1H  | 2H  | members                                             |
+/// |---------------|-----|-----|-----------------------------------------------------|
+/// | power-attack  | 0.5 | 1.0 | Power Attack, Guardbreaker, Skullcrusher, Ind. Smash |
+/// | quick-strikes | 1.0 | 0.0 | Quick / Piercing / Recovery / Venom Strikes          |
+/// | symmetric     | 1.0 | 1.0 | all Bash and Dodge variants                          |
+///
+/// so a power-attack family member is authored at its TWO-handed figure and halved
+/// one-handed, while a quick-strikes member gets **no** bonus two-handed at all.
+/// Reckless Fury ships 0/0 — it is a buff that swings nothing.
+///
+/// Grip follows the same rule as the weapon's own base damage:
+/// `two_handed = !has_shield` (`loadout::base_damage_in_hand`).
+///
+/// CALIBRATION NOTE: the recorded s506 Middle-maneuver values (201.37 / 274.51 /
+/// 186.98) sit inside the band of a PLAIN swing (150.81..271.46 across the
+/// swing-factor range), and `swing_factor` is not observable in the capture, so that
+/// recording can neither confirm nor refute the magnitude of this bonus. What it
+/// cannot excuse is every maneuver dealing identical damage. The mechanism and the
+/// authored numbers are what is shipped here; the magnitude wants a capture with a
+/// known maneuver and a known charge state.
+fn maneuver_bonus_damage(rank: &super::gamedata::AbilityRank, two_handed: bool) -> f32 {
+    let Some(params) = rank.parameters else {
+        return 0.0;
+    };
+    let mult = if two_handed {
+        params.two_handed_multiplier
+    } else {
+        params.one_handed_multiplier
+    };
+    (params.bonus_damage * mult).max(0.0)
+}
+
 fn apply_ability_impact(
     combat: &mut MatchCombat,
     sender: usize,
@@ -1421,6 +1587,13 @@ fn apply_ability_impact(
         // 2026-08-03: QuickStrikes (150 stamina) and PiercingStrikes (180 stamina) ship
         // NO damage field at any rank, so `unwrap_or(0.0)` made both cost a third of
         // the stamina bar and do literally nothing. 87 of 160 casts that day dealt 0.0.
+        // Reckless Fury is tagged Maneuver but is a pure SELF-BUFF: its
+        // `parameters.bonusDamage` is 0 with both grip multipliers 0, so it swings
+        // nothing. Resolving it as a weapon hit gave the caster a free phantom
+        // attack on every cast.
+        AbilityTag::Maneuver if ability_uuid == uuid_reckless_fury() => {
+            out.extend(apply_reckless_fury(combat, sender, level, now));
+        }
         AbilityTag::Maneuver => {
             let mut attacker_loadout = combat.fighters[sender].loadout.clone();
             // §5 PIERCING. Both of these ratings are ALREADY consumed by the damage
@@ -1449,6 +1622,21 @@ fn apply_ability_impact(
                 if let Some(ebp) = r.elemental_block_piercing() {
                     attacker_loadout.elem_block_piercing_rating += ebp;
                 }
+                // §6 THE MANEUVER'S OWN BONUS DAMAGE. Every maneuver rank ships
+                // `parameters.bonusDamage` with a one-/two-handed multiplier, and
+                // nothing read them — which is why all 17 maneuvers resolved to an
+                // identical plain weapon hit regardless of which one was cast.
+                //
+                // Grip follows the same rule as the weapon's own base damage:
+                // `two_handed = !has_shield` (see `loadout::base_damage_in_hand`).
+                //
+                // The three authored families (see ability-spec):
+                //   power-attack  1H 0.5 / 2H 1.0 — the bonus is the TWO-handed figure
+                //   quick-strikes 1H 1.0 / 2H 0.0 — two-handed gets no bonus at all
+                //   bashes/dodges 1.0 / 1.0
+                // Reckless Fury ships 0/0 because it is a buff that swings nothing.
+                attacker_loadout.maneuver_bonus_damage +=
+                    maneuver_bonus_damage(&r, !attacker_loadout.has_shield);
             }
             // Middle is not part of a Left/Right chain, so it resets the combo — the
             // same rule `resolve_swing_with_side` applies to a Middle swing.
@@ -1542,7 +1730,18 @@ fn apply_ability_impact(
             // (`_damageToCauseParalyze` / `_duration`), applied by
             // `apply_status_conditioning` via the caster's `paralyze_rank`.
             if tag == AbilityTag::Paralyze {
-                out.extend(try_paralyze(combat, sender, target_slot, level, now));
+                // Threshold is checked against the Poison THIS CAST actually landed
+                // (post-negation — `resolved.components` is what survived Ward/Absorb),
+                // not the sliding window. See `try_paralyze`.
+                let cast_poison: f32 = resolved
+                    .components
+                    .iter()
+                    .filter(|(t, _)| *t == super::state::DamageType::Poison)
+                    .map(|(_, v)| *v)
+                    .sum();
+                out.extend(try_paralyze(
+                    combat, sender, target_slot, level, cast_poison, now,
+                ));
             }
             // `_damageToCauseStagger` used to be handled HERE, inside this arm. It is
             // now in `apply_shipped_effects` below, which every arm reaches — the two
@@ -1581,9 +1780,14 @@ fn apply_ability_impact(
 fn ability_impact_delay(ability_uuid: &str, level: u8) -> Duration {
     let secs = super::gamedata::ability_rank_clamped(ability_uuid, level as u16)
         .map(|r| {
-            r.channel_duration()
-                .unwrap_or(0.0)
-                .max(r.block_duration().unwrap_or(0.0))
+            // `_delayDuration` is the spell's OWN delay and is ADDITIVE to the channel
+            // — they are separate fields, not alternatives. Delayed Lightning Bolt
+            // ships channelDuration 1.3 + delayDuration 4.0, i.e. 5.3 s to impact;
+            // ignoring the delay landed it after ~1.3 s and made it indistinguishable
+            // from the ordinary Lightning Bolt it is supposed to trade time for.
+            let channel = r.channel_duration().unwrap_or(0.0)
+                + r.get(super::gamedata::AbilityField::DelayDuration).unwrap_or(0.0);
+            channel.max(r.block_duration().unwrap_or(0.0))
         })
         .unwrap_or(0.0);
     if secs.is_finite() && secs > 0.0 {
@@ -1836,14 +2040,96 @@ fn apply_shipped_effects(
         }
     }
 
+    // `_bonusResistance` — a FLAT all-damage resistance granted to the CASTER.
+    // Indomitable Smash ships 250 at rank 1 and it was read by nobody, so the
+    // maneuver cured conditions and then did nothing else defensively.
+    //
+    // Lifetime: the ability ships no duration of its own, so it rides the same
+    // `ABILITY_USE_MIN_WINDOW_SECS` window the Combat Focus / Willpower perks use for
+    // a cast — the committed-animation window. That is a modelling choice, not an
+    // authored number, and is called out here rather than buried.
+    if let Some(bonus) = r.get(super::gamedata::AbilityField::BonusResistance) {
+        if bonus > 0.0 && caster < viewers {
+            let window = super::perks::ABILITY_USE_MIN_WINDOW_SECS;
+            let expires = now + Duration::from_secs_f32(window);
+            combat.fighters[caster]
+                .transient_all_resistance
+                .push((bonus, expires));
+            info!(
+                "combat: slot {caster} bonus resistance +{bonus:.1} for {window:.2}s ({ability_uuid})"
+            );
+        }
+    }
+
+    // `_resistanceBonus` + `_resistTypes` — a resistance to SPECIFIC damage types for
+    // the caster. Frostbite ships 13.13 against resistTypes [1,2,3] (the three
+    // physical tracks) while it channels, and both fields were unread: the spell did
+    // its channelled damage and gave the caster none of the protection its
+    // description promises.
+    if let Some(bonus) = r.get(super::gamedata::AbilityField::ResistanceBonus) {
+        if bonus > 0.0 && caster < viewers && !r.resist_types.is_empty() {
+            // Lasts as long as the channel it protects.
+            let secs = r
+                .get(super::gamedata::AbilityField::ChannelMaxLength)
+                .or_else(|| r.channel_duration())
+                .unwrap_or(super::perks::ABILITY_USE_MIN_WINDOW_SECS);
+            let expires = now + Duration::from_secs_f32(secs);
+            let mut applied = 0;
+            for raw in r.resist_types {
+                use super::state::DamageType as DT;
+                let ty = match *raw {
+                    1 => Some(DT::Slashing),
+                    2 => Some(DT::Cleaving),
+                    3 => Some(DT::Bashing),
+                    4 => Some(DT::Fire),
+                    5 => Some(DT::Frost),
+                    6 => Some(DT::Shock),
+                    7 => Some(DT::Poison),
+                    _ => None,
+                };
+                if let Some(ty) = ty {
+                    combat.fighters[caster]
+                        .transient_resistances
+                        .push((ty, bonus, expires));
+                    applied += 1;
+                }
+            }
+            info!(
+                "combat: slot {caster} resistance +{bonus:.1} on {applied} type(s) for \
+                 {secs:.2}s ({ability_uuid})"
+            );
+        }
+    }
+
     if let Some(cap) = r.maximum_damage_dodged() {
         if cap > 0.0 && caster < viewers {
+            // `_dodgeDuration` is authored at **1.0 s** on all four dodge maneuvers
+            // and was ignored: the pool was given the 3600 s "until consumed"
+            // placeholder, so a Dodging Strike stayed armed for an hour and ate a hit
+            // a round or more later. It is a one-second reactive window, not a
+            // banked shield.
+            let dodge_secs = r
+                .get(super::gamedata::AbilityField::DodgeDuration)
+                .filter(|v| *v > 0.0);
+            let expires = match dodge_secs {
+                Some(secs) => now + Duration::from_secs_f32(secs),
+                None => until_consumed,
+            };
             combat.fighters[caster].negation_pools.push(NegationPool {
                 source: DamageNegationSource::Dodge,
                 remaining: cap,
-                expires_at: until_consumed,
+                expires_at: expires,
+                // Adrenaline / Renewing / Focusing Dodge pay out only if the dodge
+                // actually connects. Absent fields are 0, i.e. a plain Dodging Strike.
+                on_absorb_restore: (
+                    r.get(super::gamedata::AbilityField::MaximumHealthRestored).unwrap_or(0.0),
+                    r.get(super::gamedata::AbilityField::MaximumMagickaRestored).unwrap_or(0.0),
+                    r.get(super::gamedata::AbilityField::MaximumCooldownReduction).unwrap_or(0.0),
+                ),
                 restoration_factor: 0.0,
                 absorb_fraction: 1.0,
+                elemental_only: false,
+                consumes_overflow: false,
             });
             let obj = combat.fighters[caster].net_object_id;
             info!("combat: slot {caster} dodge pool +{cap:.1} ({ability_uuid})");
@@ -1872,6 +2158,11 @@ fn apply_shipped_effects(
                 expires_at: until_consumed,
                 restoration_factor: 0.0,
                 absorb_fraction: absorb,
+                on_absorb_restore: (0.0, 0.0, 0.0),
+                // Storm-armor shields are not element-scoped and have no overflow
+                // clause in their description — only Ward does.
+                elemental_only: false,
+                consumes_overflow: false,
             });
             let obj = combat.fighters[caster].net_object_id;
             info!("combat: slot {caster} storm-armor shield +{shield:.1} ({ability_uuid})");
@@ -2039,25 +2330,32 @@ fn apply_shipped_effects(
 
 /// Land `Paralyzed` on `target_slot` when the caster's Paralyze rank says the hit is
 /// strong enough. The threshold is the **absolute** shipped `_damageToCauseParalyze`
-/// (32.7 @ R1) checked against the target's accumulated poison in the sliding window,
-/// and the lock lasts the rank's own `_duration` (2.0 s @ R1). [Phase 3.9]
+/// (32.7 @ R1), and the lock lasts the rank's own `_duration` (2.0 s @ R1). [Phase 3.9]
+///
+/// `cast_poison` is the Poison damage THIS Paralyze cast actually delivered, AFTER
+/// negation. It used to be `recent_element_damage(Poison)` — every poison point the
+/// target had taken in the 5 s window, from any source. That was wrong twice over:
+/// a Paralyze fully eaten by a Ward still paralysed (it contributed 0 damage but the
+/// window was already over threshold), and a Poison Cloud ticking in the background
+/// could arm someone else's Paralyze. Both make the lock land when the spell that is
+/// supposed to cause it did nothing.
 fn try_paralyze(
     combat: &mut MatchCombat,
     _caster: usize,
     target_slot: usize,
     rank: u8,
+    cast_poison: f32,
     now: Instant,
 ) -> Vec<(usize, Vec<u8>)> {
-    use super::state::{ActorStateType, DamageType, StatusEffectType};
+    use super::state::{ActorStateType, StatusEffectType};
     let mut out = Vec::new();
     if !combat.fighters[target_slot].can_be_paralyzed
         || combat.fighters[target_slot].actor_state() == ActorStateType::Paralyzed
     {
         return out;
     }
-    let recent = combat.fighters[target_slot].recent_element_damage(DamageType::Poison);
     let threshold = super::state::paralyze_damage_threshold(rank);
-    if recent < threshold {
+    if cast_poison < threshold {
         return out;
     }
     let secs = super::state::paralyze_duration_secs(rank);
@@ -2074,7 +2372,7 @@ fn try_paralyze(
     f.paralyze_secs = secs;
     let obj = f.net_object_id;
     info!(
-        "combat status: gsid={} target_slot={target_slot} target={} status=Paralyzed poison_window={recent:.1} threshold={threshold:.1} duration={secs}",
+        "combat status: gsid={} target_slot={target_slot} target={} status=Paralyzed cast_poison={cast_poison:.1} threshold={threshold:.1} duration={secs}",
         combat.game_session_id,
         combat.fighters[target_slot].loadout.display_name,
     );
@@ -2111,12 +2409,36 @@ fn emit_damage(
 
     // Whole hit eaten by a Ward/Absorb pool → emit DamageNegated(66), apply the Absorb
     // heal-back, and DO NOT reduce HP (the hit dealt 0). [status-resistance-spec §4]
+    // Pool restorations are paid whenever a pool ABSORBED something, whether or not
+    // it swallowed the hit whole. The heal used to live inside the `negated` branch
+    // below, so an Absorb that ate most of a big hit healed nothing, and the dodge
+    // restorations (Adrenaline / Renewing / Focusing) would have had the same hole.
+    if neg.heal > 0.0 {
+        let f = &mut combat.fighters[target_slot];
+        f.health = (f.health + neg.heal.round() as u32).min(f.max_health);
+    }
+    if neg.restore_magicka > 0.0 {
+        let f = &mut combat.fighters[target_slot];
+        f.magicka = (f.magicka + neg.restore_magicka.round() as u32).min(f.max_magicka);
+        info!(
+            "combat: slot {target_slot} dodge restored {:.0} magicka",
+            neg.restore_magicka
+        );
+    }
+    if neg.restore_cooldown_secs > 0.0 {
+        let cut = Duration::from_secs_f32(neg.restore_cooldown_secs);
+        let f = &mut combat.fighters[target_slot];
+        for until in f.cooldowns.values_mut() {
+            *until = until.checked_sub(cut).unwrap_or(*until);
+        }
+        info!(
+            "combat: slot {target_slot} dodge cut {:.1}s off its cooldowns",
+            neg.restore_cooldown_secs
+        );
+    }
+
     if neg.negated {
         let defender_obj = combat.fighters[target_slot].net_object_id;
-        if neg.heal > 0.0 {
-            let f = &mut combat.fighters[target_slot];
-            f.health = (f.health + neg.heal.round() as u32).min(f.max_health);
-        }
         info!(
             "combat damage: slot {attacker_slot} → slot {target_slot} | source {:?} side {:?} | \
              NEGATED by a pool (heal +{:.0}) → op66 DamageNegated, no HP loss",
@@ -2130,7 +2452,9 @@ fn emit_damage(
 
     let hp_before = combat.fighters[target_slot].health;
     let max_hp = combat.fighters[target_slot].max_health;
-    combat.fighters[target_slot].take_damage(total.round().max(0.0) as u32);
+    // `take_damage_at`, not `take_damage`: Reckless Fury floors the victim at 1 HP
+    // for its window ("cannot be killed").
+    combat.fighters[target_slot].take_damage_at(total.round().max(0.0) as u32, now);
     // The mirrored Stamina/Magicka tracks come off their pools BEFORE `packed_stats()`
     // is read for the frame, so the bars the client draws match the numbers the same
     // frame reports. [Fighter::drain_mirrored_pools]
@@ -2161,7 +2485,12 @@ fn emit_damage(
             resolved.source,
             resolved.flags,
             total,
-            0,
+            // The ATTACKER's current combo depth. This was a hardcoded `0`, so all
+            // 5,147 production op50 events reported comboCount 0 regardless of the
+            // chain that produced them — which both lies to the client and destroys
+            // our own ability to compare a recorded chain against retail, since the
+            // depth is the x-axis of every combo-ramp comparison.
+            i16::try_from(attacker.combo_count).unwrap_or(i16::MAX),
             resolved.active_side,
             resolved.most_resisted,
             &components,
@@ -2216,7 +2545,7 @@ fn apply_revenge(
     attacker_slot: usize,
     triggering_source: super::state::DamageSource,
     triggering_components: &[(super::state::DamageType, f32)],
-    _now: Instant,
+    now: Instant,
 ) -> Vec<(usize, Vec<u8>)> {
     let mut out = Vec::new();
     if defender_slot == attacker_slot {
@@ -2255,12 +2584,12 @@ fn apply_revenge(
             let a = &combat.fighters[attacker_slot];
             // No elemental piercing: that is a property of an ATTACK, and Revenge is
             // gear firing on its own, not a swing the wearer aimed.
-            (raw - a.total_resistance_against(ty, 0.0, _now)).max(0.0)
+            (raw - a.total_resistance_against(ty, 0.0, now)).max(0.0)
         };
         if resisted <= 0.0 {
             continue;
         }
-        combat.fighters[attacker_slot].take_damage(resisted.round().max(0.0) as u32);
+        combat.fighters[attacker_slot].take_damage_at(resisted.round().max(0.0) as u32, now);
         let msg = {
             let hit = &combat.fighters[attacker_slot];
             let other = &combat.fighters[defender_slot];
@@ -2780,7 +3109,7 @@ fn apply_dot_ticks(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8
             for _ in 0..due {
                 let hp_before = combat.fighters[slot].health;
                 let max_hp = combat.fighters[slot].max_health;
-                combat.fighters[slot].take_damage(tick_dmg.round().max(0.0) as u32);
+                combat.fighters[slot].take_damage_at(tick_dmg.round().max(0.0) as u32, now);
                 let hp_after = combat.fighters[slot].health;
                 let pct = if max_hp > 0 { 100.0 * tick_dmg / max_hp as f32 } else { 0.0 };
                 info!(
@@ -2851,6 +3180,12 @@ fn apply_ward(
         expires_at: ward_expires,
         restoration_factor: 0.0, // Ward: pure negation, no heal-back
         absorb_fraction: 1.0,    // Ward swallows a hit whole until exhausted
+        on_absorb_restore: (0.0, 0.0, 0.0),
+        // `Ability.Spell.Ward.Description`: "negates up to {1} ELEMENTAL damage,
+        // plus any EXCESS damage from the attack that destroys it". Ward's physical
+        // protection is the Armor Rating pushed below, not this pool.
+        elemental_only: true,
+        consumes_overflow: true,
     });
     // Add transient flat physical armor (subtracted from incoming physical as a
     // transient resistance on the caster — `DamageType::Health` is NOT physical;
@@ -2902,7 +3237,10 @@ fn apply_absorb(
         remaining: amount,
         expires_at: now + Duration::from_secs_f32(duration),
         restoration_factor: restoration,
-                absorb_fraction: 1.0,
+        absorb_fraction: 1.0,
+        on_absorb_restore: (0.0, 0.0, 0.0),
+        elemental_only: false,
+        consumes_overflow: false,
     });
     let obj = f.net_object_id;
     info!("combat: slot {caster_slot} ABSORB r{rank} applied (pool {amount:.2}, heal ×{restoration}, {duration}s)");
@@ -6480,6 +6818,242 @@ mod shipped_effects_tests {
             .unwrap_or_else(|| panic!("{editor} missing from the shipped table"))
     }
 
+    /// THE SYSTEMIC MANEUVER BUG: all 17 maneuvers dealt identical damage because
+    /// `parameters.bonusDamage` and the grip multipliers were generated into the
+    /// tables and read by nobody. Guardbreaker (131.15) and Quick Strikes (13.78)
+    /// cannot be the same hit.
+    ///
+    /// Differential across maneuvers, so it cannot pass on a hardcoded constant.
+    #[test]
+    fn maneuvers_carry_their_own_authored_bonus_damage() {
+        let r = |editor: &str| {
+            super::super::gamedata::ability_rank_clamped(uuid_of(editor), 1)
+                .unwrap_or_else(|| panic!("{editor} rank 1"))
+        };
+        // One-handed (a shield is equipped).
+        let gb = maneuver_bonus_damage(&r("Guardbreaker"), false);
+        let qs = maneuver_bonus_damage(&r("QuickStrikes"), false);
+        assert!(gb > 0.0, "Guardbreaker must contribute a bonus, got {gb}");
+        assert!(qs > 0.0, "QuickStrikes must contribute a bonus, got {qs}");
+        assert!(
+            gb > qs * 2.0,
+            "Guardbreaker ({gb:.2}) must hit far harder than QuickStrikes ({qs:.2})"
+        );
+    }
+
+    /// The power-attack family is authored at its TWO-handed figure and halved in one
+    /// hand; the quick-strikes family is the other way round and gets NOTHING in two
+    /// hands. A single shared multiplier would fail one of these two assertions.
+    #[test]
+    fn grip_multipliers_follow_the_authored_family() {
+        let r = |editor: &str| {
+            super::super::gamedata::ability_rank_clamped(uuid_of(editor), 1)
+                .unwrap_or_else(|| panic!("{editor} rank 1"))
+        };
+        let pa_1h = maneuver_bonus_damage(&r("PowerAttack"), false);
+        let pa_2h = maneuver_bonus_damage(&r("PowerAttack"), true);
+        assert!(
+            pa_2h > pa_1h && (pa_1h * 2.0 - pa_2h).abs() < 0.01,
+            "PowerAttack one-handed ({pa_1h:.2}) must be half of two-handed ({pa_2h:.2})"
+        );
+
+        let qs_1h = maneuver_bonus_damage(&r("QuickStrikes"), false);
+        let qs_2h = maneuver_bonus_damage(&r("QuickStrikes"), true);
+        assert!(qs_1h > 0.0, "QuickStrikes one-handed must get its bonus");
+        assert_eq!(qs_2h, 0.0, "…and two-handed must get none (2H multiplier is 0)");
+    }
+
+    /// Reckless Fury is a BUFF: it ships bonusDamage 0 with both multipliers 0, so it
+    /// must contribute no swing damage at all. The server used to resolve it as an
+    /// ordinary Middle weapon hit.
+    #[test]
+    fn reckless_fury_contributes_no_swing_damage() {
+        let r = super::super::gamedata::ability_rank_clamped(uuid_of("RecklessFury"), 1)
+            .expect("RecklessFury rank 1");
+        assert_eq!(maneuver_bonus_damage(&r, false), 0.0);
+        assert_eq!(maneuver_bonus_damage(&r, true), 0.0);
+    }
+
+    /// THE PRODUCTION BUG (match fffe01ca-9b20-4cb8-bd8c-a7ce1cfeaf29): the AI cast
+    /// Reckless Fury at 18:38:48 and was stunned at 18:38:50 — two seconds into a
+    /// five-second window that is supposed to make stunning impossible. Fury had no
+    /// persistent state at all, so nothing was there to prevent it.
+    #[test]
+    fn reckless_fury_cannot_be_stunned_for_its_window() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        apply_reckless_fury(&mut c, 0, 1, now);
+        assert!(c.fighters[0].has_reckless_fury(now), "precondition: Fury is up");
+
+        // The exact production timing: the stun arrives 2s in.
+        let at_stun = now + Duration::from_secs(2);
+        c.fighters[0].apply_stagger_for(at_stun, 2.5);
+        assert!(
+            !c.fighters[0].is_staggered(at_stun),
+            "a fighter in Reckless Fury must not be stunnable"
+        );
+
+        // …and is stunnable again once the 5s window has lapsed, so the guard is a
+        // window and not a permanent immunity.
+        let after = now + Duration::from_secs_f32(5.5);
+        assert!(!c.fighters[0].has_reckless_fury(after), "the window has closed");
+        c.fighters[0].apply_stagger_for(after, 2.5);
+        assert!(c.fighters[0].is_staggered(after), "and normal stuns resume");
+    }
+
+    /// "…cannot be killed." Floors at 1 HP for the window, and dies normally after.
+    #[test]
+    fn reckless_fury_prevents_death_for_its_window() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        apply_reckless_fury(&mut c, 0, 1, now);
+        c.fighters[0].take_damage_at(u32::MAX, now);
+        assert!(!c.fighters[0].is_dead(), "Fury must survive a lethal hit");
+        assert_eq!(c.fighters[0].health, 1, "…at exactly 1 HP");
+
+        let after = now + Duration::from_secs_f32(5.5);
+        c.fighters[0].take_damage_at(u32::MAX, after);
+        assert!(c.fighters[0].is_dead(), "and dies normally once Fury lapses");
+    }
+
+    /// Fury is a self-buff: casting it must NOT produce a weapon hit. The generic
+    /// maneuver arm gave the caster a free phantom attack on every cast.
+    #[test]
+    fn casting_reckless_fury_emits_no_damage_to_the_target() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        let before = c.fighters[1].health;
+        apply_reckless_fury(&mut c, 0, 1, now);
+        assert_eq!(c.fighters[1].health, before, "the opponent must take no damage");
+    }
+
+    /// The window carries the rank's authored `_duration` and a weapon-class bonus
+    /// picked from `bonusDamages`, not a hardcoded number.
+    #[test]
+    fn reckless_fury_uses_its_authored_duration_and_bonus() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        apply_reckless_fury(&mut c, 0, 1, now);
+        assert!(c.fighters[0].reckless_fury_bonus > 0.0, "a class bonus was chosen");
+        // 5.0s authored: up just before, down just after.
+        assert!(c.fighters[0].has_reckless_fury(now + Duration::from_secs_f32(4.9)));
+        assert!(!c.fighters[0].has_reckless_fury(now + Duration::from_secs_f32(5.1)));
+    }
+
+    /// op53 `PlayerChannelingStateChange` announces a CHANNEL. An ability that does
+    /// not channel must not send one — we used to send a 0.0-second frame for every
+    /// non-maneuver, which is the same malformed message that made bashes animate
+    /// wrongly (report #24) and is the likely "spell pose with no spell text".
+    ///
+    /// The predicate is "ships a channel field at all", not "ships
+    /// `_channelDuration`": Frostbite and Consuming Inferno channel via
+    /// `_channelMaxLength` and retail does send op53 for them. This asserts the split
+    /// against every player ability whose retail op53 behaviour was measured — ten
+    /// carriers and four silent ones — so it cannot pass by accident in one direction.
+    #[test]
+    fn only_channelled_abilities_announce_a_channel() {
+        let channels = |editor: &str| {
+            let r = super::super::gamedata::ability_rank_clamped(uuid_of(editor), 1)
+                .unwrap_or_else(|| panic!("{editor} rank 1"));
+            r.channel_duration().is_some_and(|v| v > 0.0)
+                || r.get(super::super::gamedata::AbilityField::ChannelMaxLength)
+                    .is_some_and(|v| v > 0.0)
+        };
+        for editor in [
+            "ResistElements", "LightningBolt", "Fireball", "IceSpike", "Frostbite",
+            "Paralyze", "PosionCloud", "DelayedLightningBolt", "Blind", "ConsumingInferno",
+        ] {
+            assert!(channels(editor), "{editor} carries an op53 in retail and must send one");
+        }
+        for editor in ["Ward", "Absorb", "MagickaSurge", "BlizzardArmor"] {
+            assert!(
+                !channels(editor),
+                "{editor} sends NO op53 in retail (0 across 144 Ward and 30 Absorb cast \
+                 echoes) — it is an instant buff, not a channel"
+            );
+        }
+    }
+
+    /// A dodge is a ONE-SECOND reactive window, not a banked shield. `_dodgeDuration`
+    /// is authored at 1.0 s on all four dodge maneuvers and was ignored — the pool got
+    /// the 3600 s "until consumed" placeholder, so a Dodging Strike stayed armed for an
+    /// hour and could eat a hit a round later.
+    #[test]
+    fn a_dodge_pool_expires_after_its_authored_second() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        apply_shipped_effects(&mut c, 0, 1, uuid_of("DodgingStrike"), 1, 500.0, 0, now);
+        let pool = c.fighters[0].negation_pools.first().expect("a dodge pool").clone();
+        assert!(
+            pool.expires_at <= now + Duration::from_secs_f32(1.05),
+            "the dodge must lapse after its authored ~1.0s, not an hour"
+        );
+        assert!(pool.expires_at > now, "…but it is armed now");
+
+        c.fighters[0].prune_negation_pools(now + Duration::from_secs_f32(1.5));
+        assert!(c.fighters[0].negation_pools.is_empty(), "and is gone a second later");
+    }
+
+    /// Delayed Lightning Bolt trades time for damage: `_delayDuration` 4.0 is ADDITIVE
+    /// to `_channelDuration` 1.3, so it lands at ~5.3 s. The delay field was read by
+    /// nobody, so it landed after ~1.3 s — indistinguishable from the plain bolt.
+    ///
+    /// Differential against the ordinary Lightning Bolt so it cannot pass on a
+    /// constant.
+    #[test]
+    fn delayed_lightning_bolt_waits_for_its_authored_delay() {
+        let delayed = super::ability_impact_delay(uuid_of("DelayedLightningBolt"), 1);
+        let plain = super::ability_impact_delay(uuid_of("LightningBolt"), 1);
+        assert!(
+            delayed >= Duration::from_secs_f32(5.0),
+            "delayed bolt must wait channel+delay (~5.3s), got {delayed:?}"
+        );
+        assert!(
+            delayed > plain + Duration::from_secs(3),
+            "it must land far later than the plain bolt ({plain:?}), not alongside it"
+        );
+    }
+
+    /// Indomitable Smash ships `_bonusResistance` 250 and it was read by nobody, so
+    /// the maneuver cured conditions and then did nothing defensively at all.
+    #[test]
+    fn indomitable_smash_grants_its_authored_resistance() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        apply_shipped_effects(&mut c, 0, 1, uuid_of("IndomitableSmash"), 1, 500.0, 0, now);
+        let total: f32 = c.fighters[0].transient_all_resistance.iter().map(|(v, _)| *v).sum();
+        assert!(total >= 250.0, "expected the authored 250 flat resistance, got {total}");
+    }
+
+    /// Frostbite ships `_resistanceBonus` 13.13 against `_resistTypes` [1,2,3] — the
+    /// three physical tracks — for the caster while it channels. Both fields were
+    /// unread, so the spell dealt its damage and gave none of the protection its
+    /// description promises.
+    #[test]
+    fn frostbite_grants_its_authored_physical_resistance_to_the_caster() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        apply_shipped_effects(&mut c, 0, 1, uuid_of("Frostbite"), 1, 500.0, 0, now);
+        use super::super::state::DamageType;
+        for ty in [DamageType::Slashing, DamageType::Cleaving, DamageType::Bashing] {
+            let got: f32 = c.fighters[0]
+                .transient_resistances
+                .iter()
+                .filter(|(t, _, _)| *t == ty)
+                .map(|(_, v, _)| *v)
+                .sum();
+            assert!(got > 0.0, "{ty:?} must be resisted while Frostbite channels");
+        }
+        // …and NOT the elemental tracks: resistTypes is [1,2,3], physical only.
+        let fire: f32 = c.fighters[0]
+            .transient_resistances
+            .iter()
+            .filter(|(t, _, _)| *t == DamageType::Fire)
+            .map(|(_, v, _)| *v)
+            .sum();
+        assert_eq!(fire, 0.0, "resistTypes is physical-only; Fire must not be covered");
+    }
+
     #[test]
     fn a_dodge_ability_gives_the_caster_a_dodge_pool() {
         let now = Instant::now();
@@ -6525,9 +7099,10 @@ mod shipped_effects_tests {
         let paralyse_at = |rank: u8| -> f32 {
             let now = Instant::now();
             let mut c = combat2(now);
-            // Enough accumulated poison to clear even the top rank's threshold.
+            // A cast_poison well above even the top rank's threshold: these tests are
+            // about the DURATION of the lock, not about what arms it.
             c.fighters[1].record_element_damage(DamageType::Poison, 500.0, now);
-            let out = try_paralyze(&mut c, 0, 1, rank, now);
+            let out = try_paralyze(&mut c, 0, 1, rank, 1_000.0, now);
             assert!(!out.is_empty(), "rank {rank} did not paralyse — the test would be vacuous");
             assert!(c.fighters[1].is_paralyzed(), "rank {rank} target not locked");
             c.fighters[1].paralyze_secs
@@ -6551,7 +7126,7 @@ mod shipped_effects_tests {
         let now = Instant::now();
         let mut c = combat2(now);
         c.fighters[1].record_element_damage(DamageType::Poison, 500.0, now);
-        try_paralyze(&mut c, 0, 1, 12, now);
+        try_paralyze(&mut c, 0, 1, 12, 1_000.0, now);
 
         // 2.5 s in: rank 1's window has long lapsed, rank 12's has not.
         reconcile_paralysis(&mut c.fighters[1], now + Duration::from_millis(2500));
@@ -6613,11 +7188,49 @@ mod shipped_effects_tests {
         c.fighters[1].paralyze_secs = 99.0;
         c.fighters[1].record_element_damage(DamageType::Poison, 500.0, now);
 
-        try_paralyze(&mut c, 0, 1, 1, now);
+        try_paralyze(&mut c, 0, 1, 1, 1_000.0, now);
         assert!(
             (c.fighters[1].paralyze_secs - 2.0).abs() < 0.001,
             "rank 1 must set its OWN 2.0s, not keep the stale 99.0"
         );
+    }
+
+    /// A Paralyze that a Ward ate must NOT paralyse. The threshold used to be checked
+    /// against `recent_element_damage(Poison)` — every poison point taken in the 5 s
+    /// window from any source — so a cast that delivered literally zero damage still
+    /// landed the lock as long as the victim happened to be poisoned already.
+    ///
+    /// Fails on the old code: the 500 seeded into the window armed it.
+    #[test]
+    fn a_fully_negated_paralyze_does_not_paralyze() {
+        use super::super::state::DamageType;
+        let now = Instant::now();
+        let mut c = combat2(now);
+        // The victim is already poisoned — the window is way over any threshold.
+        c.fighters[1].record_element_damage(DamageType::Poison, 500.0, now);
+        // …but THIS cast was fully negated, so it delivered nothing.
+        try_paralyze(&mut c, 0, 1, 1, 0.0, now);
+        assert!(
+            !c.fighters[1].is_paralyzed(),
+            "a cast that dealt no poison must not paralyse, however poisoned the target is"
+        );
+    }
+
+    /// The complement: background poison alone must not arm someone else's Paralyze.
+    /// A cast landing UNDER the rank's own `_damageToCauseParalyze` does nothing even
+    /// when the sliding window is saturated.
+    #[test]
+    fn background_poison_does_not_arm_a_weak_paralyze() {
+        use super::super::state::DamageType;
+        let now = Instant::now();
+        let mut c = combat2(now);
+        c.fighters[1].record_element_damage(DamageType::Poison, 500.0, now);
+        let threshold = super::super::state::paralyze_damage_threshold(1);
+        try_paralyze(&mut c, 0, 1, 1, threshold - 1.0, now);
+        assert!(!c.fighters[1].is_paralyzed(), "under its own threshold: no lock");
+        // …and one point over it does land, so the test cannot pass vacuously.
+        try_paralyze(&mut c, 0, 1, 1, threshold + 1.0, now);
+        assert!(c.fighters[1].is_paralyzed(), "over its own threshold: locked");
     }
 
     /// FlashFreeze locks the TARGET, not the caster, for the rank's own duration.
@@ -7563,7 +8176,7 @@ mod report_31_high_block_stun {
             500.0,
             now,
         );
-        let _ = super::try_paralyze(&mut c, 0, 1, 12, now);
+        let _ = super::try_paralyze(&mut c, 0, 1, 12, 1_000.0, now);
         assert!(c.fighters[1].is_paralyzed());
 
         super::on_tick(&mut c, now + Duration::from_millis(10), false);
@@ -7600,7 +8213,7 @@ mod report_31_high_block_stun {
             500.0,
             now + Duration::from_millis(5),
         );
-        let _ = super::try_paralyze(&mut c, 0, 1, 12, now + Duration::from_millis(5));
+        let _ = super::try_paralyze(&mut c, 0, 1, 12, 1_000.0, now + Duration::from_millis(5));
         assert!(c.fighters[1].is_paralyzed());
         assert_eq!(c.pending_hits.len(), 1, "paralysis must retain a committed hit");
 

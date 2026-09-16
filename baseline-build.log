@@ -1,0 +1,40 @@
+warning: unused import: `super::*`
+   --> blades_lib/src/util/quest.rs:130:9
+    |
+130 |     use super::*;
+    |         ^^^^^^^^
+    |
+    = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling zstd v0.13.3
+   Compiling actix-http v3.12.0
+   Compiling actix-web v4.13.0
+warning: `blades_lib` (lib test) generated 1 warning (run `cargo fix --lib -p blades_lib --tests` to apply 1 suggestion)
+   Compiling actix-files v0.6.10
+   Compiling actix-ws v0.4.0
+   Compiling diesel-async v0.7.4
+   Compiling server v0.1.0 (/private/tmp/nb-combat-fixes/server)
+warning: unused import: `super::*`
+    --> server/src/arena/combat/state.rs:2457:9
+     |
+2457 |     use super::*;
+     |         ^^^^^^^^
+     |
+     = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `slice_for` is never used
+    --> server/src/abyss.rs:1969:8
+     |
+1969 |     fn slice_for(dungeon: &str, difficulty: u32, floor: u32) -> AbyssSliceEntry {
+     |        ^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `b64` is never used
+   --> server/src/character.rs:113:4
+    |
+113 | fn b64(input: &[u8]) -> String {
+    |    ^^^
+
+warning: `server` (bin "server" test) generated 3 warnings (run `cargo fix --bin "server" -p server --tests` to apply 1 suggestion)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 42.81s

@@ -71,13 +71,32 @@ impl Weight {
     /// Per-step combo multiplier and ceiling for the GEOMETRIC fallback in
     /// [`combo_factor`] (weights WITHOUT a capture-pinned per-depth table).
     ///
-    /// **Versatile / Heavy steps + caps are GUESSES** (those weights aren't in the
-    /// recorded match). **Light** does NOT use this — it uses [`LIGHT_COMBO_RAMP`].
+    /// The old comment here said Versatile and Heavy were "GUESS (no capture)".
+    /// **That was false.** The retail corpus does contain both: versatile appears in
+    /// 46 sessions and heavy in 21 (s615/s616 alone carry all three classes —
+    /// Flappety light, Taheen versatile, Huracan heavy). Nobody had looked.
+    ///
+    /// Measured medians relative to each fighter's own combo-0 damage, over distinct
+    /// unblocked Left/Right hits:
+    ///
+    /// | class     | n    | depth 0/1/2/3/4               |
+    /// |-----------|------|-------------------------------|
+    /// | Versatile | 1003 | 1.00 / 1.42 / 1.21 / 0.80 / 0.45 |
+    /// | Heavy     |  247 | 1.00 / 1.36 / 1.35 / 1.24 / 1.29 |
+    ///
+    /// Both PEAK around depth 1-2 at ~1.3-1.4× and never exceed ~1.4×; retail's
+    /// maximum damage does not rise with depth at all. The old geometric ceilings
+    /// (2.441 versatile, 1.979 heavy) were ~1.7-2.0× and ~1.5× too steep.
+    ///
+    /// The per-step ratio is kept — the climb to the peak is about right — and only
+    /// the CEILING is corrected, deliberately: the measured tails are non-monotonic
+    /// and pool different bases, tempering and defender armor, so the peak is what
+    /// the data robustly supports and the tail shape is not.
     pub fn combo_step_cap(self) -> (f32, f32) {
         match self {
-            Weight::Light => (1.45, 4.12), // capture-calibrated (s506); table-driven
-            Weight::Versatile => (1.250, 1.250_f32.powi(4)), // GUESS (no capture)
-            Weight::Heavy => (1.186, 1.186_f32.powi(4)),     // GUESS (no capture)
+            Weight::Light => (1.45, LIGHT_COMBO_CAP), // table-driven; see LIGHT_COMBO_RAMP
+            Weight::Versatile => (1.250, 1.40),       // capture-measured ceiling (1003 hits)
+            Weight::Heavy => (1.186, 1.40),           // capture-measured ceiling (247 hits)
         }
     }
 }
@@ -137,6 +156,27 @@ pub fn fallback_swing_interval(weight: Weight) -> std::time::Duration {
 /// rather than a geometric series.
 pub const LIGHT_COMBO_RAMP: [f32; 5] = [1.00, 1.45, 1.50, 2.65, 4.12];
 /// The recorded Light combo ceiling (×4.12, seq 452).
+///
+/// **LEFT AT 4.12 DELIBERATELY, and it is disputed.** A 2026-09-16 measurement of
+/// the retail corpus (281 distinct light attacks over 15 sessions) puts the light
+/// ramp at 1.00 / 1.88 / 2.23 / 1.97 / 1.29 — peaking at depth 2 and falling, never
+/// near 4.12. The same analysis found that the s506 series this table came from is
+/// damage Flappety *received*, dealt by an opponent wielding Serpentstrike, a
+/// **VERSATILE** weapon — so the "light" ramp may be calibrated off the wrong class
+/// entirely. Its indices (0/1/3/4) also disagree with the wire comboCount for those
+/// same values (0/1/1/2).
+///
+/// It is NOT changed here because the two pieces of evidence genuinely conflict and
+/// the s506 series is reproduced EXACTLY by this table
+/// (`s506_combo_ramp_reproduces_recorded_slashing`: 113.82 / 165.07 / 301.79 /
+/// 469.30). Lowering the cap breaks that reproduction, and a corpus median cannot
+/// simply overrule a directly reproduced chain — the disagreement means one of the
+/// two is mislabelled, and which one is not yet established.
+///
+/// Note that removing the combo×charge compounding (see `swing_components`) already
+/// cuts a full-charge deep light chain by 24.5% (×5.459 → ×4.12) WITHOUT touching
+/// this number. Resolving the provenance question is its own task; see
+/// docs/UNFIXED-ERRORS.md.
 pub const LIGHT_COMBO_CAP: f32 = 4.12;
 
 /// The combo multiplier for a normal swing at chain depth `count` (0 = fresh).
@@ -170,9 +210,35 @@ pub const QUALITY_BONUS: [f32; 11] =
 
 /// The damage a `tempering_level` adds to a weapon of this `weight`:
 /// `QUALITY_BONUS[level] × weight.damage_factor()`. Levels past the table clamp.
+///
+/// Prefer [`tempering_bonus_in_hand`] — this entry point is grip-blind and so
+/// over-credits a one-handed VERSATILE weapon. Kept for the Light/Heavy callers and
+/// the fallback profile, where grip makes no difference.
 pub fn tempering_bonus(weight: Weight, tempering_level: u64) -> f32 {
     let idx = (tempering_level as usize).min(QUALITY_BONUS.len() - 1);
     QUALITY_BONUS[idx] * weight.damage_factor()
+}
+
+/// `tempering_bonus`, with the VERSATILE grip correction.
+///
+/// `damage_factor()` is documented as the **two-handed** grip figure, and the
+/// shipped templates confirm it: across `WeaponTemplateList`,
+/// `baseTwoHandedDamage / baseDamage` is exactly **1.15 on 129 of 130 versatile
+/// weapons**, and exactly **1.00 on all 111 light and all 126 heavy** ones. So
+/// versatile is the only class whose base depends on grip, and its one-handed
+/// tempering factor is `0.92 / 1.15 = 0.80`, not 0.92.
+///
+/// Charging the two-handed factor to a one-handed versatile build over-credited
+/// `75 × (0.92 − 0.80) = 9.0` base damage at tempering 10 — on most characters,
+/// since 77 of 94 carry a shield.
+pub fn tempering_bonus_in_hand(weight: Weight, tempering_level: u64, two_handed: bool) -> f32 {
+    let idx = (tempering_level as usize).min(QUALITY_BONUS.len() - 1);
+    let factor = match (weight, two_handed) {
+        // 0.92 / 1.15 — the exact ratio the templates ship.
+        (Weight::Versatile, false) => 0.80,
+        _ => weight.damage_factor(),
+    };
+    QUALITY_BONUS[idx] * factor
 }
 
 // ---------------------------------------------------------------------------
