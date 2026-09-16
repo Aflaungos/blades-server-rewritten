@@ -269,7 +269,7 @@ mod creation_route_tests {
         let src = include_str!("character.rs");
         assert!(
             src.contains(
-                "#[post(\"/blades.bgs.services/api/game/v1/public/characters\")]\nasync fn create_characters",
+                "#[post(\"/api/game/v1/public/characters\")]\nasync fn create_characters",
             ),
             "character creation must be registered at the path the retail client calls"
         );

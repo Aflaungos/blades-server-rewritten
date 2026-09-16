@@ -423,7 +423,7 @@ pub async fn import_character(
 /// deployment window in which the web control can be shipped and the existing
 /// opponent can be checked. Once managed, an empty table intentionally means
 /// "no opted-in mimics"; it must not silently expose arbitrary player saves.
-#[post("/blades.bgs.services/api/dev/v1/ai-mimic")]
+#[post("/api/dev/v1/ai-mimic")]
 pub async fn set_ai_mimic(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -525,7 +525,7 @@ pub async fn set_ai_mimic(
 /// selection before the first checkbox write. This is intentionally token-gated:
 /// it exposes character/account associations that are useful to the capture
 /// platform but are not part of the public game API.
-#[get("/blades.bgs.services/api/dev/v1/ai-mimics")]
+#[get("/api/dev/v1/ai-mimics")]
 pub async fn list_ai_mimics(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -604,7 +604,7 @@ fn current_character_summary(
 /// used by social cards. The capture-platform profile needs to distinguish the
 /// active arena character from archived captured alts; it does not need the
 /// character's wallet, inventory, town, or save data.
-#[get("/blades.bgs.services/api/dev/v1/current-character")]
+#[get("/api/dev/v1/current-character")]
 pub async fn get_current_character(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -1879,7 +1879,7 @@ pub struct GrantSeasonAwardsResponse {
 /// * `granted_at IS NULL` is rechecked in the update;
 /// * unknown rows remain pending and are reported by key;
 /// * an explicit caller override wins over the retail default.
-#[post("/blades.bgs.services/api/dev/v1/arena-seasons/{season_id}/grant-awards")]
+#[post("/api/dev/v1/arena-seasons/{season_id}/grant-awards")]
 pub async fn grant_arena_season_awards(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,

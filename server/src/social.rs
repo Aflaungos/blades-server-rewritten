@@ -319,7 +319,7 @@ pub async fn get_social_characters(
 ///                    "name":"Valhalla"}}}
 /// ```
 #[get(
-    "/blades.bgs.services/api/game/v1/public/social/users/{user_id}/characters/{character_id}/towns/current"
+    "/api/game/v1/public/social/users/{user_id}/characters/{character_id}/towns/current"
 )]
 pub async fn get_social_town(
     session: SessionLookedUpMaybe,
@@ -353,7 +353,7 @@ pub async fn get_social_town(
 /// town projections. Retail answered 200 in all three committed examples; a
 /// missing route leaves the profile loading until the client gives up.
 #[get(
-    "/blades.bgs.services/api/game/v1/public/characters/{requester_character_id}/social/users/{user_id}/characters/{character_id}/loadouts/current"
+    "/api/game/v1/public/characters/{requester_character_id}/social/users/{user_id}/characters/{character_id}/loadouts/current"
 )]
 pub async fn get_social_loadout(
     session: SessionLookedUpMaybe,

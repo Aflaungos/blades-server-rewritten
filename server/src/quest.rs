@@ -389,7 +389,7 @@ pub async fn get_quests(
                     id: character_id_var,
                     character: character.character.0,
                 },
-                jobs,
+                jobs: Vec::new(),
                 game_event_quests,
                 game_event_quests_finished: Vec::new(),
                 game_event_quests_in_warning,
