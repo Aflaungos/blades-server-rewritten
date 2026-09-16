@@ -45088,6 +45088,28 @@ pub const ENCHANT_MAGNITUDES: [EnchantMagnitude; 94] = [
 
 /// The shipped magnitude for a family at a tier, or `None` where the client ships
 /// no table (then the caller must not invent one).
+/// The shipped magnitude for `family_uuid` at `tier`, on the curve for a weapon of
+/// `weight`.
+///
+/// Weapon families ship three curves — the base `tiers` is LIGHT, with `balanced` and
+/// `heavy` beside it. Weapon Ravage Stamina/Magicka at tier 10 is 31.66 / 42.0 / 52.66
+/// across the three, so reading the light table for a mace under-reports by a third.
+/// Families that ship only one curve return it for every weight.
+pub fn enchant_magnitude_for_weight(
+    family_uuid: &str,
+    tier: u8,
+    weight: crate::arena::combat::tables::Weight,
+) -> Option<f32> {
+    use crate::arena::combat::tables::Weight;
+    let e = ENCHANT_MAGNITUDES.iter().find(|e| e.family_uuid == family_uuid)?;
+    let table = match weight {
+        Weight::Light => e.tiers,
+        Weight::Versatile => e.balanced.unwrap_or(e.tiers),
+        Weight::Heavy => e.heavy.unwrap_or(e.tiers),
+    };
+    table.get((tier as usize).min(10)).copied()
+}
+
 pub fn enchant_magnitude(family_uuid: &str, tier: u8) -> Option<f32> {
     let e = ENCHANT_MAGNITUDES.iter().find(|e| e.family_uuid == family_uuid)?;
     e.tiers.get((tier as usize).min(10)).copied()

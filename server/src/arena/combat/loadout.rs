@@ -332,6 +332,35 @@ fn apply_enchant(lo: &mut Loadout, id: &Uuid, tier: u8) {
         // contribute 2 × 110.64 before the arena multiplier.
         "FortifyHealthPropertyLogic" => lo.max_health_bonus += magnitude,
 
+        // ---- Ravage: a cut to the target's MAXIMUM pool ---------------------
+        // "Reduces target's maximum Stamina by {0}." Per landed swing, and it does
+        // not cross a round. The magnitude is read on the WEAPON'S OWN WEIGHT CURVE
+        // (31.66 light / 42.0 versatile / 52.66 heavy at tier 10) — reading the base
+        // table for a mace would under-report by a third.
+        //
+        // This is one of the game's decisive enchants and was previously unwired:
+        // 30 characters in the capture corpus carry Ravage Stamina and 24 Ravage
+        // Magicka. Enough of it takes Reckless Fury (425 stamina) out of reach and
+        // voids Maximum Power, which needs a FULL magicka pool.
+        // The WEAPON families ride a landed swing and ravage the victim.
+        "WeaponRavageStaminaPropertyLogic" => push_ravage(lo, DamageType::Stamina, &uuid, tier),
+        "WeaponRavageMagickaPropertyLogic" => push_ravage(lo, DamageType::Magicka, &uuid, tier),
+        "WeaponRavageHealthPropertyLogic" => push_ravage(lo, DamageType::Health, &uuid, tier),
+
+        // The SHIELD families fire on the opposite event — "on a blocked attack or
+        // Shield Bash" — so they ravage whoever swung INTO the guard. Same magnitude
+        // shape, opposite direction; kept in their own list so the resolver cannot
+        // apply one as if it were the other.
+        "ShieldRavageStaminaPropertyLogic" => {
+            push_shield_ravage(lo, DamageType::Stamina, magnitude)
+        }
+        "ShieldRavageMagickaPropertyLogic" => {
+            push_shield_ravage(lo, DamageType::Magicka, magnitude)
+        }
+        "ShieldRavageHealthPropertyLogic" => {
+            push_shield_ravage(lo, DamageType::Health, magnitude)
+        }
+
         // ---- elemental retaliation (Revenge) -------------------------------
         // Only these FOUR ship values. All nine `SpellRevenge*` /
         // `BlockSpellRevenge*` / Templar variants are zero at every tier in the
@@ -453,6 +482,25 @@ fn curve_fraction(family: &'static gamedata::EnchantFamily, tier: u8) -> f32 {
         return 0.0;
     }
     (family.value(tier).unwrap_or(0.0) / max).clamp(0.0, 1.0)
+}
+
+/// Record one Ravage family on the loadout, at the magnitude for this weapon's weight.
+fn push_ravage(lo: &mut Loadout, ty: DamageType, uuid: &str, tier: u8) {
+    let weight = lo.weapon.weight.unwrap_or(tables::Weight::Light);
+    let Some(magnitude) = gamedata::enchant_magnitude_for_weight(uuid, tier, weight) else {
+        return;
+    };
+    if magnitude > 0.0 {
+        lo.ravage.push((ty, magnitude));
+    }
+}
+
+/// A shield family carries one curve (no weapon weight), so the shared `magnitude`
+/// the dispatch already resolved is the right value.
+fn push_shield_ravage(lo: &mut Loadout, ty: DamageType, magnitude: f32) {
+    if magnitude > 0.0 {
+        lo.shield_ravage.push((ty, magnitude));
+    }
 }
 
 fn push_enchant(lo: &mut Loadout, ty: DamageType, tier: u8) {
@@ -1139,6 +1187,36 @@ mod tests {
         apply_enchant(&mut p, &Uuid::parse_str(ELEM_PIERCE).unwrap(), 10);
         assert!(p.elem_resist_piercing_rating > 0.0);
         assert_eq!(p.elem_resist_piercing, 0.0, "the fractional field is ability-side only");
+    }
+
+    #[test]
+    /// Thunderfell is the reported weapon: a Shock Mace carrying BOTH ravage
+    /// suffixes at tier 10. It is versatile (`weaponClass` 2), so each reads 42.0 —
+    /// the owner's number — not the 31.66 on the light table.
+    #[test]
+    fn thunderfells_two_ravage_suffixes_read_the_versatile_curve() {
+        for (uuid, ty) in [
+            ("9be2e7e9-5ef5-4ee8-aeec-b864bca07f07", DamageType::Stamina),
+            ("7cdb7179-4cd4-466e-8b77-4caf2fddb268", DamageType::Magicka),
+        ] {
+            let m = gamedata::enchant_magnitude_for_weight(uuid, 10, tables::Weight::Versatile)
+                .expect("Thunderfell's suffix ships a versatile curve");
+            assert!((m - 42.0).abs() < 1e-3, "{ty:?} ravage t10 versatile = 42.0, got {m}");
+        }
+    }
+
+    /// The weight scaling itself: light is smaller, heavy larger. A single curve read
+    /// for every weapon would silently mis-price two thirds of the weapons.
+    #[test]
+    fn ravage_scales_with_weapon_weight() {
+        let u = "9be2e7e9-5ef5-4ee8-aeec-b864bca07f07";
+        let light = gamedata::enchant_magnitude_for_weight(u, 10, tables::Weight::Light).unwrap();
+        let vers = gamedata::enchant_magnitude_for_weight(u, 10, tables::Weight::Versatile).unwrap();
+        let heavy = gamedata::enchant_magnitude_for_weight(u, 10, tables::Weight::Heavy).unwrap();
+        assert!((light - 31.66).abs() < 1e-2, "light t10 = 31.66, got {light}");
+        assert!((vers - 42.0).abs() < 1e-2, "versatile t10 = 42.0, got {vers}");
+        assert!((heavy - 52.66).abs() < 1e-2, "heavy t10 = 52.66, got {heavy}");
+        assert!(light < vers && vers < heavy, "light < versatile < heavy");
     }
 
     #[test]

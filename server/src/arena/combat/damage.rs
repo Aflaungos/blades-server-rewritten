@@ -57,6 +57,10 @@ pub struct ResolvedDamage {
     pub negated: bool,
     /// HP the negation healed back to the DEFENDER (Absorb only).
     pub heal: f32,
+    /// This hit's PHYSICAL block factor (1.0 unblocked, 0.0 on a connected optimal
+    /// block, in between when late). Carried so the caller can scale effects that
+    /// ride the swing rather than a damage component — Ravage is the one that does.
+    pub block_physical: f32,
 }
 
 /// Damage flags (`ReceiveDamage` propId 7 bitfield).
@@ -910,6 +914,9 @@ fn finish_resolved(
     //    continuous damage (`continuousDamageBlockingEffectiveness == 1`).
     let block = block_outcome(target, attacker, active_side, now);
     hit_flags |= block.flag;
+    // Kept for effects that ride the SWING rather than a component (Ravage). Read on
+    // the physical track, which is what a weapon swing is.
+    let block_physical = block.factor_for(DamageType::Slashing);
     for (ty, v) in components.iter_mut() {
         *v *= block.factor_for(*ty);
     }
@@ -968,6 +975,7 @@ fn finish_resolved(
         most_resisted,
         negated: false,
         heal: 0.0,
+        block_physical,
     }
 }
 
