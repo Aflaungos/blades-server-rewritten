@@ -1064,15 +1064,15 @@ impl MatchInstance {
                         // Mirror the s506 +3s op79 "StateTimeout" flow heartbeat that
                         // rides between PostRound and BackendMatchEnd (only once, at the
                         // first terminal step).
+                        // Mirror the s506 +3s op79 "StateTimeout" flow heartbeat that
+                        // rides between PostRound and BackendMatchEnd. Capture-proven
+                        // to belong to THIS step and no other: across 88 match-end
+                        // walks, entering BackendMatchEnd(17) is paired with an op79
+                        // 88/88 times, and entering Victory(15), PostMatch(16) and
+                        // Disconnecting(19) is paired 0/88. Retail's terminal walk is
+                        // deliberately unpaired after 17.
                         if self.combat.matchend_step == 0 {
                             self.broadcast_flow(&mut out, FlowState::StateTimeout);
-                            // …then the per-recipient op49 MatchEndMatchMsg (the victory
-                            // CARD): one PER PLAYER, right after the heartbeat, as
-                            // BackendMatchEnd is about to be emitted — matching s506's
-                            // op49 at 05:07:06 (just after the 05:07:04 StateTimeout). The
-                            // `matchend_step == 0` guard sends it exactly ONCE, only on the
-                            // FINAL round (this branch runs only when the match was won).
-                            self.broadcast_match_end_results(&mut out);
                         }
                         info!(
                             "combat FSM: post-match MatchState → {:?}({}) [matchend step {}/{}]",
@@ -1082,6 +1082,29 @@ impl MatchInstance {
                             MATCH_STATE_MATCHEND_PROGRESSION.len(),
                         );
                         self.broadcast_match_state(&mut out, state, timeout);
+                        // THE VICTORY CARD BELONGS TO THE VICTORY SCREEN.
+                        //
+                        // op49 used to go out at step 0, before BackendMatchEnd(17) was
+                        // even broadcast — so it reached the client while the Match
+                        // object still said PostRound(14), two states before the screen
+                        // that renders it.
+                        //
+                        // Retail sends it while Victory(15) is CURRENT: of 99 captured
+                        // op49 frames across 11 sessions, 95 (96%) arrive with the Match
+                        // state at 15 and the other 4 at Disconnecting(19). Not one is
+                        // sent at 14 or 17.
+                        //
+                        // It has to follow `broadcast_match_state` rather than precede
+                        // it, because "while Victory is current" is the whole point: the
+                        // op55 that enters Victory must be on the wire first.
+                        //
+                        // Reported as a match-end freeze with no winner name on the
+                        // victory screen (report #163) — the card carries the winner and
+                        // loser ids and the ResultsJSON the screen draws from, so a card
+                        // delivered before that screen exists leaves it with nothing.
+                        if matches!(state, MatchState::Victory) {
+                            self.broadcast_match_end_results(&mut out);
+                        }
                         self.combat.matchend_step += 1;
                         self.combat.phase_entered = now;
                     }
@@ -1412,8 +1435,9 @@ impl MatchInstance {
     /// ONE PER PLAYER at match-end (`docs/arena-match-end-spec.md` §5 step 3). Each
     /// player gets their OWN ResultsJSON (their character snapshot + reward + wallet);
     /// the winner/loser identity for the card comes from the op49 HEADER (p5/p6), not the
-    /// JSON. ENet auto-fragments the ~4 KB frame on ch4. Sent exactly once (the
-    /// `matchend_step == 0` guard at the call site), only on the FINAL round.
+    /// JSON. ENet auto-fragments the ~4 KB frame on ch4. Sent exactly once, as the
+    /// walk enters `Victory`(15) and right after that state is broadcast, which is
+    /// where retail puts it (95 of 99 captured cards; none at 14 or 17).
     ///
     /// **Phase 5 — the economy is real now.** The magnitudes used to be hard-coded
     /// placeholders (`4047` gold win / `302` loss, a flat `30` trophies) and, worse,
@@ -3618,6 +3642,123 @@ pub(in crate::arena::combat) mod tests {
     /// BackendMatchEnd(17) → PostMatch(16) → DisconnectingPlayers(19) on the s506
     /// final-round timers, then finishes — so the client shows a clean result and
     /// returns to the lobby instead of timing out at InRound. [MATCH_STATE_MATCHEND_PROGRESSION]
+    /// THE VICTORY CARD MUST ARRIVE WHILE THE VICTORY SCREEN IS UP.
+    ///
+    /// op49 `MatchEndMatchMsg` used to go out at matchend step 0, before
+    /// `BackendMatchEnd`(17) was broadcast — reaching the client while the Match
+    /// object still said `PostRound`(14), two states before the screen that draws
+    /// it. Retail sends it while `Victory`(15) is CURRENT: of 99 captured op49
+    /// frames across 11 sessions, 95 arrive with the Match state at 15 and the
+    /// remaining 4 at `Disconnecting`(19). None at 14, none at 17.
+    ///
+    /// Report #163: the victory screen freezes with no winner name on it. The card
+    /// carries the winner/loser ids and the ResultsJSON that screen renders.
+    #[test]
+    fn the_victory_card_is_sent_while_victory_is_the_current_state() {
+        use crate::arena::combat::state::MatchState;
+        let (mut m, t0) = live_inst(2);
+        let leave = t0 + Duration::from_secs(3);
+        m.concede_by_departure(1, leave);
+        assert_eq!(m.phase(), FlowState::RoundEnd, "the terminal walk has begun");
+
+        // Walk the terminal progression, recording for every tick the Match states
+        // broadcast in it and whether the op49 card rode along.
+        let mut card_seen_at: Option<MatchState> = None;
+        let mut cards = 0usize;
+        let step = Duration::from_millis(250);
+        for i in 1..=200u32 {
+            let out = m.on_tick(2, leave + step * i);
+            let mut state_this_tick: Option<MatchState> = None;
+            for (_, b) in &out {
+                if b.len() > 2 && b[1] == 0x35 {
+                    let nd = arena_proto::parse_netdata(&b[2..]);
+                    if nd.int(1) == Some(54) {
+                        state_this_tick = match nd.int(5) {
+                            Some(15) => Some(MatchState::Victory),
+                            Some(16) => Some(MatchState::PostMatch),
+                            Some(17) => Some(MatchState::BackendMatchEnd),
+                            Some(19) => Some(MatchState::DisconnectingPlayersAfterMatch),
+                            _ => None,
+                        };
+                    }
+                }
+            }
+            for (_, b) in &out {
+                if b.len() > 2
+                    && b[1] == 0x36
+                    && arena_proto::parse_netdata(&b[2..]).int(3) == Some(49)
+                {
+                    cards += 1;
+                    if card_seen_at.is_none() {
+                        card_seen_at = state_this_tick;
+                    }
+                }
+            }
+            if m.is_finished() {
+                break;
+            }
+        }
+
+        assert!(cards > 0, "the match-end card must be sent at all");
+        assert_eq!(
+            card_seen_at,
+            Some(MatchState::Victory),
+            "retail sends op49 while Victory(15) is current (95 of 99 captured cards), \
+             not at PostRound(14) or BackendMatchEnd(17)"
+        );
+    }
+
+    /// THE CONTROL for the test above. Ordering within the tick matters as much as
+    /// the tick: "while Victory is current" means the op55 that ENTERS Victory has
+    /// to be on the wire before the card. Emitting the card first would still land
+    /// it in the right tick and pass a state-only assertion, while leaving the
+    /// client exactly as badly off as before.
+    #[test]
+    fn the_victory_state_precedes_the_card_within_the_tick() {
+        let (mut m, t0) = live_inst(2);
+        let leave = t0 + Duration::from_secs(3);
+        m.concede_by_departure(1, leave);
+
+        let step = Duration::from_millis(250);
+        for i in 1..=200u32 {
+            let out = m.on_tick(2, leave + step * i);
+            // Per recipient, the position of the Victory op55 and of the op49 card.
+            let mut victory_at: Option<usize> = None;
+            let mut card_at: Option<usize> = None;
+            for (k, (_, b)) in out.iter().enumerate() {
+                if b.len() > 2 && b[1] == 0x35 {
+                    let nd = arena_proto::parse_netdata(&b[2..]);
+                    if nd.int(1) == Some(54) && nd.int(5) == Some(15) && victory_at.is_none() {
+                        victory_at = Some(k);
+                    }
+                }
+                if b.len() > 2
+                    && b[1] == 0x36
+                    && arena_proto::parse_netdata(&b[2..]).int(3) == Some(49)
+                    && card_at.is_none()
+                {
+                    card_at = Some(k);
+                }
+            }
+            if let (Some(v), Some(c)) = (victory_at, card_at) {
+                assert!(
+                    v < c,
+                    "the op55 entering Victory must precede the op49 card in the same batch \
+                     (victory at {v}, card at {c})"
+                );
+                return;
+            }
+            assert!(
+                card_at.is_none(),
+                "the card was sent in a tick that did not enter Victory"
+            );
+            if m.is_finished() {
+                break;
+            }
+        }
+        panic!("the walk never emitted both the Victory state and the card");
+    }
+
     /// WIN BY CONCESSION on a mid-match departure: if a peer leaves while the round
     /// is live, `concede_by_departure` awards the survivor the match and drives the
     /// SAME terminal victory walk a normal 2-0 does — so the survivor gets a result
