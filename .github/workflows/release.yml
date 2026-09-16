@@ -61,6 +61,19 @@ permissions:
   contents: read
   packages: write
 
+# Serialised so two builds cannot race to publish `:main`. The runs are NOT
+# cancelled on top of each other (`cancel-in-progress: false`), but GitHub still
+# keeps only the most recently QUEUED run per group and cancels the rest — and
+# "most recently queued" is not "newest commit". On 2026-09-16, five PRs merged
+# within 30 seconds: three release runs were cancelled and the survivor was the
+# run for an OLDER commit, so two merged fixes were never built. They reached
+# production only because an unrelated push happened to rebuild main minutes
+# later.
+#
+# The cull is fine; building the event's own commit was not. Both jobs below
+# check out `main` rather than the triggering SHA, so whichever run survives
+# publishes whatever main is at that moment. A dropped run then costs nothing:
+# the survivor already contains its commits.
 concurrency:
   group: arena-release
   cancel-in-progress: false
@@ -76,7 +89,10 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
+      # `ref: main`, not the event SHA — see the concurrency note above.
       - uses: actions/checkout@v4
+        with:
+          ref: main
       - run: sudo apt-get update && sudo apt-get install -y pkg-config
       - uses: actions/cache@v4
         with:
@@ -95,7 +111,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
+      # `ref: main`, not the event SHA — see the concurrency note above. The
+      # image is tagged from the checked-out HEAD below, so the sha- tag and the
+      # revision label describe what was actually built.
       - uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: log in to ghcr
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
@@ -106,9 +127,15 @@ jobs:
       - name: build
         run: |
           set -euo pipefail
+          # Both derived from the CHECKED-OUT commit. $GITHUB_SHA is the event's
+          # commit, which is not necessarily what we just checked out, and a
+          # revision label that lies is worse than none: verifying a deploy on the
+          # box reads exactly this label.
+          BUILT_SHA="$(git rev-parse HEAD)"
           SHA_TAG="sha-$(git rev-parse --short HEAD)"
           echo "SHA_TAG=$SHA_TAG" >> "$GITHUB_ENV"
-          docker build --build-arg VCS_REF="$GITHUB_SHA" -t "$IMAGE:$SHA_TAG" -t "$IMAGE:main" .
+          echo "building $BUILT_SHA (event was $GITHUB_SHA)"
+          docker build --build-arg VCS_REF="$BUILT_SHA" -t "$IMAGE:$SHA_TAG" -t "$IMAGE:main" .
 
       - name: push
         run: |
