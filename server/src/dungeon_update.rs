@@ -67,7 +67,15 @@ struct CombatDurabilityUpdate {
 /// depending on which client-side property-bag path produced the combat update.
 /// Accept both wire forms; [`apply_combat_durability`] still rejects non-finite,
 /// negative, invented, and repairing values before touching inventory state.
-fn deserialize_f64_number_or_string<'de, D>(deserializer: D) -> Result<f64, D::Error>
+///
+/// How lopsided the wire is: across the captured corpus, `/dungeons/current/update`
+/// carries 16,290 string durabilities against 310 numeric ones, and
+/// `/abysses/current/update` carries 838 strings and not one number.
+///
+/// `pub(crate)` because the Abyss needs exactly this and had its own `f64`, which
+/// 400d every post-fight update there — the whole body, not just the field. That
+/// is report #156. One wire quirk, one reader.
+pub(crate) fn deserialize_f64_number_or_string<'de, D>(deserializer: D) -> Result<f64, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
