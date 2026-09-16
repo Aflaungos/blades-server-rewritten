@@ -610,6 +610,12 @@ pub fn on_c2s_input(
     if messages::is_player_blocking_state_change(user_data) {
         if sender < combat.fighters.len() {
             let side = messages::blocking_active_side(user_data).unwrap_or(ActiveSide::Middle);
+            // Reckless Fury cannot block — the trade its description makes for the
+            // damage and the immunity. Drop the request rather than raising a guard.
+            if combat.fighters[sender].has_reckless_fury(now) {
+                debug!("combat: slot {sender} cannot block during Reckless Fury");
+                return Vec::new();
+            }
             let f = &mut combat.fighters[sender];
             // Record block-raise instant for OPTIMAL→LATE timeout logic.
             // If the fighter re-raises within the recovery window (`last_block_dropped_at`
@@ -975,7 +981,15 @@ fn land_due_hits(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8>)
         if combat.fighters[h.target].is_dead() || combat.fighters[h.sender].is_dead() {
             continue;
         }
-        let attacker_loadout = combat.fighters[h.sender].loadout.clone();
+        let mut attacker_loadout = combat.fighters[h.sender].loadout.clone();
+        // Reckless Fury adds its weapon-class bonus to every swing for its window
+        // (`_bonusDamages`: Light 11.24 / Versatile 14.17 / Heavy 17.86 at rank 1).
+        // Ride the maneuver channel — same "flat additive on the physical base"
+        // treatment, on a clone so it expires with the buff rather than sticking.
+        if combat.fighters[h.sender].has_reckless_fury(now) {
+            attacker_loadout.maneuver_bonus_damage +=
+                combat.fighters[h.sender].reckless_fury_bonus;
+        }
         let resolved = RetailDamageModel.resolve_attack(
             &attacker_loadout,
             &combat.fighters[h.target],
@@ -1382,6 +1396,123 @@ pub(super) fn resolve_ability_cast(
 /// Swings already work this way: [`resolve_swing`] queues a `PendingHit` and
 /// [`land_due_hits`] delivers it after `FOLLOW_THROUGH_DELAY`. This is the same
 /// pattern for casts.
+
+/// Apply a **Reckless Fury** cast to `caster_slot`: start the 5 s window, pick the
+/// weapon-class bonus, and announce `StatusEffectType::RecklessFury (11)`.
+///
+/// Fury had NO persistent implementation. It is tagged `Maneuver`, so it fell into
+/// the generic maneuver arm and was resolved as one ordinary Middle weapon hit —
+/// which is both a phantom attack it should never make (`parameters.bonusDamage` is
+/// 0 with both grip multipliers 0: it swings nothing) and a complete absence of the
+/// five behaviours it exists for. Production match fffe01ca has the AI casting Fury
+/// at 18:38:48 and being stunned at 18:38:50, two seconds inside a window that is
+/// supposed to make stunning impossible.
+///
+/// `RecklessFuryAbility` serializes only `_bonusDamages` and `_duration`, so the
+/// damage numbers are read from the asset and the four boolean behaviours (no stun,
+/// no death, no block, no skills) are modelled as state for the window. They are NOT
+/// invented magnitudes — they have none to invent.
+fn apply_reckless_fury(
+    combat: &mut MatchCombat,
+    caster_slot: usize,
+    rank: u8,
+    now: Instant,
+) -> Vec<(usize, Vec<u8>)> {
+    use super::state::StatusEffectType;
+    let mut out = Vec::new();
+    if caster_slot >= combat.fighters.len() {
+        return out;
+    }
+    let Some(r) = super::gamedata::ability_rank_clamped(uuid_reckless_fury(), u16::from(rank.max(1)))
+    else {
+        return out;
+    };
+    let secs = r.get(super::gamedata::AbilityField::Duration).unwrap_or(5.0);
+    // Pick the bonus for the wielder's weapon class, falling back to the class-0
+    // "None" entry the asset ships for exactly this purpose.
+    let class_raw = combat.fighters[caster_slot]
+        .loadout
+        .weapon_template
+        .map(|w| w.weapon_class as u8)
+        .unwrap_or(0);
+    let bonus = r
+        .bonus_damages
+        .iter()
+        .find(|(c, _)| *c == class_raw)
+        .or_else(|| r.bonus_damages.iter().find(|(c, _)| *c == 0))
+        .map(|(_, v)| *v)
+        .unwrap_or(0.0);
+
+    let f = &mut combat.fighters[caster_slot];
+    f.reckless_fury_until = Some(now + Duration::from_secs_f32(secs));
+    f.reckless_fury_bonus = bonus;
+    // Fury cannot block: drop any guard already up, and `can_block` keeps it down.
+    f.blocking_until = None;
+    f.block_raised_at = None;
+    let obj = f.net_object_id;
+    info!(
+        "combat: slot {caster_slot} RECKLESS FURY r{rank} for {secs:.2}s \
+         (+{bonus:.2} dmg, weapon class {class_raw}, no stun / no death / no block)"
+    );
+    let frame =
+        messages::change_combat_status_effect(obj, true, StatusEffectType::RecklessFury, secs);
+    for v in 0..combat.fighters.len() {
+        out.push((v, frame.clone()));
+    }
+    out
+}
+
+/// Reckless Fury's uuid, resolved from the shipped table rather than hardcoded.
+fn uuid_reckless_fury() -> &'static str {
+    super::gamedata::ABILITIES
+        .iter()
+        .find(|a| a.editor_name == "RecklessFury")
+        .map(|a| a.uuid)
+        .unwrap_or("")
+}
+
+/// The flat bonus damage a MANEUVER rank contributes to its swing, grip applied.
+///
+/// Every maneuver rank ships `parameters.bonusDamage` together with
+/// `oneHandedMultiplier` / `twoHandedMultiplier`, and until now **nothing read
+/// them** — the generated tables carried the numbers and the resolver never looked.
+/// That is why all 17 maneuvers resolved to the same plain Middle weapon hit:
+/// Guardbreaker's 131.15 and Quick Strikes' 13.78 produced identical damage.
+///
+/// The three authored families:
+///
+/// | family        | 1H  | 2H  | members                                             |
+/// |---------------|-----|-----|-----------------------------------------------------|
+/// | power-attack  | 0.5 | 1.0 | Power Attack, Guardbreaker, Skullcrusher, Ind. Smash |
+/// | quick-strikes | 1.0 | 0.0 | Quick / Piercing / Recovery / Venom Strikes          |
+/// | symmetric     | 1.0 | 1.0 | all Bash and Dodge variants                          |
+///
+/// so a power-attack family member is authored at its TWO-handed figure and halved
+/// one-handed, while a quick-strikes member gets **no** bonus two-handed at all.
+/// Reckless Fury ships 0/0 — it is a buff that swings nothing.
+///
+/// Grip follows the same rule as the weapon's own base damage:
+/// `two_handed = !has_shield` (`loadout::base_damage_in_hand`).
+///
+/// CALIBRATION NOTE: the recorded s506 Middle-maneuver values (201.37 / 274.51 /
+/// 186.98) sit inside the band of a PLAIN swing (150.81..271.46 across the
+/// swing-factor range), and `swing_factor` is not observable in the capture, so that
+/// recording can neither confirm nor refute the magnitude of this bonus. What it
+/// cannot excuse is every maneuver dealing identical damage. The mechanism and the
+/// authored numbers are what is shipped here; the magnitude wants a capture with a
+/// known maneuver and a known charge state.
+fn maneuver_bonus_damage(rank: &super::gamedata::AbilityRank, two_handed: bool) -> f32 {
+    let Some(params) = rank.parameters else {
+        return 0.0;
+    };
+    let mult = if two_handed {
+        params.two_handed_multiplier
+    } else {
+        params.one_handed_multiplier
+    };
+    (params.bonus_damage * mult).max(0.0)
+}
+
 fn apply_ability_impact(
     combat: &mut MatchCombat,
     sender: usize,
@@ -1421,6 +1552,13 @@ fn apply_ability_impact(
         // 2026-08-03: QuickStrikes (150 stamina) and PiercingStrikes (180 stamina) ship
         // NO damage field at any rank, so `unwrap_or(0.0)` made both cost a third of
         // the stamina bar and do literally nothing. 87 of 160 casts that day dealt 0.0.
+        // Reckless Fury is tagged Maneuver but is a pure SELF-BUFF: its
+        // `parameters.bonusDamage` is 0 with both grip multipliers 0, so it swings
+        // nothing. Resolving it as a weapon hit gave the caster a free phantom
+        // attack on every cast.
+        AbilityTag::Maneuver if ability_uuid == uuid_reckless_fury() => {
+            out.extend(apply_reckless_fury(combat, sender, level, now));
+        }
         AbilityTag::Maneuver => {
             let mut attacker_loadout = combat.fighters[sender].loadout.clone();
             // §5 PIERCING. Both of these ratings are ALREADY consumed by the damage
@@ -1449,6 +1587,21 @@ fn apply_ability_impact(
                 if let Some(ebp) = r.elemental_block_piercing() {
                     attacker_loadout.elem_block_piercing_rating += ebp;
                 }
+                // §6 THE MANEUVER'S OWN BONUS DAMAGE. Every maneuver rank ships
+                // `parameters.bonusDamage` with a one-/two-handed multiplier, and
+                // nothing read them — which is why all 17 maneuvers resolved to an
+                // identical plain weapon hit regardless of which one was cast.
+                //
+                // Grip follows the same rule as the weapon's own base damage:
+                // `two_handed = !has_shield` (see `loadout::base_damage_in_hand`).
+                //
+                // The three authored families (see ability-spec):
+                //   power-attack  1H 0.5 / 2H 1.0 — the bonus is the TWO-handed figure
+                //   quick-strikes 1H 1.0 / 2H 0.0 — two-handed gets no bonus at all
+                //   bashes/dodges 1.0 / 1.0
+                // Reckless Fury ships 0/0 because it is a buff that swings nothing.
+                attacker_loadout.maneuver_bonus_damage +=
+                    maneuver_bonus_damage(&r, !attacker_loadout.has_shield);
             }
             // Middle is not part of a Left/Right chain, so it resets the combo — the
             // same rule `resolve_swing_with_side` applies to a Middle swing.
@@ -2154,7 +2307,9 @@ fn emit_damage(
 
     let hp_before = combat.fighters[target_slot].health;
     let max_hp = combat.fighters[target_slot].max_health;
-    combat.fighters[target_slot].take_damage(total.round().max(0.0) as u32);
+    // `take_damage_at`, not `take_damage`: Reckless Fury floors the victim at 1 HP
+    // for its window ("cannot be killed").
+    combat.fighters[target_slot].take_damage_at(total.round().max(0.0) as u32, now);
     // The mirrored Stamina/Magicka tracks come off their pools BEFORE `packed_stats()`
     // is read for the frame, so the bars the client draws match the numbers the same
     // frame reports. [Fighter::drain_mirrored_pools]
@@ -2240,7 +2395,7 @@ fn apply_revenge(
     attacker_slot: usize,
     triggering_source: super::state::DamageSource,
     triggering_components: &[(super::state::DamageType, f32)],
-    _now: Instant,
+    now: Instant,
 ) -> Vec<(usize, Vec<u8>)> {
     let mut out = Vec::new();
     if defender_slot == attacker_slot {
@@ -2279,12 +2434,12 @@ fn apply_revenge(
             let a = &combat.fighters[attacker_slot];
             // No elemental piercing: that is a property of an ATTACK, and Revenge is
             // gear firing on its own, not a swing the wearer aimed.
-            (raw - a.total_resistance_against(ty, 0.0, _now)).max(0.0)
+            (raw - a.total_resistance_against(ty, 0.0, now)).max(0.0)
         };
         if resisted <= 0.0 {
             continue;
         }
-        combat.fighters[attacker_slot].take_damage(resisted.round().max(0.0) as u32);
+        combat.fighters[attacker_slot].take_damage_at(resisted.round().max(0.0) as u32, now);
         let msg = {
             let hit = &combat.fighters[attacker_slot];
             let other = &combat.fighters[defender_slot];
@@ -2804,7 +2959,7 @@ fn apply_dot_ticks(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8
             for _ in 0..due {
                 let hp_before = combat.fighters[slot].health;
                 let max_hp = combat.fighters[slot].max_health;
-                combat.fighters[slot].take_damage(tick_dmg.round().max(0.0) as u32);
+                combat.fighters[slot].take_damage_at(tick_dmg.round().max(0.0) as u32, now);
                 let hp_after = combat.fighters[slot].health;
                 let pct = if max_hp > 0 { 100.0 * tick_dmg / max_hp as f32 } else { 0.0 };
                 info!(
@@ -6509,6 +6664,128 @@ mod shipped_effects_tests {
             .find(|a| a.editor_name == editor)
             .map(|a| a.uuid)
             .unwrap_or_else(|| panic!("{editor} missing from the shipped table"))
+    }
+
+    /// THE SYSTEMIC MANEUVER BUG: all 17 maneuvers dealt identical damage because
+    /// `parameters.bonusDamage` and the grip multipliers were generated into the
+    /// tables and read by nobody. Guardbreaker (131.15) and Quick Strikes (13.78)
+    /// cannot be the same hit.
+    ///
+    /// Differential across maneuvers, so it cannot pass on a hardcoded constant.
+    #[test]
+    fn maneuvers_carry_their_own_authored_bonus_damage() {
+        let r = |editor: &str| {
+            super::super::gamedata::ability_rank_clamped(uuid_of(editor), 1)
+                .unwrap_or_else(|| panic!("{editor} rank 1"))
+        };
+        // One-handed (a shield is equipped).
+        let gb = maneuver_bonus_damage(&r("Guardbreaker"), false);
+        let qs = maneuver_bonus_damage(&r("QuickStrikes"), false);
+        assert!(gb > 0.0, "Guardbreaker must contribute a bonus, got {gb}");
+        assert!(qs > 0.0, "QuickStrikes must contribute a bonus, got {qs}");
+        assert!(
+            gb > qs * 2.0,
+            "Guardbreaker ({gb:.2}) must hit far harder than QuickStrikes ({qs:.2})"
+        );
+    }
+
+    /// The power-attack family is authored at its TWO-handed figure and halved in one
+    /// hand; the quick-strikes family is the other way round and gets NOTHING in two
+    /// hands. A single shared multiplier would fail one of these two assertions.
+    #[test]
+    fn grip_multipliers_follow_the_authored_family() {
+        let r = |editor: &str| {
+            super::super::gamedata::ability_rank_clamped(uuid_of(editor), 1)
+                .unwrap_or_else(|| panic!("{editor} rank 1"))
+        };
+        let pa_1h = maneuver_bonus_damage(&r("PowerAttack"), false);
+        let pa_2h = maneuver_bonus_damage(&r("PowerAttack"), true);
+        assert!(
+            pa_2h > pa_1h && (pa_1h * 2.0 - pa_2h).abs() < 0.01,
+            "PowerAttack one-handed ({pa_1h:.2}) must be half of two-handed ({pa_2h:.2})"
+        );
+
+        let qs_1h = maneuver_bonus_damage(&r("QuickStrikes"), false);
+        let qs_2h = maneuver_bonus_damage(&r("QuickStrikes"), true);
+        assert!(qs_1h > 0.0, "QuickStrikes one-handed must get its bonus");
+        assert_eq!(qs_2h, 0.0, "…and two-handed must get none (2H multiplier is 0)");
+    }
+
+    /// Reckless Fury is a BUFF: it ships bonusDamage 0 with both multipliers 0, so it
+    /// must contribute no swing damage at all. The server used to resolve it as an
+    /// ordinary Middle weapon hit.
+    #[test]
+    fn reckless_fury_contributes_no_swing_damage() {
+        let r = super::super::gamedata::ability_rank_clamped(uuid_of("RecklessFury"), 1)
+            .expect("RecklessFury rank 1");
+        assert_eq!(maneuver_bonus_damage(&r, false), 0.0);
+        assert_eq!(maneuver_bonus_damage(&r, true), 0.0);
+    }
+
+    /// THE PRODUCTION BUG (match fffe01ca-9b20-4cb8-bd8c-a7ce1cfeaf29): the AI cast
+    /// Reckless Fury at 18:38:48 and was stunned at 18:38:50 — two seconds into a
+    /// five-second window that is supposed to make stunning impossible. Fury had no
+    /// persistent state at all, so nothing was there to prevent it.
+    #[test]
+    fn reckless_fury_cannot_be_stunned_for_its_window() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        apply_reckless_fury(&mut c, 0, 1, now);
+        assert!(c.fighters[0].has_reckless_fury(now), "precondition: Fury is up");
+
+        // The exact production timing: the stun arrives 2s in.
+        let at_stun = now + Duration::from_secs(2);
+        c.fighters[0].apply_stagger_for(at_stun, 2.5);
+        assert!(
+            !c.fighters[0].is_staggered(at_stun),
+            "a fighter in Reckless Fury must not be stunnable"
+        );
+
+        // …and is stunnable again once the 5s window has lapsed, so the guard is a
+        // window and not a permanent immunity.
+        let after = now + Duration::from_secs_f32(5.5);
+        assert!(!c.fighters[0].has_reckless_fury(after), "the window has closed");
+        c.fighters[0].apply_stagger_for(after, 2.5);
+        assert!(c.fighters[0].is_staggered(after), "and normal stuns resume");
+    }
+
+    /// "…cannot be killed." Floors at 1 HP for the window, and dies normally after.
+    #[test]
+    fn reckless_fury_prevents_death_for_its_window() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        apply_reckless_fury(&mut c, 0, 1, now);
+        c.fighters[0].take_damage_at(u32::MAX, now);
+        assert!(!c.fighters[0].is_dead(), "Fury must survive a lethal hit");
+        assert_eq!(c.fighters[0].health, 1, "…at exactly 1 HP");
+
+        let after = now + Duration::from_secs_f32(5.5);
+        c.fighters[0].take_damage_at(u32::MAX, after);
+        assert!(c.fighters[0].is_dead(), "and dies normally once Fury lapses");
+    }
+
+    /// Fury is a self-buff: casting it must NOT produce a weapon hit. The generic
+    /// maneuver arm gave the caster a free phantom attack on every cast.
+    #[test]
+    fn casting_reckless_fury_emits_no_damage_to_the_target() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        let before = c.fighters[1].health;
+        apply_reckless_fury(&mut c, 0, 1, now);
+        assert_eq!(c.fighters[1].health, before, "the opponent must take no damage");
+    }
+
+    /// The window carries the rank's authored `_duration` and a weapon-class bonus
+    /// picked from `bonusDamages`, not a hardcoded number.
+    #[test]
+    fn reckless_fury_uses_its_authored_duration_and_bonus() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        apply_reckless_fury(&mut c, 0, 1, now);
+        assert!(c.fighters[0].reckless_fury_bonus > 0.0, "a class bonus was chosen");
+        // 5.0s authored: up just before, down just after.
+        assert!(c.fighters[0].has_reckless_fury(now + Duration::from_secs_f32(4.9)));
+        assert!(!c.fighters[0].has_reckless_fury(now + Duration::from_secs_f32(5.1)));
     }
 
     #[test]

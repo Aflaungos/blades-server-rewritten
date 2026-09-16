@@ -824,6 +824,20 @@ pub struct Loadout {
     /// Armor Rating before the physical reduction. [Phase 3.3]
     pub armor_piercing_rating: f32,
 
+    /// Flat bonus damage contributed by the MANEUVER being resolved, already scaled
+    /// by the grip multiplier. Zero for an ordinary swing.
+    ///
+    /// Every maneuver rank ships `parameters.bonusDamage` plus
+    /// `oneHandedMultiplier` / `twoHandedMultiplier`, and NOTHING read them — the
+    /// generated tables carried the numbers and the resolver never looked. That is
+    /// why every maneuver resolved to a plain Middle weapon hit: Power Attack's
+    /// 75.33, Skullcrusher's 100.09, Guardbreaker's 131.15 were all silently 0.
+    ///
+    /// Set on a CLONE of the attacker's loadout for the duration of one cast (the
+    /// same trick the piercing ratings already use), so a maneuver cannot leak its
+    /// bonus into the next auto-attack.
+    pub maneuver_bonus_damage: f32,
+
     /// Resolved perk bonuses, computed once at parse time. `Default` (every
     /// field zero) for a fighter with no perks, which every application site
     /// treats as a no-op.
@@ -1227,6 +1241,22 @@ pub struct Fighter {
     /// like `Paralyzed`, and the actor-state is `Staggered`. [Phase 3.13]
     pub staggered_until: Option<Instant>,
 
+    /// **Reckless Fury** is active until this instant. `RecklessFuryAbility`
+    /// serializes only `_bonusDamages` and `_duration` (5.0 s at every rank), so the
+    /// four headline behaviours its description promises — cannot be stunned, cannot
+    /// die, cannot block, cannot use skills — are boolean state tied to
+    /// `StatusEffectType::RecklessFury (11)` for that window, not numbers to read.
+    ///
+    /// Before this existed the ability had NO persistent implementation at all: it
+    /// was resolved as one ordinary Middle weapon hit. That is the whole of the
+    /// production report in match fffe01ca — the AI cast Fury and was stunned 2 s
+    /// later, inside the window that is supposed to make it un-stunnable.
+    pub reckless_fury_until: Option<Instant>,
+    /// Flat bonus damage Fury adds to each swing while active, chosen by the
+    /// wielder's WEAPON CLASS from the rank's `bonusDamages` table
+    /// (Light 11.24 / Balanced 14.17 / Heavy 17.86 at rank 1).
+    pub reckless_fury_bonus: f32,
+
     /// Statuses we have told the clients are ACTIVE on this fighter, as of the
     /// last tick.
     ///
@@ -1392,6 +1422,8 @@ impl Fighter {
         Fighter {
             slot,
             net_object_id,
+            reckless_fury_until: None,
+            reckless_fury_bonus: 0.0,
             player_net_object_id: 0, // assigned by MatchInstance::new
             ability_net_object_id: 0, // assigned by MatchInstance::new
             health: max_health,
@@ -1620,6 +1652,11 @@ impl Fighter {
     /// real duration. If a real Stun id turns up in the dump, this is the one place to
     /// change.
     pub fn apply_stagger_for(&mut self, now: Instant, secs: f32) {
+        // Reckless Fury cannot be stunned. This is the guard whose absence let the
+        // production stun in match fffe01ca land 2 s into a 5 s Fury.
+        if self.has_reckless_fury(now) {
+            return;
+        }
         self.staggered_until =
             Some(now + std::time::Duration::from_secs_f32(secs.max(0.05)));
         self.set_actor_state(ActorStateType::Staggered, now);
@@ -1805,10 +1842,35 @@ impl Fighter {
         self.health == 0
     }
 
+    /// Is Reckless Fury active right now?
+    pub fn has_reckless_fury(&self, now: Instant) -> bool {
+        self.reckless_fury_until.is_some_and(|t| now < t)
+    }
+
     /// Apply `amount` raw damage to health, clamped at 0, and bump the stats seq.
+    ///
+    /// While Reckless Fury is up the fighter CANNOT DIE: health floors at 1 instead
+    /// of 0. Use [`Fighter::take_damage_at`] to get that protection — this entry
+    /// point has no clock and so cannot check the window.
     pub fn take_damage(&mut self, amount: u32) {
         self.health = self.health.saturating_sub(amount);
         self.stats_seq = self.stats_seq.wrapping_add(1);
+    }
+
+    /// `take_damage` with Reckless Fury's death prevention applied.
+    ///
+    /// Fury's description promises the wielder cannot be killed for its duration; the
+    /// ability had no persistent state at all, so this never held. Floors at 1 HP
+    /// rather than 0 — the fighter survives the window and dies normally afterwards
+    /// if the damage keeps coming.
+    pub fn take_damage_at(&mut self, amount: u32, now: Instant) {
+        if self.has_reckless_fury(now) {
+            let floor = 1;
+            self.health = self.health.saturating_sub(amount).max(floor.min(self.health));
+            self.stats_seq = self.stats_seq.wrapping_add(1);
+            return;
+        }
+        self.take_damage(amount);
     }
 
     /// Apply the **non-health** damage components of a hit to their pools:

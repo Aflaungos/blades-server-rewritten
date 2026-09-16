@@ -368,6 +368,15 @@ impl RetailDamageModel {
             0.0
         };
 
+        // The maneuver's own `parameters.bonusDamage × grip multiplier`. Treated like
+        // `weapon_bonus`: it rides on the weapon's damage, so it is added before armour
+        // and mitigated with it. One bonus per swing, first physical component only.
+        //
+        // Maneuvers land on Middle, which resets the combo, so unlike PDOC this is not
+        // multiplied by a combo ramp — it is worth its face value, which is what the
+        // authored numbers (Power Attack 75.33, Skullcrusher 100.09) read as.
+        let mut maneuver_bonus = attacker.maneuver_bonus_damage.max(0.0);
+
         attacker
             .weapon
             .base_by_type
@@ -381,6 +390,10 @@ impl RetailDamageModel {
                 if is_physical(*ty) && pdoc > 0.0 {
                     base += pdoc;
                     pdoc = 0.0;
+                }
+                if is_physical(*ty) && maneuver_bonus > 0.0 {
+                    base += maneuver_bonus;
+                    maneuver_bonus = 0.0;
                 }
                 let cut = if is_physical(*ty) {
                     tables::armor_reduction(base, armor_rating)
