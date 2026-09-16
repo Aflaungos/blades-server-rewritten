@@ -249,11 +249,30 @@ impl CostError {
 /// the per-style extra `styleInputs`; a style not present in the table contributes
 /// no extra materials (the building's stored style is often the plain default that
 /// carries no style inputs — charge base only rather than fail).
+/// Whether this operation CHOOSES the style, and so pays for its materials.
+///
+/// True when placing a building (you pick the style as you build it) and
+/// when changing one. FALSE on a level upgrade: a building already wearing a
+/// style does not buy it again, and retail agrees — across 168 captured
+/// upgrades, **168 consume a build material and NOT ONE consumes a
+/// style-only material**. Style changes are their own action in the corpus
+/// (128 captured `…/styles/<id>` posts), which is where that cost lives.
+///
+/// Charging it per level is what blocked report #160: a level-6 Workshop
+/// upgrade wanted 111 of a trim material the upgrade screen never lists,
+/// while all three materials it DOES list were covered several times over.
+/// The player sees "insufficient materials" and everything they can see is
+/// fine.
+///
+/// The style's GOLD, `requireTownLevel` and `prestigeForLevel` are NOT
+/// affected: prestige in particular is a town-capacity number whose removal
+/// is documented below to drop a town under its own level threshold.
 fn lookup_level_cost(
     building_upgrades: &Value,
     type_id: Uuid,
     target_level: u64,
     style_id: Option<Uuid>,
+    charge_style_materials: bool,
 ) -> Result<LevelCost, CostError> {
     let building = building_upgrades
         .get("buildings")
@@ -322,8 +341,9 @@ fn lookup_level_cost(
                 prestige = prestige.saturating_add(style_prestige);
             }
 
-            // Add style materials (skip special fields)
-            if let Some(row) = style_data.as_object() {
+            // Add style materials (skip special fields) — only when this
+            // operation is the one that chooses the style. See the parameter doc.
+            if let Some(row) = style_data.as_object().filter(|_| charge_style_materials) {
                 for (k, v) in row {
                     // Skip special fields that we already processed
                     if k == "goldCost" || k == "requireTownLevel" || k == "prestigeForLevel" {
@@ -534,11 +554,13 @@ pub async fn upgrade_building(
             let (type_id, style_id, cur_level) = read_building_facts(&town, building_id)
                 .ok_or_else(|| BladeApiError::new(StatusCode::NOT_FOUND, TOWN_SERVICE_ID, 1))?;
             let target_level = cur_level + 1;
+            // An upgrade does not re-buy the style it is already wearing.
             let cost = lookup_level_cost(
                 &globals.building_upgrades,
                 type_id,
                 target_level,
                 style_id,
+                false,
             )
             .map_err(|e| e.to_api())?;
 
@@ -816,11 +838,13 @@ pub async fn place_building(
             let mut town = take_town(&mut entry, &globals)?;
 
             // Placement is the level-0 build (initial construction on an empty lot).
+            // Placement PICKS the style, so it pays for it.
             let cost = lookup_level_cost(
                 &globals.building_upgrades,
                 req.building_type,
                 0,
                 Some(req.style_id),
+                true,
             )
             .map_err(|e| e.to_api())?;
 
@@ -2329,6 +2353,7 @@ mod tests {
             Uuid::parse_str(FORGE).unwrap(),
             1,
             Some(Uuid::parse_str(STYLE).unwrap()),
+            true,
         )
         .unwrap();
         assert_eq!(cost.gold, 1140);
@@ -2385,6 +2410,7 @@ mod tests {
             Uuid::parse_str(FORGE).unwrap(),
             9,
             Some(Uuid::parse_str(STYLE).unwrap()),
+            true,
         )
         .unwrap();
 
@@ -2396,7 +2422,7 @@ mod tests {
     #[test]
     fn a_level_with_no_style_chosen_charges_neither_surcharge() {
         let cost =
-            lookup_level_cost(&styled_upgrades(), Uuid::parse_str(FORGE).unwrap(), 9, None).unwrap();
+            lookup_level_cost(&styled_upgrades(), Uuid::parse_str(FORGE).unwrap(), 9, None, true).unwrap();
         assert_eq!(cost.gold, 412_190);
         assert_eq!(cost.prestige, 300);
     }
@@ -2465,6 +2491,94 @@ mod tests {
         assert_eq!(town, before, "a failed lookup must not modify the town");
     }
 
+    /// THE regression (report #160). An UPGRADE must not re-buy the style the
+    /// building already wears.
+    ///
+    /// Measured, with the control: across 168 captured retail upgrades, **168
+    /// consume a build material and NOT ONE consumes a style-only material**.
+    /// So the probe could see materials and simply never saw a style one. Style
+    /// changes are their own action in the corpus (128 captured `…/styles/<id>`
+    /// posts), which is where that cost belongs.
+    ///
+    /// The visible failure: a level-6 Workshop upgrade demanded 111 of a trim
+    /// material the upgrade screen never lists, while all three materials it DOES
+    /// list were covered many times over. The player reads "insufficient
+    /// materials" and everything they can see is fine.
+    #[test]
+    fn an_upgrade_does_not_charge_the_style_materials_again() {
+        let up = sample_upgrades();
+        let styled = lookup_level_cost(
+            &up,
+            Uuid::parse_str(FORGE).unwrap(),
+            1,
+            Some(Uuid::parse_str(STYLE).unwrap()),
+            false,
+        )
+        .unwrap();
+        let bare = lookup_level_cost(&up, Uuid::parse_str(FORGE).unwrap(), 1, None, false).unwrap();
+        assert_eq!(
+            styled.materials, bare.materials,
+            "an upgrade's materials must not depend on the style worn"
+        );
+        assert!(
+            !styled.materials.iter().any(|(id, _)| *id == Uuid::parse_str(BRONZE).unwrap()),
+            "the style-only material must not be charged on an upgrade"
+        );
+    }
+
+    /// The control, and the reason this is a gate rather than a deletion:
+    /// PLACING a building is the operation that chooses the style, so it still
+    /// pays for it. Removing the surcharge outright would have made every
+    /// building free of its trim.
+    #[test]
+    fn placing_a_building_still_pays_for_its_style() {
+        let up = sample_upgrades();
+        let placed = lookup_level_cost(
+            &up,
+            Uuid::parse_str(FORGE).unwrap(),
+            1,
+            Some(Uuid::parse_str(STYLE).unwrap()),
+            true,
+        )
+        .unwrap();
+        assert!(
+            placed.materials.iter().any(|(id, _)| *id == Uuid::parse_str(BRONZE).unwrap()),
+            "choosing a style must still charge its materials"
+        );
+    }
+
+    /// The style's GOLD, town-level gate and PRESTIGE are deliberately untouched
+    /// by the gate — only its materials are. Prestige in particular is a town
+    /// capacity number, and dropping it is documented to push a town under its
+    /// own level threshold.
+    #[test]
+    fn the_gate_changes_materials_only_not_gold_or_prestige() {
+        let up = sample_upgrades();
+        let on = lookup_level_cost(
+            &up,
+            Uuid::parse_str(FORGE).unwrap(),
+            1,
+            Some(Uuid::parse_str(STYLE).unwrap()),
+            true,
+        )
+        .unwrap();
+        let off = lookup_level_cost(
+            &up,
+            Uuid::parse_str(FORGE).unwrap(),
+            1,
+            Some(Uuid::parse_str(STYLE).unwrap()),
+            false,
+        )
+        .unwrap();
+        assert_eq!(on.gold, off.gold, "style gold is unchanged by the gate");
+        assert_eq!(on.prestige, off.prestige, "style prestige is unchanged by the gate");
+        assert_eq!(
+            on.require_town_level, off.require_town_level,
+            "the town-level gate is unchanged"
+        );
+        assert_ne!(on.materials, off.materials, "…but the materials do differ");
+    }
+
     #[test]
     fn cost_lookup_without_matching_style_charges_base_only() {
         let up = sample_upgrades();
@@ -2474,6 +2588,7 @@ mod tests {
             Uuid::parse_str(FORGE).unwrap(),
             1,
             Some(Uuid::new_v4()),
+            true,
         )
         .unwrap();
         assert_eq!(cost.materials.len(), 1); // only base lumber
@@ -2482,14 +2597,14 @@ mod tests {
     #[test]
     fn cost_lookup_rejects_beyond_max_level() {
         let up = sample_upgrades();
-        let err = lookup_level_cost(&up, Uuid::parse_str(FORGE).unwrap(), 10, None).unwrap_err();
+        let err = lookup_level_cost(&up, Uuid::parse_str(FORGE).unwrap(), 10, None, true).unwrap_err();
         assert_eq!(err, CostError::AtMaxLevel);
     }
 
     #[test]
     fn cost_lookup_unknown_building() {
         let up = sample_upgrades();
-        let err = lookup_level_cost(&up, Uuid::new_v4(), 1, None).unwrap_err();
+        let err = lookup_level_cost(&up, Uuid::new_v4(), 1, None, true).unwrap_err();
         assert_eq!(err, CostError::UnknownBuilding);
     }
 
