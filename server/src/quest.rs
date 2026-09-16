@@ -107,6 +107,18 @@ pub struct GetQuestsResponse {
 /// `quests[]` or `gameEventQuests[]` has a matching entry in `generatedData[]`,
 /// keyed by the same id.** Retail holds it for event quests too — in every captured
 /// response the event instance's id was also in `dungeonGeneratedDataList`.
+/// Is this row an ordinary quest the player has already completed?
+///
+/// "Ordinary" excludes the two row kinds that have their own lifecycle: town jobs
+/// (rotated on the daily reset) and event quests (retired when their window
+/// closes). What is left is the quest log proper, and a completed entry there is
+/// stale — retail serves `completed: false` on every quest it lists.
+fn is_finished_ordinary_quest(info: &blades_lib::user_data::Quest) -> bool {
+    info.completed
+        && !jobs_gen::is_job_row(info)
+        && !matches!(info.r#type, blades_lib::user_data::QuestType::GameEvent)
+}
+
 fn split_quest_rows(
     rows: impl Iterator<
         Item = (
@@ -352,6 +364,49 @@ pub async fn get_quests(
                 }
             }
 
+            // Retire ordinary quests the player has already finished.
+            //
+            // `/complete` sets `info.completed = true` and leaves the row in place, so
+            // the quest kept coming back in `quests[]` as a live entry. Retail never
+            // does that: across 719 captured `/quests` bodies, all 563 quest entries
+            // carry `completed` and **every one of them is false** — a completed quest
+            // leaves the list, which is what `deletedQuestIds` (177 of those 719
+            // bodies, 1033 ids) is for.
+            //
+            // The visible failure is report #157. The client kept offering "Rescuing
+            // the Townsfolk" after it was done, and re-accepting it handed back the
+            // stored row with every objective already `Completed`, so the run could
+            // never be finished and the main-quest chain never moved on. 8 of the 11
+            // stuck rows in prod were that one quest, on 8 different characters.
+            //
+            // Jobs and events are pruned above on their own schedules; this is the
+            // third case and deliberately has no `dungeon_state.is_null()` guard —
+            // that guard protects a run still in progress, and a completed quest has
+            // none. The completion count lives on `character.completedQuests`, which
+            // is what gates the chain, so dropping the row loses nothing.
+            {
+                use crate::schema::quests;
+                let finished: Vec<Uuid> = quests::table
+                    .filter(quests::character_id.eq(character_id_var))
+                    .select(QuestDbEntry::as_select())
+                    .load(&mut conn)
+                    .await?
+                    .into_iter()
+                    .filter(|q| is_finished_ordinary_quest(&q.info.0))
+                    .map(|q| q.id)
+                    .collect();
+                if !finished.is_empty() {
+                    diesel::delete(
+                        quests::table
+                            .filter(quests::character_id.eq(character_id_var))
+                            .filter(quests::id.eq_any(&finished)),
+                    )
+                    .execute(&mut conn)
+                    .await?;
+                    deleted_quest_ids.extend(finished.iter().copied());
+                }
+            }
+
             // we could have done an inner join to check the get the user id, but the user has already been checked previously.
             let quests = {
                 use crate::schema::quests::dsl::*;
@@ -564,6 +619,33 @@ async fn accept_quest(
         .transaction(move |mut conn| {
             async move {
                 use crate::schema::quests;
+
+                // A row left over from a PREVIOUS completion is not progress to
+                // protect — it is a finished quest with every objective already
+                // `Completed`. Leaving it for the `do_nothing` below to return hands
+                // the client a run it can never finish: that is report #157, "I can't
+                // finish that quest again". Drop it so the insert makes a fresh
+                // instance. `/quests` prunes these on the next board refresh too, but
+                // a client that re-accepts before then would still get the corpse.
+                let replayed = quests::table
+                    .filter(quests::id.eq(quest_id))
+                    .filter(quests::character_id.eq(character_id))
+                    .select(QuestDbEntry::as_select())
+                    .load(&mut conn)
+                    .await?
+                    .into_iter()
+                    .next()
+                    .is_some_and(|q| is_finished_ordinary_quest(&q.info.0));
+                if replayed {
+                    diesel::delete(
+                        quests::table
+                            .filter(quests::id.eq(quest_id))
+                            .filter(quests::character_id.eq(character_id)),
+                    )
+                    .execute(&mut conn)
+                    .await?;
+                }
+
                 let inserted = insert_into(quests::table)
                     .values(&to_insert)
                     .on_conflict((quests::id, quests::character_id))
@@ -581,7 +663,12 @@ async fn accept_quest(
                     .next()
                     .unwrap_or(to_insert);
 
-                let reward = if inserted == 1 {
+                // A replay re-inserts the row, so `inserted == 1` on its own no
+                // longer means "first acceptance". Paying here would let anyone farm
+                // the acceptance reward by finishing a quest and accepting it again,
+                // so a replay pays nothing. Whether retail re-pays a genuinely
+                // repeatable quest is unmeasured; not paying cannot be exploited.
+                let reward = if inserted == 1 && !replayed {
                     acceptance_reward(quest_id)
                 } else {
                     RewardGrant::default()
@@ -3515,6 +3602,89 @@ mod report92_job_completion_reward_tests {
         assert_eq!(
             serde_json::to_value(&job).unwrap()["jobReward"]["characterXp"],
             json!(7)
+        );
+    }
+}
+
+#[cfg(test)]
+mod finished_quest_tests {
+    use super::*;
+    use blades_lib::user_data::{Quest, QuestType};
+
+    /// A quest body built through serde from the exact key set production stores.
+    fn quest(gld: Uuid, r#type: &str, completed: bool) -> Quest {
+        serde_json::from_value(json!({
+            "version": 0,
+            "type": r#type,
+            "objectiveStatuses": {},
+            "difficultyLevel": 0,
+            "seed": 0,
+            "gldQuestId": gld,
+            "completed": completed,
+        }))
+        .expect("fixture quest must deserialize")
+    }
+
+    /// "Rescuing the Townsfolk" — 8 of the 11 rows stuck in prod were this one.
+    const MQ03: Uuid = Uuid::from_u128(0x5AD30483_8994_484E_B6DC_A5E9014CC4D5_u128);
+
+    /// The measurement this fix rests on.
+    ///
+    /// 719 captured retail `/quests` bodies carry a `quests` array holding 563 entries.
+    /// Every one of those entries has a `completed` key, and every one of them is
+    /// `false` — so retail never lists a quest the player has finished. Our
+    /// `/complete` left the row in place, and the client went on offering it.
+    #[test]
+    fn a_completed_ordinary_quest_is_stale() {
+        assert!(
+            is_finished_ordinary_quest(&quest(MQ03, "NORMAL", true)),
+            "a finished main quest must be retired from the quest log"
+        );
+    }
+
+    /// The control: the same predicate must NOT fire on the live entries, or it would
+    /// delete the player's whole quest log instead of just the finished rows.
+    #[test]
+    fn an_unfinished_ordinary_quest_is_kept() {
+        assert!(!is_finished_ordinary_quest(&quest(MQ03, "NORMAL", false)));
+    }
+
+    /// Jobs and events have their own lifecycles — rotated on the daily reset and
+    /// retired when the window closes — and both are pruned elsewhere in `/quests`.
+    /// Claiming them here would delete an event row mid-window.
+    #[test]
+    fn jobs_and_events_are_left_to_their_own_prunes() {
+        let job = quest(jobs_gen::JOB_SENTINEL_GLD, "NORMAL", true);
+        assert!(jobs_gen::is_job_row(&job), "fixture must actually be a job row");
+        assert!(!is_finished_ordinary_quest(&job));
+
+        let event = quest(MQ03, "GAME_EVENT", true);
+        assert!(matches!(event.r#type, QuestType::GameEvent));
+        assert!(!is_finished_ordinary_quest(&event));
+    }
+
+    /// `split_quest_rows` is what builds the wire `quests[]`. Even with the prune in
+    /// place, a completed row that somehow survives must never reach the client —
+    /// this is the assertion that pins the retail shape end to end.
+    #[test]
+    fn a_completed_row_never_reaches_the_wire() {
+        let generated: blades_lib::user_data::DungeonGeneratedData =
+            serde_json::from_value(json!({ "algorithmVersion": 0, "version": 0 }))
+                .expect("minimal generated data must deserialize");
+        let rows = vec![
+            (MQ03, quest(MQ03, "NORMAL", true), Some(generated.clone())),
+            (Uuid::from_u128(7), quest(Uuid::from_u128(7), "NORMAL", false), Some(generated)),
+        ];
+        let live: Vec<_> = rows
+            .into_iter()
+            .filter(|(_, info, _)| !is_finished_ordinary_quest(info))
+            .collect();
+        let (quests, _events, _generated) =
+            split_quest_rows(live.into_iter(), &std::collections::HashSet::new());
+        assert_eq!(quests.len(), 1, "only the unfinished quest is listed");
+        assert!(
+            quests.iter().all(|q| !q.quest.completed),
+            "retail serves completed:false on all 563 captured entries"
         );
     }
 }
