@@ -885,6 +885,14 @@ pub struct Loadout {
     /// followed a blocked 54.3 and again a blocked 23.8. It is the wearer's gear
     /// hitting back, not a block-punish.
     pub revenge: Vec<(DamageType, f32)>,
+    /// `Weapon`/`Shield` `Ravage{Stamina,Magicka,Health}` — the flat amount this hit
+    /// takes off the victim's **maximum** pool ("Reduces target's maximum Stamina by
+    /// {0}"), per landed swing. Distinct from the drain families, which take the
+    /// CURRENT pool: a drain regenerates back, a ravage does not.
+    ///
+    /// Weight-scaled: at tier 10 a light weapon ravages 31.66, a versatile 42.0 and a
+    /// heavy 52.66 — the three curves the shipped family carries.
+    pub ravage: Vec<(DamageType, f32)>,
     /// Display name + character UUID for the round-start op50 spawn. Empty for the
     /// starter loadout (no character row); set by `loadout::from_character` + the
     /// matchmaker's character load.
@@ -1116,6 +1124,15 @@ pub struct Fighter {
     pub loadout: Loadout,
     /// Ability instance UUID → time it comes off cooldown.
     pub cooldowns: HashMap<String, Instant>,
+    /// How much maximum Stamina / Magicka ravage has removed **this round**.
+    ///
+    /// Held separately from `max_stamina`/`max_magicka` so the round reset can hand
+    /// the ceiling straight back: ravage does not cross a round boundary. Nothing is
+    /// sent for it — the wire carries pools as fractions of max, so a reduced ceiling
+    /// is invisible to the bar by construction. See `charge_initial_cooldowns` for
+    /// the other per-round reset.
+    pub ravaged_stamina: u32,
+    pub ravaged_magicka: u32,
     pub effects: Vec<ActiveEffect>,
     /// The fighter's current animation/logic state.
     ///
@@ -1554,6 +1571,8 @@ impl Fighter {
             stats_seq: 0,
             loadout,
             cooldowns: HashMap::new(),
+            ravaged_stamina: 0,
+            ravaged_magicka: 0,
             effects: Vec::new(),
             // Construction, not a transition — nothing to tell a client that has no
             // avatar yet, so the field is set directly rather than via the mutator.
@@ -2028,6 +2047,57 @@ impl Fighter {
         self.magicka -= drained_m;
         self.stats_seq = self.stats_seq.wrapping_add(1);
         (drained_s, drained_m)
+    }
+
+    /// Take `attacker`'s Ravage off this fighter's MAXIMUM pools, scaled by `factor`.
+    ///
+    /// Returns `(stamina, magicka)` actually removed, for the log. Current pool is
+    /// clamped down with the ceiling: a fighter sitting on a full bar loses the
+    /// stamina, it does not sit above its own maximum.
+    ///
+    /// `factor` is the hit's PHYSICAL block factor — ravage rides the weapon swing, so
+    /// an optimal block (physical x0) negates it outright and a late block reduces it
+    /// in proportion. A dodged swing never reaches this function at all, because no
+    /// hit resolves. **This scaling is authored, not measured** — ravage is absent from
+    /// the capture corpus entirely (no op50 component, no status effect), so no capture
+    /// can settle it; see `docs/arena-ravage.md`.
+    pub fn apply_ravage(&mut self, ravage: &[(DamageType, f32)], factor: f32) -> (u32, u32) {
+        if ravage.is_empty() || factor <= 0.0 {
+            return (0, 0);
+        }
+        let (mut took_s, mut took_m) = (0_u32, 0_u32);
+        for (ty, amount) in ravage {
+            let cut = (amount * factor).round().max(0.0) as u32;
+            if cut == 0 {
+                continue;
+            }
+            match ty {
+                DamageType::Stamina => {
+                    // Never below zero, and never more than is left to take.
+                    let cut = cut.min(self.max_stamina);
+                    self.max_stamina -= cut;
+                    self.ravaged_stamina += cut;
+                    self.stamina = self.stamina.min(self.max_stamina);
+                    took_s += cut;
+                }
+                DamageType::Magicka => {
+                    let cut = cut.min(self.max_magicka);
+                    self.max_magicka -= cut;
+                    self.ravaged_magicka += cut;
+                    self.magicka = self.magicka.min(self.max_magicka);
+                    took_m += cut;
+                }
+                // RavageHealth ships in the data but is deliberately not applied:
+                // max-Health is the arena's x3-multiplied pool and a permanent cut to
+                // it inside a round would interact with the death check. Out of scope
+                // until it is asked for.
+                _ => {}
+            }
+        }
+        if took_s > 0 || took_m > 0 {
+            self.stats_seq = self.stats_seq.wrapping_add(1);
+        }
+        (took_s, took_m)
     }
 
     /// The packed-stats ULong for `ReceiveDamage` propId 4/5: each pool encoded as
@@ -2612,6 +2682,13 @@ impl MatchCombat {
 
     pub fn reset_fighters_for_next_round(&mut self, now: Instant) {
         for f in &mut self.fighters {
+            // Ravage does not cross a round boundary: give the ceiling back BEFORE
+            // refilling, or the fighter would refill to the ravaged maximum and carry
+            // the loss into a round it was never applied in.
+            f.max_stamina += f.ravaged_stamina;
+            f.max_magicka += f.ravaged_magicka;
+            f.ravaged_stamina = 0;
+            f.ravaged_magicka = 0;
             f.health = f.max_health;
             f.stamina = f.max_stamina;
             f.magicka = f.max_magicka;
@@ -2907,6 +2984,113 @@ mod tests {
         let b = Fighter::new(1, 565, Loadout::default(), now);
         assert_eq!(a.arena_target, 1);
         assert_eq!(b.arena_target, 0);
+    }
+
+    #[test]
+    /// Ravage takes the MAXIMUM down, not the current pool, and clamps current with it.
+    #[test]
+    fn ravage_lowers_the_ceiling_and_drags_a_full_pool_down_with_it() {
+        let mut f = Fighter::new(0, 564, Loadout::default(), Instant::now());
+        f.max_stamina = 660;
+        f.stamina = 660;
+        let (s, m) = f.apply_ravage(&[(DamageType::Stamina, 42.0)], 1.0);
+        assert_eq!((s, m), (42, 0));
+        assert_eq!(f.max_stamina, 618, "the ceiling came down");
+        assert_eq!(f.stamina, 618, "a full pool cannot sit above its own maximum");
+        assert_eq!(f.ravaged_stamina, 42, "and the round remembers what to give back");
+    }
+
+    /// Per swing, and it accumulates — which is the whole point of the mechanic.
+    ///
+    /// Reckless Fury costs 425 stamina at rank 1. A versatile tier-10 Ravage Stamina
+    /// takes 42 a swing, so six connected swings put a 660 ceiling under the cost and
+    /// the ability becomes uncastable for the rest of the round.
+    #[test]
+    fn six_versatile_swings_put_reckless_fury_out_of_reach() {
+        let mut f = Fighter::new(0, 564, Loadout::default(), Instant::now());
+        f.max_stamina = 660;
+        f.stamina = 660;
+        const RECKLESS_FURY_COST: u32 = 425;
+        assert!(f.max_stamina > RECKLESS_FURY_COST, "affordable before any ravage");
+        for _ in 0..6 {
+            f.apply_ravage(&[(DamageType::Stamina, 42.0)], 1.0);
+        }
+        assert_eq!(f.max_stamina, 660 - 6 * 42, "660 -> 408");
+        assert!(
+            f.max_stamina < RECKLESS_FURY_COST,
+            "six swings must take Reckless Fury off the table: {} < {RECKLESS_FURY_COST}",
+            f.max_stamina
+        );
+    }
+
+    /// Maximum Power needs a FULL magicka pool (`magicka >= max_magicka`). Ravage
+    /// clamps current down WITH the ceiling, so the perk survives a ravage on a full
+    /// pool — it is voided by ravage landing while the victim is mid-pool, which is
+    /// the ordinary case in a fight. This test pins which of the two it is.
+    #[test]
+    fn ravage_on_a_spent_magicka_pool_is_what_voids_maximum_power() {
+        let mut full = Fighter::new(0, 564, Loadout::default(), Instant::now());
+        full.max_magicka = 590;
+        full.magicka = 590;
+        full.apply_ravage(&[(DamageType::Magicka, 42.0)], 1.0);
+        assert_eq!(full.magicka, full.max_magicka, "clamped together: still 'full'");
+
+        let mut spent = Fighter::new(0, 564, Loadout::default(), Instant::now());
+        spent.max_magicka = 590;
+        spent.magicka = 500; // has cast something
+        spent.apply_ravage(&[(DamageType::Magicka, 42.0)], 1.0);
+        assert_eq!(spent.max_magicka, 548);
+        assert!(
+            spent.magicka < spent.max_magicka,
+            "500 < 548 — Maximum Power is void until the pool refills to the new ceiling"
+        );
+    }
+
+    /// Block scales it, because ravage rides the swing: an optimal block (physical
+    /// factor 0) negates it outright, a late block takes a proportional bite.
+    #[test]
+    fn block_scales_ravage_and_an_optimal_block_negates_it() {
+        let mut opt = Fighter::new(0, 564, Loadout::default(), Instant::now());
+        opt.max_stamina = 660;
+        opt.stamina = 660;
+        assert_eq!(opt.apply_ravage(&[(DamageType::Stamina, 42.0)], 0.0), (0, 0));
+        assert_eq!(opt.max_stamina, 660, "an optimal block loses no ceiling");
+
+        let mut late = Fighter::new(0, 564, Loadout::default(), Instant::now());
+        late.max_stamina = 660;
+        late.stamina = 660;
+        let (s, _) = late.apply_ravage(&[(DamageType::Stamina, 42.0)], 0.5);
+        assert_eq!(s, 21, "a half-reducing late block ravages half");
+        assert_eq!(late.max_stamina, 639);
+    }
+
+    /// It does not cross a round boundary — the owner's rule, and the reason the
+    /// removal is tracked separately from `max_stamina`.
+    #[test]
+    fn the_round_reset_hands_the_whole_ceiling_back() {
+        let now = Instant::now();
+        let mut c = MatchCombat::new(2, 1, now);
+        c.fighters.push(Fighter::new(0, 564, Loadout::default(), now));
+        c.fighters.push(Fighter::new(1, 565, Loadout::default(), now));
+        c.fighters[0].max_stamina = 660;
+        c.fighters[0].stamina = 660;
+        c.fighters[0].max_magicka = 590;
+        for _ in 0..4 {
+            c.fighters[0].apply_ravage(
+                &[(DamageType::Stamina, 42.0), (DamageType::Magicka, 42.0)],
+                1.0,
+            );
+        }
+        assert_eq!(c.fighters[0].max_stamina, 492, "ravaged during the round");
+        assert_eq!(c.fighters[0].max_magicka, 422);
+
+        c.reset_fighters_for_next_round(now);
+
+        assert_eq!(c.fighters[0].max_stamina, 660, "round 2 starts on the full ceiling");
+        assert_eq!(c.fighters[0].max_magicka, 590);
+        assert_eq!(c.fighters[0].stamina, 660, "and refills to it, not to the ravaged max");
+        assert_eq!(c.fighters[0].ravaged_stamina, 0);
+        assert_eq!(c.fighters[0].ravaged_magicka, 0);
     }
 
     #[test]

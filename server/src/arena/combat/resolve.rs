@@ -2717,6 +2717,14 @@ fn emit_damage(
     // is read for the frame, so the bars the client draws match the numbers the same
     // frame reports. [Fighter::drain_mirrored_pools]
     let (drained_stam, drained_mag) = combat.fighters[target_slot].drain_mirrored_pools(&components);
+    // RAVAGE — a cut to the victim's MAXIMUM pools, taken per landed swing and given
+    // back at the round boundary. Scaled by this hit's physical block factor, so an
+    // optimal block negates it and a late block reduces it; a dodged swing resolves no
+    // hit and never arrives here. Nothing goes on the wire for it: pools are sent as
+    // fractions of max, so the ceiling change is invisible to the bar — which is why
+    // the game shows no opponent stamina bar and players count it in their heads.
+    let ravage = combat.fighters[attacker_slot].loadout.ravage.clone();
+    let (rav_s, rav_m) = combat.fighters[target_slot].apply_ravage(&ravage, resolved.block_physical);
     let hp_after = combat.fighters[target_slot].health;
     // Per-hit damage-vs-maxHP ratio (info-level so the ghost-verify on the box shows the
     // before→after HP without RUST_LOG=debug). NOTE: the 25% one-shot clamp is GONE for
@@ -2724,12 +2732,14 @@ fn emit_damage(
     let pct = if max_hp > 0 { 100.0 * total / max_hp as f32 } else { 0.0 };
     let dealt = hp_before.saturating_sub(hp_after);
     info!(
-        "combat event: gsid={} attacker_slot={attacker_slot} attacker={} target_slot={target_slot} target={} source={:?} side={:?} components={components:?} total={total:.1} pct_max_hp={pct:.1} hp={hp_before}->{hp_after} dealt={dealt} drained_stam={drained_stam} drained_mag={drained_mag}",
+        "combat event: gsid={} attacker_slot={attacker_slot} attacker={} target_slot={target_slot} target={} source={:?} side={:?} components={components:?} total={total:.1} pct_max_hp={pct:.1} hp={hp_before}->{hp_after} dealt={dealt} drained_stam={drained_stam} drained_mag={drained_mag} ravaged_stam={rav_s} ravaged_mag={rav_m} max_stam_now={} max_mag_now={}",
         combat.game_session_id,
         combat.fighters[attacker_slot].loadout.display_name,
         combat.fighters[target_slot].loadout.display_name,
         resolved.source,
         resolved.active_side,
+        combat.fighters[target_slot].max_stamina,
+        combat.fighters[target_slot].max_magicka,
     );
 
     let msg = {
@@ -8956,6 +8966,7 @@ mod report_31_high_block_stun {
             most_resisted: super::super::state::DamageType::None,
             negated: false,
             heal: 0.0,
+            block_physical: 1.0,
         };
 
         let out = super::emit_damage(&mut c, 0, 1, &fire_hit, now);
