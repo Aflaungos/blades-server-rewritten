@@ -1870,6 +1870,23 @@ impl Fighter {
         if self.is_paralyzed() {
             v.push(StatusEffectType::Paralyzed);
         }
+        // A live dodge window IS a tracked status, so the diff below emits its
+        // remove when the window closes — whether it closed because the second
+        // lapsed or because the dodge actually ate a hit (`apply_negation_pools`
+        // drops a drained pool).
+        //
+        // Retail sends that remove: of 405 captured `Dodging` (12) op51 frames,
+        // 204 are applies and 201 are removes. We sent the apply and never the
+        // remove, so the client's dodge indicator had nothing to clear on.
+        //
+        // Scoped to `DamageNegationSource::Dodge` on purpose — Ward and Absorb
+        // share `negation_pools` but are announced from elsewhere, and this list
+        // may hold ONLY what it can see (see `announced_statuses`).
+        if self.negation_pools.iter().any(|p| {
+            p.source == DamageNegationSource::Dodge && p.remaining > 0.0 && now < p.expires_at
+        }) {
+            v.push(StatusEffectType::Dodging);
+        }
         v.sort_by_key(|s| *s as u16);
         v.dedup();
         v
