@@ -1412,6 +1412,7 @@ mod tests {
             absorb_fraction: 1.0,
             elemental_only: false,
             consumes_overflow: false,
+            on_absorb_restore: (0.0, 0.0, 0.0),
         });
         let mut components = vec![(DamageType::Slashing, 200.0), (DamageType::Poison, 137.3), (DamageType::Magicka, 137.3)];
         let res = tgt.apply_negation_pools(&mut components);

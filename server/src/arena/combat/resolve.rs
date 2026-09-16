@@ -2040,6 +2040,67 @@ fn apply_shipped_effects(
         }
     }
 
+    // `_bonusResistance` — a FLAT all-damage resistance granted to the CASTER.
+    // Indomitable Smash ships 250 at rank 1 and it was read by nobody, so the
+    // maneuver cured conditions and then did nothing else defensively.
+    //
+    // Lifetime: the ability ships no duration of its own, so it rides the same
+    // `ABILITY_USE_MIN_WINDOW_SECS` window the Combat Focus / Willpower perks use for
+    // a cast — the committed-animation window. That is a modelling choice, not an
+    // authored number, and is called out here rather than buried.
+    if let Some(bonus) = r.get(super::gamedata::AbilityField::BonusResistance) {
+        if bonus > 0.0 && caster < viewers {
+            let window = super::perks::ABILITY_USE_MIN_WINDOW_SECS;
+            let expires = now + Duration::from_secs_f32(window);
+            combat.fighters[caster]
+                .transient_all_resistance
+                .push((bonus, expires));
+            info!(
+                "combat: slot {caster} bonus resistance +{bonus:.1} for {window:.2}s ({ability_uuid})"
+            );
+        }
+    }
+
+    // `_resistanceBonus` + `_resistTypes` — a resistance to SPECIFIC damage types for
+    // the caster. Frostbite ships 13.13 against resistTypes [1,2,3] (the three
+    // physical tracks) while it channels, and both fields were unread: the spell did
+    // its channelled damage and gave the caster none of the protection its
+    // description promises.
+    if let Some(bonus) = r.get(super::gamedata::AbilityField::ResistanceBonus) {
+        if bonus > 0.0 && caster < viewers && !r.resist_types.is_empty() {
+            // Lasts as long as the channel it protects.
+            let secs = r
+                .get(super::gamedata::AbilityField::ChannelMaxLength)
+                .or_else(|| r.channel_duration())
+                .unwrap_or(super::perks::ABILITY_USE_MIN_WINDOW_SECS);
+            let expires = now + Duration::from_secs_f32(secs);
+            let mut applied = 0;
+            for raw in r.resist_types {
+                use super::state::DamageType as DT;
+                let ty = match *raw {
+                    1 => Some(DT::Slashing),
+                    2 => Some(DT::Cleaving),
+                    3 => Some(DT::Bashing),
+                    4 => Some(DT::Fire),
+                    5 => Some(DT::Frost),
+                    6 => Some(DT::Shock),
+                    7 => Some(DT::Poison),
+                    _ => None,
+                };
+                if let Some(ty) = ty {
+                    combat.fighters[caster]
+                        .transient_resistances
+                        .push((ty, bonus, expires));
+                    applied += 1;
+                }
+            }
+            info!(
+                "combat: slot {caster} resistance +{bonus:.1} on {applied} type(s) for \
+                 {secs:.2}s ({ability_uuid})"
+            );
+        }
+    }
+
     if let Some(cap) = r.maximum_damage_dodged() {
         if cap > 0.0 && caster < viewers {
             // `_dodgeDuration` is authored at **1.0 s** on all four dodge maneuvers
@@ -2058,6 +2119,13 @@ fn apply_shipped_effects(
                 source: DamageNegationSource::Dodge,
                 remaining: cap,
                 expires_at: expires,
+                // Adrenaline / Renewing / Focusing Dodge pay out only if the dodge
+                // actually connects. Absent fields are 0, i.e. a plain Dodging Strike.
+                on_absorb_restore: (
+                    r.get(super::gamedata::AbilityField::MaximumHealthRestored).unwrap_or(0.0),
+                    r.get(super::gamedata::AbilityField::MaximumMagickaRestored).unwrap_or(0.0),
+                    r.get(super::gamedata::AbilityField::MaximumCooldownReduction).unwrap_or(0.0),
+                ),
                 restoration_factor: 0.0,
                 absorb_fraction: 1.0,
                 elemental_only: false,
@@ -2090,6 +2158,7 @@ fn apply_shipped_effects(
                 expires_at: until_consumed,
                 restoration_factor: 0.0,
                 absorb_fraction: absorb,
+                on_absorb_restore: (0.0, 0.0, 0.0),
                 // Storm-armor shields are not element-scoped and have no overflow
                 // clause in their description — only Ward does.
                 elemental_only: false,
@@ -2340,12 +2409,36 @@ fn emit_damage(
 
     // Whole hit eaten by a Ward/Absorb pool → emit DamageNegated(66), apply the Absorb
     // heal-back, and DO NOT reduce HP (the hit dealt 0). [status-resistance-spec §4]
+    // Pool restorations are paid whenever a pool ABSORBED something, whether or not
+    // it swallowed the hit whole. The heal used to live inside the `negated` branch
+    // below, so an Absorb that ate most of a big hit healed nothing, and the dodge
+    // restorations (Adrenaline / Renewing / Focusing) would have had the same hole.
+    if neg.heal > 0.0 {
+        let f = &mut combat.fighters[target_slot];
+        f.health = (f.health + neg.heal.round() as u32).min(f.max_health);
+    }
+    if neg.restore_magicka > 0.0 {
+        let f = &mut combat.fighters[target_slot];
+        f.magicka = (f.magicka + neg.restore_magicka.round() as u32).min(f.max_magicka);
+        info!(
+            "combat: slot {target_slot} dodge restored {:.0} magicka",
+            neg.restore_magicka
+        );
+    }
+    if neg.restore_cooldown_secs > 0.0 {
+        let cut = Duration::from_secs_f32(neg.restore_cooldown_secs);
+        let f = &mut combat.fighters[target_slot];
+        for until in f.cooldowns.values_mut() {
+            *until = until.checked_sub(cut).unwrap_or(*until);
+        }
+        info!(
+            "combat: slot {target_slot} dodge cut {:.1}s off its cooldowns",
+            neg.restore_cooldown_secs
+        );
+    }
+
     if neg.negated {
         let defender_obj = combat.fighters[target_slot].net_object_id;
-        if neg.heal > 0.0 {
-            let f = &mut combat.fighters[target_slot];
-            f.health = (f.health + neg.heal.round() as u32).min(f.max_health);
-        }
         info!(
             "combat damage: slot {attacker_slot} → slot {target_slot} | source {:?} side {:?} | \
              NEGATED by a pool (heal +{:.0}) → op66 DamageNegated, no HP loss",
@@ -3087,6 +3180,7 @@ fn apply_ward(
         expires_at: ward_expires,
         restoration_factor: 0.0, // Ward: pure negation, no heal-back
         absorb_fraction: 1.0,    // Ward swallows a hit whole until exhausted
+        on_absorb_restore: (0.0, 0.0, 0.0),
         // `Ability.Spell.Ward.Description`: "negates up to {1} ELEMENTAL damage,
         // plus any EXCESS damage from the attack that destroys it". Ward's physical
         // protection is the Armor Rating pushed below, not this pool.
@@ -3144,6 +3238,7 @@ fn apply_absorb(
         expires_at: now + Duration::from_secs_f32(duration),
         restoration_factor: restoration,
         absorb_fraction: 1.0,
+        on_absorb_restore: (0.0, 0.0, 0.0),
         elemental_only: false,
         consumes_overflow: false,
     });
@@ -6917,6 +7012,46 @@ mod shipped_effects_tests {
             delayed > plain + Duration::from_secs(3),
             "it must land far later than the plain bolt ({plain:?}), not alongside it"
         );
+    }
+
+    /// Indomitable Smash ships `_bonusResistance` 250 and it was read by nobody, so
+    /// the maneuver cured conditions and then did nothing defensively at all.
+    #[test]
+    fn indomitable_smash_grants_its_authored_resistance() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        apply_shipped_effects(&mut c, 0, 1, uuid_of("IndomitableSmash"), 1, 500.0, 0, now);
+        let total: f32 = c.fighters[0].transient_all_resistance.iter().map(|(v, _)| *v).sum();
+        assert!(total >= 250.0, "expected the authored 250 flat resistance, got {total}");
+    }
+
+    /// Frostbite ships `_resistanceBonus` 13.13 against `_resistTypes` [1,2,3] — the
+    /// three physical tracks — for the caster while it channels. Both fields were
+    /// unread, so the spell dealt its damage and gave none of the protection its
+    /// description promises.
+    #[test]
+    fn frostbite_grants_its_authored_physical_resistance_to_the_caster() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        apply_shipped_effects(&mut c, 0, 1, uuid_of("Frostbite"), 1, 500.0, 0, now);
+        use super::super::state::DamageType;
+        for ty in [DamageType::Slashing, DamageType::Cleaving, DamageType::Bashing] {
+            let got: f32 = c.fighters[0]
+                .transient_resistances
+                .iter()
+                .filter(|(t, _, _)| *t == ty)
+                .map(|(_, v, _)| *v)
+                .sum();
+            assert!(got > 0.0, "{ty:?} must be resisted while Frostbite channels");
+        }
+        // …and NOT the elemental tracks: resistTypes is [1,2,3], physical only.
+        let fire: f32 = c.fighters[0]
+            .transient_resistances
+            .iter()
+            .filter(|(t, _, _)| *t == DamageType::Fire)
+            .map(|(_, v, _)| *v)
+            .sum();
+        assert_eq!(fire, 0.0, "resistTypes is physical-only; Fire must not be covered");
     }
 
     #[test]

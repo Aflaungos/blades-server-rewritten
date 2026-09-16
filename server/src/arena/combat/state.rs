@@ -1349,6 +1349,20 @@ pub struct NegationPool {
     /// supposed to pay off. Scoped to the eligible components so an elemental-only
     /// Ward cannot swallow a physical component it was never allowed to touch.
     pub consumes_overflow: bool,
+    /// Granted ONCE if this pool actually absorbs damage — the dodge maneuvers'
+    /// reward for a dodge that connected. `(health, magicka, cooldown_seconds)`
+    /// from `_maximumHealthRestored` (Adrenaline Dodge, 43.5),
+    /// `_maximumMagickaRestored` (Renewing Dodge, 338) and
+    /// `_maximumCooldownReduction` (Focusing Dodge, 4.0 s).
+    ///
+    /// All three were read by nobody, so those three maneuvers were identical to a
+    /// plain Dodging Strike — they cost their stamina and gave only the dodge.
+    ///
+    /// These are authored as CAPS. The shipped data has no proximity curve ("the
+    /// closer you are to being hit, the more you get"), so the cap is granted whole
+    /// on a dodge that connects: it is the only number the data actually contains,
+    /// and awarding nothing was the bug.
+    pub on_absorb_restore: (f32, f32, f32),
 }
 
 /// The sliding damage-history window length (`ElementalStatusEffectData._duration` ≈ 5 s
@@ -2067,7 +2081,12 @@ impl Fighter {
     /// current instant through [`Self::prune_negation_pools`] first).
     pub fn apply_negation_pools(&mut self, components: &mut [(DamageType, f32)]) -> NegationResult {
         if self.negation_pools.is_empty() {
-            return NegationResult { negated: false, heal: 0.0 };
+            return NegationResult {
+                negated: false,
+                heal: 0.0,
+                restore_magicka: 0.0,
+                restore_cooldown_secs: 0.0,
+            };
         }
         let health_before: f32 = components
             .iter()
@@ -2075,9 +2094,16 @@ impl Fighter {
             .map(|(_, v)| *v)
             .sum();
         if health_before <= 0.0 {
-            return NegationResult { negated: false, heal: 0.0 };
+            return NegationResult {
+                negated: false,
+                heal: 0.0,
+                restore_magicka: 0.0,
+                restore_cooldown_secs: 0.0,
+            };
         }
         let mut heal = 0.0;
+        let mut restore_magicka = 0.0;
+        let mut restore_cooldown_secs = 0.0;
         for pool in self.negation_pools.iter_mut() {
             if pool.remaining <= 0.0 {
                 continue;
@@ -2103,6 +2129,14 @@ impl Fighter {
                 *v -= eaten;
                 pool.remaining -= eaten;
                 heal += eaten * pool.restoration_factor;
+                if eaten > 0.0 {
+                    // This pool connected: pay its one-off restoration and disarm it
+                    // so a multi-component hit cannot pay it several times.
+                    let (h, m, c) = std::mem::take(&mut pool.on_absorb_restore);
+                    heal += h;
+                    restore_magicka += m;
+                    restore_cooldown_secs += c;
+                }
             }
             // "…plus any excess damage from the attack that destroys it." The pool
             // ran out DURING this hit, so the rest of the hit it was allowed to see
@@ -2123,7 +2157,12 @@ impl Fighter {
             .filter(|(t, _)| super::damage::is_health_type(*t))
             .map(|(_, v)| *v)
             .sum();
-        NegationResult { negated: health_after <= 0.0, heal }
+        NegationResult {
+            negated: health_after <= 0.0,
+            heal,
+            restore_magicka,
+            restore_cooldown_secs,
+        }
     }
 
     /// Drop negation pools whose duration has lapsed (call on tick / before a hit).
@@ -2172,6 +2211,12 @@ pub enum RoundOutcome {
 pub struct NegationResult {
     pub negated: bool,
     pub heal: f32,
+    /// Magicka restored by a dodge that actually absorbed something
+    /// (Renewing Dodge's `_maximumMagickaRestored`).
+    pub restore_magicka: f32,
+    /// Seconds to take off the dodger's own cooldowns
+    /// (Focusing Dodge's `_maximumCooldownReduction`).
+    pub restore_cooldown_secs: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -3030,6 +3075,7 @@ mod absorb_fraction_tests {
             absorb_fraction: fraction,
             elemental_only: false,
             consumes_overflow: false,
+            on_absorb_restore: (0.0, 0.0, 0.0),
         }
     }
 
@@ -3083,6 +3129,7 @@ mod absorb_fraction_tests {
             absorb_fraction: 1.0,
             elemental_only: true,
             consumes_overflow: true,
+            on_absorb_restore: (0.0, 0.0, 0.0),
         }
     }
 
@@ -3171,6 +3218,60 @@ mod absorb_fraction_tests {
         assert!(!r.negated);
     }
 
+    /// Adrenaline / Renewing / Focusing Dodge each ship a restoration the server read
+    /// from nobody, so all three were identical to a plain Dodging Strike: they cost
+    /// their stamina and gave only the dodge. The payout is conditional on the dodge
+    /// CONNECTING, and is paid once per dodge, not once per damage component.
+    #[test]
+    fn a_connecting_dodge_pays_its_authored_restoration_exactly_once() {
+        let now = Instant::now();
+        let mut f = Fighter::new(0, 1, loadout::starter(), now);
+        f.negation_pools.push(NegationPool {
+            source: DamageNegationSource::Dodge,
+            remaining: 500.0,
+            expires_at: now + std::time::Duration::from_secs(1),
+            restoration_factor: 0.0,
+            absorb_fraction: 1.0,
+            elemental_only: false,
+            consumes_overflow: false,
+            on_absorb_restore: (43.5, 338.0, 4.0),
+        });
+        // A multi-component hit: the restoration must NOT be paid per component.
+        let mut c = vec![
+            (DamageType::Slashing, 40.0),
+            (DamageType::Fire, 30.0),
+            (DamageType::Poison, 20.0),
+        ];
+        let r = f.apply_negation_pools(&mut c);
+        assert!((r.heal - 43.5).abs() < 1e-3, "health paid once, got {}", r.heal);
+        assert!((r.restore_magicka - 338.0).abs() < 1e-3, "magicka paid once");
+        assert!((r.restore_cooldown_secs - 4.0).abs() < 1e-3, "cooldown paid once");
+    }
+
+    /// A dodge that never connects pays nothing — the reward is for a dodge that
+    /// actually absorbed a hit, not for casting.
+    #[test]
+    fn a_dodge_that_absorbs_nothing_pays_nothing() {
+        let now = Instant::now();
+        let mut f = Fighter::new(0, 1, loadout::starter(), now);
+        f.negation_pools.push(NegationPool {
+            source: DamageNegationSource::Dodge,
+            remaining: 500.0,
+            expires_at: now + std::time::Duration::from_secs(1),
+            restoration_factor: 0.0,
+            absorb_fraction: 1.0,
+            elemental_only: false,
+            consumes_overflow: false,
+            on_absorb_restore: (43.5, 338.0, 4.0),
+        });
+        // Only a Magicka drain — not a health-type component, so nothing is absorbed.
+        let mut c = vec![(DamageType::Magicka, 100.0)];
+        let r = f.apply_negation_pools(&mut c);
+        assert_eq!(r.heal, 0.0);
+        assert_eq!(r.restore_magicka, 0.0);
+        assert_eq!(r.restore_cooldown_secs, 0.0);
+    }
+
     /// Absorb is NOT element-scoped and has no overflow clause — the additivity proof
     /// that the two new flags changed nothing for the other pool kinds.
     #[test]
@@ -3185,6 +3286,7 @@ mod absorb_fraction_tests {
             absorb_fraction: 1.0,
             elemental_only: false,
             consumes_overflow: false,
+            on_absorb_restore: (0.0, 0.0, 0.0),
         });
         let mut c = vec![(DamageType::Slashing, 130.0)];
         let r = f.apply_negation_pools(&mut c);
