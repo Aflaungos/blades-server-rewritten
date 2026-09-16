@@ -3457,6 +3457,24 @@ fn on_round_ended(
         // branch walks ChooseLoadout(8)→…→InRound(13) + resets HP + re-enters the round.
         combat.interround_step = 0;
         combat.phase = FlowState::NextState;
+
+        // Return both actors to Idle NOW, as the round ends — not six interround
+        // steps later when round 2 goes live.
+        //
+        // `reset_fighters_for_next_round` already does this, but it runs only at
+        // `InRound(13)`, the last step of the walk. So a fighter caught mid-cast when
+        // the round ended kept that pose for the whole break. Report #113, in the
+        // reporter's own words: the opponent's cast pose held "from the end of a round
+        // right through the break and up until the first strikes of the next round
+        // began" — which is exactly where the old reset fired.
+        //
+        // This is additive: it tells the clients earlier and removes nothing. Retail
+        // interleaves actor-state (gmid 39) with the match-state walk rather than
+        // confining it to round start — 856 gmid-39 frames sit among the 277 gmid-79
+        // state changes in session 615 — so an Idle inside the walk is the shape the
+        // client already expects.
+        combat.reset_actor_animations(now);
+        out.extend(drain_state_changes(combat, now));
         info!(
             "combat: round-ending {} (round {}) → winner slot {winner} (obj {winner_obj}), loser slot {loser} \
              (obj {loser_obj}); score {:?} (no fighter at {} wins yet) — LOOPING to the next round; \
@@ -6314,6 +6332,67 @@ mod phase4_tests {
         let mut f = messages::frame_for_test(w.finish());
         f[0] = 0x84;
         f
+    }
+
+    /// Report #113: a fighter caught mid-cast when the round ended held that pose
+    /// for the whole inter-round walk.
+    ///
+    /// `reset_fighters_for_next_round` did reset the actor, but it runs at
+    /// `InRound(13)` — the LAST of the six interround steps — so the pose survived
+    /// until round 2 went live. The reporter described exactly that boundary: the
+    /// cast pose held "right through the break and up until the first strikes of the
+    /// next round began".
+    ///
+    /// The round end must therefore put both actors back to Idle itself.
+    #[test]
+    fn a_round_ending_returns_both_actors_to_idle() {
+        let now = Instant::now();
+        let mut combat = live_combat(now);
+
+        // Both fighters mid-animation when the round ends.
+        combat.fighters[0].set_actor_state(ActorStateType::Channeling, now);
+        combat.fighters[1].set_actor_state(ActorStateType::Channeling, now);
+        assert_ne!(combat.fighters[0].actor_state(), ActorStateType::Idle);
+        assert_ne!(combat.fighters[1].actor_state(), ActorStateType::Idle);
+
+        combat.reset_actor_animations(now);
+
+        assert_eq!(
+            combat.fighters[0].actor_state(),
+            ActorStateType::Idle,
+            "the winner's actor must stop animating when the round ends"
+        );
+        assert_eq!(
+            combat.fighters[1].actor_state(),
+            ActorStateType::Idle,
+            "the loser's actor must stop animating when the round ends"
+        );
+
+        // And the clients must be TOLD — a server-side field change nobody sends is
+        // what left the pose stuck on screen in the first place.
+        let frames = drain_state_changes(&mut combat, now);
+        assert!(
+            !frames.is_empty(),
+            "the reset must emit actor-state frames, not just mutate server state"
+        );
+    }
+
+    /// The control: an actor already Idle must not emit a redundant change. Without
+    /// this the fix would spam an op39 at every round end for a fighter that was
+    /// simply standing still, which is not what retail does.
+    #[test]
+    fn an_already_idle_actor_emits_nothing() {
+        let now = Instant::now();
+        let mut combat = live_combat(now);
+        assert_eq!(combat.fighters[0].actor_state(), ActorStateType::Idle);
+        assert_eq!(combat.fighters[1].actor_state(), ActorStateType::Idle);
+
+        combat.reset_actor_animations(now);
+        let frames = drain_state_changes(&mut combat, now);
+        assert!(
+            frames.is_empty(),
+            "an actor that was already Idle must not produce a state change: {frames:?}"
+        );
     }
 
     fn live_combat(now: Instant) -> MatchCombat {

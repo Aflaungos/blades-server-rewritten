@@ -2424,6 +2424,26 @@ impl MatchCombat {
     /// swing-throttle, actor back to Idle. The stats sequence id keeps rising
     /// (monotonic across the whole match, as the wire expects). `round` is NOT
     /// touched here — the engine bumps it when the next round goes live.
+    /// Return every fighter's ANIMATION to Idle, dropping any in-flight or scheduled
+    /// transition, and leave the change queued for the caller to drain.
+    ///
+    /// Split out of [`Self::reset_fighters_for_next_round`] because the animation and
+    /// the pools want different moments. The pools refill when the next round goes
+    /// live; the animation has to stop when the round ENDS, or a fighter caught
+    /// mid-cast holds that pose across the whole inter-round walk — report #113,
+    /// where the opponent's cast pose survived "right through the break and up until
+    /// the first strikes of the next round began", which is precisely where the
+    /// combined reset used to fire.
+    pub fn reset_actor_animations(&mut self, now: Instant) {
+        for f in &mut self.fighters {
+            f.pending_state_changes.clear();
+            f.scheduled_states.clear();
+            if f.actor_state != ActorStateType::Idle {
+                f.set_actor_state(ActorStateType::Idle, now);
+            }
+        }
+    }
+
     pub fn reset_fighters_for_next_round(&mut self, now: Instant) {
         for f in &mut self.fighters {
             f.health = f.max_health;
