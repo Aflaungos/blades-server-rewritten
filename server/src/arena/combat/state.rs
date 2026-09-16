@@ -1284,6 +1284,27 @@ pub struct Fighter {
     /// redirected". The reduction half was already applied as a transient resistance;
     /// the REDIRECT half was never implemented, so Reflecting Bash was strictly worse
     /// than Shield Bash — same guard, less damage, no reflection.
+    /// **Wall of Fire** is up until this instant. While it is, an attacker who lands
+    /// a hit on this fighter "passes through" the wall and is burned for
+    /// `firewall_damage`; the caster pays `firewall_self_pct` of that in fire itself.
+    ///
+    /// `FirewallAbility` ships `_damage` 93.33 **per attack passing through** (not per
+    /// second), `_duration` 5 s and `_selfDamagePercent` 0.2. The server resolved it
+    /// as one immediate hit and there was no wall at all.
+    pub firewall_until: Option<Instant>,
+    pub firewall_damage: f32,
+    pub firewall_self_pct: f32,
+
+    /// **Echo Weapon** is up until this instant; each landed weapon hit is echoed
+    /// `echo_delay` later for `echo_bonus` flat damage.
+    ///
+    /// `_duration` 8 s, `_weaponDelay` 0.5 s, and a per-weapon-class `_bonusDamages`
+    /// (Light 95.84 / Versatile 108.03 / Heavy 123.70). None of it was implemented —
+    /// the spell produced no echoes whatsoever.
+    pub echo_until: Option<Instant>,
+    pub echo_bonus: f32,
+    pub echo_delay: f32,
+
     pub reflect_until: Option<Instant>,
     /// Remaining redirect budget for the current Reflecting Bash window.
     pub reflect_remaining: f32,
@@ -1489,6 +1510,12 @@ impl Fighter {
         Fighter {
             slot,
             net_object_id,
+            firewall_until: None,
+            firewall_damage: 0.0,
+            firewall_self_pct: 0.0,
+            echo_until: None,
+            echo_bonus: 0.0,
+            echo_delay: 0.0,
             reflect_until: None,
             reflect_remaining: 0.0,
             magicka_surge_until: None,
@@ -2354,6 +2381,8 @@ pub struct MatchCombat {
     pub last_regen_tick: std::time::Instant,
     /// Swings committed but not yet landed — see [`PendingHit`].
     pub pending_hits: Vec<PendingHit>,
+    /// Echo Weapon follow-ups awaiting their `_weaponDelay`.
+    pub pending_echoes: Vec<PendingEcho>,
     /// Casts waiting on their shipped wind-up. See [`PendingImpact`].
     pub pending_impacts: Vec<PendingImpact>,
 }
@@ -2382,6 +2411,19 @@ pub struct PendingImpact {
     pub ability_uuid: String,
     pub level: u8,
     pub tag: AbilityTag,
+    /// Maximum Power's condition, frozen when the cast was accepted (before its own
+    /// magicka cost was deducted) — the order the client uses.
+    pub magicka_full_at_cast: bool,
+    pub due: Instant,
+}
+
+/// An **Echo Weapon** echo waiting to land: a flat follow-up hit `_weaponDelay`
+/// after the swing that produced it.
+#[derive(Debug, Clone)]
+pub struct PendingEcho {
+    pub sender: usize,
+    pub target: usize,
+    pub damage: f32,
     pub due: Instant,
 }
 
@@ -2418,6 +2460,7 @@ impl MatchCombat {
             interround_step: 0,
             last_regen_tick: now,
             pending_hits: Vec::new(),
+            pending_echoes: Vec::new(),
             pending_impacts: Vec::new(),
         }
     }

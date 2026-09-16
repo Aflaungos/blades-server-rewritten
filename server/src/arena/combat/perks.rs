@@ -166,23 +166,29 @@ impl PerkBonuses {
 
     /// Multiplier on a spell's magnitude for this caster's state.
     ///
-    /// Maximum Power and Mettle are independent conditions that can both hold at
-    /// once (full magicka, critical health), so they stack additively — two
-    /// separate perks each promising "{0}% more effective" should not multiply into
-    /// more than the sum of their printed values.
-    pub fn spell_multiplier(&self, magicka_full: bool, health_critical: bool) -> f32 {
-        let mut m = 1.0;
+    /// Only **Maximum Power** applies to a spell. Its shipped text is *"Spells are
+    /// {0}% more effective when cast while Magicka is full"*, and
+    /// `MaximumPowerPerk.GetSpellBonus` returns 0 unless `AbilityType == Spell(1)`.
+    ///
+    /// **Mettle used to be added here and that was wrong.** Its description says
+    /// "Abilities", which reads as everything, but `MettlePerk.GetManeuverBonus`
+    /// opens with `cmp w2, 2` — `AbilityType.Maneuver` — and returns 0.0 for anything
+    /// else. The loose description is copy; the code is maneuver-only. Disassembled
+    /// from `libil2cpp.so` (RVA 0x1A22F74) rather than inferred.
+    ///
+    /// `health_critical` is kept in the signature so every caller still states the
+    /// condition it evaluated; it simply no longer affects a SPELL.
+    pub fn spell_multiplier(&self, magicka_full: bool, _health_critical: bool) -> f32 {
         if magicka_full {
-            m += self.max_power;
+            1.0 + self.max_power
+        } else {
+            1.0
         }
-        if health_critical {
-            m += self.mettle;
-        }
-        m
     }
 
-    /// Multiplier on a non-spell ability's magnitude. Maximum Power is spell-only —
-    /// its shipped text says *"Spells are…"* — so only Mettle applies here.
+    /// Multiplier on a **maneuver's** magnitude — Mettle's actual scope.
+    ///
+    /// Maximum Power is spell-only and never applies here.
     pub fn ability_multiplier(&self, health_critical: bool) -> f32 {
         if health_critical {
             1.0 + self.mettle
@@ -395,16 +401,29 @@ mod tests {
         assert_eq!(p.spell_multiplier(false, false), 1.0);
     }
 
-    /// Mettle applies to abilities generally; Maximum Power does not — it is
-    /// spell-only. This is the test that separates the two paths.
+    /// The two perks are DISJOINT: Mettle is maneuvers-only, Maximum Power is
+    /// spells-only. Neither ever applies to the other's ability type.
+    ///
+    /// This test previously asserted that a spell at full magicka AND critical health
+    /// got BOTH (×1.85). That was wrong. Mettle's description says "Abilities", which
+    /// reads as everything, but `MettlePerk.GetManeuverBonus` opens with
+    /// `cmp w2, 2` — `AbilityType.Maneuver` — and returns 0.0 for anything else
+    /// (disassembled from libil2cpp.so, RVA 0x1A22F74). The description is loose copy.
     #[test]
-    fn mettle_applies_to_abilities_but_maximum_power_does_not() {
+    fn mettle_is_maneuver_only_and_maximum_power_is_spell_only() {
         let p = PerkBonuses::resolve(&[perk(MAXIMUM_POWER, 6), perk(METTLE, 6)], false);
         // A maneuver at critical health: Mettle only.
         assert_eq!(p.ability_multiplier(true), 1.45);
         assert_eq!(p.ability_multiplier(false), 1.0);
-        // A spell at full magicka AND critical health: both, added not multiplied.
-        assert!((p.spell_multiplier(true, true) - 1.85).abs() < 1e-5);
+        // A spell at full magicka AND critical health: Maximum Power ONLY — Mettle
+        // contributes nothing to a spell however critical the caster's health is.
+        assert!((p.spell_multiplier(true, true) - 1.40).abs() < 1e-5);
+        assert!((p.spell_multiplier(true, false) - 1.40).abs() < 1e-5);
+        assert_eq!(
+            p.spell_multiplier(false, true),
+            1.0,
+            "critical health alone must do nothing to a spell"
+        );
     }
 
     #[test]

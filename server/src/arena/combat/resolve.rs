@@ -1216,6 +1216,18 @@ pub(super) fn resolve_ability_cast(
         return (0..combat.fighters.len()).map(|s| (s, frame.clone())).collect();
     }
 
+    // MAXIMUM POWER is evaluated at CAST time — "Spells are {0}% more effective when
+    // **cast while** Magicka is full" — and the client proves the order: in
+    // `Actor.ExecuteAbility` the effectiveness fold runs BEFORE `PayAbilityCost`, and
+    // the result is frozen into the AbilityExecution for every step and channel tick.
+    //
+    // We deducted the cost here and only read "is magicka full?" ~490 lines later, so
+    // for ANY spell with a magicka cost the perk could never fire. It was dead on
+    // arrival, and both existing tests hand-built `CasterPerks { magicka_full: true }`
+    // so neither could see it.
+    let magicka_full_at_cast =
+        combat.fighters[sender].magicka >= combat.fighters[sender].max_magicka;
+
     // Resource gate passed → commit: set cooldown and deduct the cost.
     combat
         .fighters[sender]
@@ -1423,7 +1435,8 @@ pub(super) fn resolve_ability_cast(
     let delay = ability_impact_delay(&ea.ability_uuid, level);
     if delay.is_zero() {
         out.extend(apply_ability_impact(
-            combat, sender, target_slot, &ea.ability_uuid, level, tag, now,
+            combat, sender, target_slot, &ea.ability_uuid, level, tag,
+            magicka_full_at_cast, now,
         ));
     } else {
         debug!(
@@ -1436,6 +1449,7 @@ pub(super) fn resolve_ability_cast(
             ability_uuid: ea.ability_uuid.clone(),
             level,
             tag,
+            magicka_full_at_cast,
             due: now + delay,
         });
     }
@@ -1577,6 +1591,10 @@ fn apply_ability_impact(
     ability_uuid: &str,
     level: u8,
     tag: super::state::AbilityTag,
+    // Was the caster's magicka full when the cast was ACCEPTED, i.e. BEFORE its own
+    // cost was deducted? Maximum Power's condition, frozen at cast the way the client
+    // freezes it (`Actor.ExecuteAbility` folds effectiveness before `PayAbilityCost`).
+    magicka_full_at_cast: bool,
     now: Instant,
 ) -> Vec<(usize, Vec<u8>)> {
     use super::state::AbilityTag;
@@ -1691,7 +1709,20 @@ fn apply_ability_impact(
             // `AbilityTag`), and `ShieldManeuver (11)` almost certainly belongs to
             // them — but 11 appears in **none** of the 168, so there is no measurement
             // behind it and it is deliberately not guessed here.
-            let resolved = RetailDamageModel.resolve_attack(
+            // METTLE applies to MANEUVERS — and only to maneuvers. A maneuver is
+            // resolved through `resolve_attack`, which takes a Loadout and no
+            // `CasterPerks`, so the perk had no way to reach it: it was being applied
+            // to spells (where the client applies nothing) and to nothing here (where
+            // the client applies it). Scale the resolved magnitude by
+            // `ability_multiplier`, which is the whole-ability effectiveness the
+            // client's `AbilityExecution._effectivenessMultiplier` expresses.
+            let mettle = {
+                let f = &combat.fighters[sender];
+                f.loadout
+                    .perks
+                    .ability_multiplier(super::perks::health_is_critical(f.health, f.max_health))
+            };
+            let mut resolved = RetailDamageModel.resolve_attack(
                 &attacker_loadout,
                 &combat.fighters[target_slot],
                 DamageSource::WeaponManeuver,
@@ -1700,6 +1731,13 @@ fn apply_ability_impact(
                 0,
                 now,
             );
+            if mettle != 1.0 {
+                for (_, v) in resolved.components.iter_mut() {
+                    *v *= mettle;
+                }
+                resolved.total *= mettle;
+                debug!("combat: slot {sender} maneuver scaled ×{mettle:.2} by Mettle");
+            }
             info!(
                 "combat: slot {sender} maneuver {} → weapon damage {:.1} (Middle)",
                 ability_uuid, resolved.total,
@@ -1725,8 +1763,10 @@ fn apply_ability_impact(
             );
         }
         AbilityTag::Paralyze | AbilityTag::Damage | AbilityTag::Generic => {
-            let caster = super::perks::CasterPerks::of(&combat.fighters[sender]);
-            let magicka_full_at_cast = caster.magicka_full;
+            let caster = super::perks::CasterPerks {
+                magicka_full: magicka_full_at_cast,
+                ..super::perks::CasterPerks::of(&combat.fighters[sender])
+            };
             let resolved = RetailDamageModel.resolve_ability(
                 ability_uuid,
                 level,
@@ -1916,6 +1956,66 @@ fn begin_ability_guard(
     info!("combat: slot {caster} bash guard UP for {window:.2}s ({ability_uuid})");
 }
 
+/// Deliver **Echo Weapon** echoes whose `_weaponDelay` has elapsed.
+///
+/// An echo is a flat follow-up, not a re-swing: it carries the spell's per-weapon-class
+/// `_bonusDamages` and nothing else — no combo, no charge, no block interaction. It is
+/// therefore emitted directly rather than routed back through the swing resolver,
+/// which would re-apply the whole multiplier chain to it.
+fn land_due_echoes(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8>)> {
+    if combat.pending_echoes.is_empty() {
+        return Vec::new();
+    }
+    let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut combat.pending_echoes)
+        .into_iter()
+        .partition(|e| now >= e.due);
+    combat.pending_echoes = waiting;
+
+    let mut out = Vec::new();
+    for e in due {
+        if e.sender >= combat.fighters.len() || e.target >= combat.fighters.len() {
+            continue;
+        }
+        // A round can end while an echo is in flight; landing it afterwards would
+        // deal damage into the next round (the same rule `land_due_hits` applies).
+        if !matches!(combat.phase, FlowState::StateTimeout) {
+            continue;
+        }
+        if combat.fighters[e.target].is_dead() || combat.fighters[e.sender].is_dead() {
+            continue;
+        }
+        combat.fighters[e.target].take_damage_at(e.damage.round().max(0.0) as u32, now);
+        let msg = {
+            let hit = &combat.fighters[e.target];
+            let other = &combat.fighters[e.sender];
+            messages::receive_damage(
+                hit.net_object_id,
+                NetObjectType::Avatar as u8,
+                hit.packed_stats(),
+                other.packed_stats(),
+                super::state::DamageSource::Spell,
+                super::damage::flags::SHOW_DAMAGE | super::damage::flags::HAS_ATTACKER,
+                e.damage,
+                0,
+                ActiveSide::Middle,
+                super::state::DamageType::None,
+                &[(super::state::DamageType::Health, e.damage)],
+            )
+        };
+        info!(
+            "combat: slot {} ECHO landed {:.1} on slot {}",
+            e.sender, e.damage, e.target
+        );
+        for v in 0..combat.fighters.len() {
+            out.push((v, msg.clone()));
+        }
+        if combat.fighters[e.target].is_dead() {
+            out.extend(on_round_ending_death(combat, e.sender, now));
+        }
+    }
+    out
+}
+
 /// Deliver casts whose wind-up has elapsed. Mirrors [`land_due_hits`].
 pub(super) fn land_due_impacts(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8>)> {
     if combat.pending_impacts.is_empty() {
@@ -1932,7 +2032,8 @@ pub(super) fn land_due_impacts(combat: &mut MatchCombat, now: Instant) -> Vec<(u
             continue;
         }
         out.extend(apply_ability_impact(
-            combat, p.sender, p.target, &p.ability_uuid, p.level, p.tag, now,
+            combat, p.sender, p.target, &p.ability_uuid, p.level, p.tag,
+            p.magicka_full_at_cast, now,
         ));
     }
     out
@@ -2103,6 +2204,68 @@ fn apply_shipped_effects(
                 "combat: slot {target_slot} skill cooldowns +{secs:.2}s on {} active skill(s) via {ability_uuid}",
                 abilities.len(),
             );
+        }
+    }
+
+    // **WALL OF FIRE** (editor `Firewall`) — a persistent wall, not a hit. It ships
+    // `_damage` **per attack passing through**, `_duration`, and `_selfDamagePercent`.
+    // The server resolved it as a single immediate hit and there was no wall.
+    // `StatusEffectType::Firewall` (13) already exists, so the client can show it.
+    if let Some(dmg) = r.damage() {
+        if caster < viewers && super::gamedata::ability(ability_uuid)
+            .is_some_and(|a| a.editor_name == "Firewall")
+        {
+            let secs = r.duration().unwrap_or(0.0);
+            let self_pct = r
+                .get(super::gamedata::AbilityField::SelfDamagePercent)
+                .unwrap_or(0.0);
+            let f = &mut combat.fighters[caster];
+            f.firewall_until = Some(now + Duration::from_secs_f32(secs));
+            f.firewall_damage = dmg;
+            f.firewall_self_pct = self_pct;
+            let obj = f.net_object_id;
+            info!(
+                "combat: slot {caster} WALL OF FIRE {dmg:.1}/attack for {secs:.1}s \
+                 (self {:.0}%)",
+                self_pct * 100.0
+            );
+            let frame = messages::change_combat_status_effect(
+                obj, true, super::state::StatusEffectType::Firewall, secs,
+            );
+            for v in 0..viewers {
+                out.push((v, frame.clone()));
+            }
+        }
+    }
+
+    // **ECHO WEAPON** — for `_duration`, each landed weapon hit is echoed
+    // `_weaponDelay` later for a flat per-weapon-class bonus. Nothing was
+    // implemented: the spell produced no echoes at all.
+    if let Some(delay) = r.get(super::gamedata::AbilityField::WeaponDelay) {
+        if caster < viewers {
+            let secs = r.duration().unwrap_or(0.0);
+            let class_raw = combat.fighters[caster]
+                .loadout
+                .weapon_template
+                .map(|w| w.weapon_class as u8)
+                .unwrap_or(0);
+            let bonus = r
+                .bonus_damages
+                .iter()
+                .find(|(c, _)| *c == class_raw)
+                .or_else(|| r.bonus_damages.iter().find(|(c, _)| *c == 0))
+                .map(|(_, v)| *v)
+                .unwrap_or(0.0);
+            if bonus > 0.0 && secs > 0.0 {
+                let f = &mut combat.fighters[caster];
+                f.echo_until = Some(now + Duration::from_secs_f32(secs));
+                f.echo_bonus = bonus;
+                f.echo_delay = delay;
+                info!(
+                    "combat: slot {caster} ECHO WEAPON +{bonus:.1} after {delay:.2}s, \
+                     for {secs:.1}s (weapon class {class_raw})"
+                );
+            }
         }
     }
 
@@ -2603,6 +2766,67 @@ fn emit_damage(
     // The DEFENDER's gear hits back. Emitted after the hit that provoked it and
     // before any death check, so a Revenge proc can itself be the killing blow —
     // which is how retail orders it (`op50 blocked` then `op50 src=Revenge`).
+    // WALL OF FIRE: an attacker who lands a hit has "passed through" the wall and is
+    // burned for its per-attack `_damage`; the caster pays `_selfDamagePercent` of
+    // that for standing in their own fire.
+    if attacker_slot != target_slot
+        && combat.fighters[target_slot].firewall_until.is_some_and(|t| now < t)
+    {
+        let burn = combat.fighters[target_slot].firewall_damage;
+        if burn > 0.0 {
+            let self_hit = burn * combat.fighters[target_slot].firewall_self_pct;
+            combat.fighters[attacker_slot].take_damage_at(burn.round().max(0.0) as u32, now);
+            if self_hit > 0.0 {
+                let f = &mut combat.fighters[target_slot];
+                // The caster's own fire never kills them outright: floor at 1.
+                let cost = self_hit.round().max(0.0) as u32;
+                f.health = f.health.saturating_sub(cost).max(1.min(f.health));
+            }
+            let msg = {
+                let hit = &combat.fighters[attacker_slot];
+                let other = &combat.fighters[target_slot];
+                messages::receive_damage(
+                    hit.net_object_id,
+                    NetObjectType::Avatar as u8,
+                    hit.packed_stats(),
+                    other.packed_stats(),
+                    super::state::DamageSource::StatusEffect,
+                    super::damage::flags::SHOW_DAMAGE,
+                    burn,
+                    0,
+                    ActiveSide::None,
+                    super::state::DamageType::Fire,
+                    &[(super::state::DamageType::Fire, burn)],
+                )
+            };
+            info!(
+                "combat: slot {attacker_slot} walked through slot {target_slot}'s WALL OF \
+                 FIRE for {burn:.1} (caster self {self_hit:.1})"
+            );
+            for v in 0..combat.fighters.len() {
+                out.push((v, msg.clone()));
+            }
+        }
+    }
+
+    // ECHO WEAPON: the attacker's landed weapon hit is echoed after `_weaponDelay`.
+    // Only a real weapon swing echoes — an echo cannot echo itself, and a spell is
+    // not a weapon.
+    if resolved.source == super::state::DamageSource::Attack
+        && combat.fighters[attacker_slot].echo_until.is_some_and(|t| now < t)
+    {
+        let f = &combat.fighters[attacker_slot];
+        let (bonus, delay) = (f.echo_bonus, f.echo_delay);
+        if bonus > 0.0 {
+            combat.pending_echoes.push(super::state::PendingEcho {
+                sender: attacker_slot,
+                target: target_slot,
+                damage: bonus,
+                due: now + Duration::from_secs_f32(delay),
+            });
+        }
+    }
+
     // REFLECTING BASH: send part of what just landed back at the attacker, capped by
     // the remaining budget. Placed beside Revenge because it is the same shape — a
     // defender dealing damage back outside its own swing — and so shares its frame.
@@ -4166,6 +4390,7 @@ pub fn on_tick(combat: &mut MatchCombat, now: Instant, debug_hold: bool) -> Vec<
     // the bot's turn, so a swing thrown last tick resolves in the order it would have
     // if it had landed instantly (tracker #21).
     out.extend(land_due_hits(combat, now));
+    out.extend(land_due_echoes(combat, now));
     out.extend(land_due_impacts(combat, now));
     if matches!(combat.phase, FlowState::RoundEnd | FlowState::NextState) {
         // A landing blow just ended the round.
@@ -7286,7 +7511,7 @@ mod shipped_effects_tests {
         let mut c = combat2(now);
         let u = uuid_of("Thunderstorm");
         let out = apply_ability_impact(
-            &mut c, 0, 1, u, 1, super::super::state::AbilityTag::Damage, now,
+            &mut c, 0, 1, u, 1, super::super::state::AbilityTag::Damage, false, now,
         );
         assert!(!out.is_empty(), "the first bolt lands immediately");
         let ch = c.channels.iter().find(|ch| ch.ability_uuid == u).expect("bolts scheduled");
@@ -9136,6 +9361,7 @@ mod report_31_high_block_stun {
             level: 2,
             tag: AbilityTag::Paralyze,
             due: t0 + Duration::from_millis(1500),
+                    magicka_full_at_cast: false,
         });
 
         c.reset_fighters_for_next_round(t0 + Duration::from_secs(1));
