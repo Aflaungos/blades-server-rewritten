@@ -984,6 +984,9 @@ impl MatchInstance {
                     // The whole progression has been emitted (last state = InRound(13));
                     // the client is now in the combat scene. Enter the live round.
                     info!("combat FSM: BackendMatchCreated → StateTimeout (InRound reached — round 1 live)");
+                    // Round 1 is a round start too: charge the first-use delays before
+                    // anyone can act, or the opener is ungated exactly as round 2 was.
+                    self.combat.charge_initial_cooldowns(now);
                     self.combat.phase = FlowState::StateTimeout;
                     self.combat.phase_entered = now;
                     self.last_heartbeat = now;
@@ -1155,6 +1158,9 @@ impl MatchInstance {
                         // went out (broadcast_match_state above).
                         if is_inround {
                             self.combat.reset_fighters_for_next_round(now);
+                            // That reset CLEARS the cooldown map, so the initial
+                            // cooldowns have to be charged again for the new round.
+                            self.combat.charge_initial_cooldowns(now);
                             self.combat.phase = FlowState::StateTimeout;
                             self.combat.phase_entered = now;
                             self.last_heartbeat = now;

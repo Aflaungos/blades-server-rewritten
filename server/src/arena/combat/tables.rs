@@ -404,6 +404,17 @@ pub fn ability_cooldown_secs(ability_uuid: &str, rank: u8) -> Option<f32> {
     gamedata::ability_rank_clamped(ability_uuid, rank.max(1) as u16)?.cooldown
 }
 
+/// The shipped **initial** cooldown (seconds) for an ability at `rank`, if any.
+///
+/// `ActiveAbility._initialCooldown` ("cooldown charged at the start of a fight",
+/// `dump.cs:607776`) is the first-use delay charged when a round goes live — it is
+/// NOT the between-cast `_cooldown`. 43 arena abilities ship one, from 0.5 s
+/// (Lightning Bolt) to 10.5 s (Reckless Fury); see
+/// `docs/arena-cooldowns-authoritative.md`.
+pub fn ability_initial_cooldown_secs(ability_uuid: &str, rank: u8) -> Option<f32> {
+    gamedata::ability_rank_clamped(ability_uuid, rank.max(1) as u16)?.initial_cooldown
+}
+
 /// Direct-hit damage for an ability rank, from the shipped `_damage`.
 /// `None` when the rank defines no `_damage` (buffs, wards, perks).
 pub fn ability_damage(ability_uuid: &str, rank: u8) -> Option<f32> {
