@@ -1084,6 +1084,33 @@ fn stun_the_blocked_attacker(
     // send is in the opposite order to every one retail sent.
     out.extend(drain_state_changes_for(combat, now, Some(attacker_slot)));
 
+    // POWERFUL BLOCK. If the blocker's gear carries it, the attacker they just
+    // stunned also takes `StaggeredWeakness` — "Target stunned by a blocked attack
+    // takes {0} extra damage while stunned".
+    //
+    // The attacker HOLDS the status and it amplifies damage they TAKE (the client
+    // registers it on `_weaknessSources`, read in the incoming-damage path; a matched
+    // control over 36 samples shows exactly +0.0 when the holder is the one dealing).
+    // It ships NO duration of its own — every captured op51 carries 0.0 — and is
+    // removed with the Staggered that produced it.
+    let weakness = combat.fighters[blocker_slot].loadout.powerful_block;
+    if weakness > 0.0 {
+        combat.fighters[attacker_slot].weakness_rating = weakness;
+        info!(
+            "combat: slot {attacker_slot} takes STAGGERED WEAKNESS +{weakness:.2} from \
+             slot {blocker_slot}'s Powerful Block"
+        );
+        let wframe = messages::change_combat_status_effect(
+            obj,
+            true,
+            StatusEffectType::StaggeredWeakness,
+            0.0,
+        );
+        for v in 0..viewers {
+            out.push((v, wframe.clone()));
+        }
+    }
+
     let frame =
         messages::change_combat_status_effect(obj, true, StatusEffectType::Staggered, secs);
     for v in 0..viewers {
