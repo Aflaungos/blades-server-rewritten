@@ -2440,8 +2440,19 @@ fn apply_shipped_effects(
             });
             let obj = combat.fighters[caster].net_object_id;
             info!("combat: slot {caster} dodge pool +{cap:.1} ({ability_uuid})");
+            // The apply carries the dodge's own duration, not 0.
+            //
+            // Retail is unambiguous: of 405 captured `Dodging` (12) op51 frames,
+            // all 204 APPLIES carry duration 1.0 and all 201 REMOVES carry -0.0.
+            // We sent 0.0 on the apply, so the client was told the dodge lasts no
+            // time — and since we never send the remove either, its indicator has
+            // nothing to clear on.
+            //
+            // `expires` above already bounds the pool server-side; this is the
+            // client being told the same thing.
+            let announced = dodge_secs.unwrap_or(0.0);
             let frame = messages::change_combat_status_effect(
-                obj, true, StatusEffectType::Dodging, 0.0,
+                obj, true, StatusEffectType::Dodging, announced,
             );
             for v in 0..viewers {
                 out.push((v, frame.clone()));
@@ -7886,6 +7897,70 @@ mod shipped_effects_tests {
         assert!(pools[0].remaining > 0.0, "the shipped cap must be positive");
         // Dodging (12) is a pinned status id, so this one DOES get an op51 — to both.
         assert_eq!(out.len(), 2, "op51 Dodging to both viewers");
+    }
+
+    /// The op51 apply must carry the dodge's own duration, not 0.
+    ///
+    /// Measured, and unambiguous: of 405 captured `Dodging` (12) op51 frames,
+    /// **all 204 applies carry duration 1.0** and all 201 removes carry -0.0. We
+    /// sent 0.0 on the apply, so the client was told the dodge lasts no time at
+    /// all. The pool was already bounded server-side; this is the client being
+    /// told the same thing.
+    ///
+    /// Report #113 asked what a dodge looks like from our side. This is the half
+    /// the player can actually see.
+    #[test]
+    fn the_dodge_status_announces_its_shipped_duration() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        let u = uuid_of("DodgingStrike");
+        let out = apply_shipped_effects(&mut c, 0, 1, u, 1, 500.0, 0, now);
+
+        // op51 layout: propId 4 apply, 5 status, 6 duration (messages.rs).
+        let durations: Vec<f32> = out
+            .iter()
+            .filter(|(_, f)| messages::user_message_gmid(f) == Some(51))
+            .filter_map(|(_, f)| {
+                let nd = arena_proto::parse_netdata(&f[2..]);
+                let status = nd.int(5)?;
+                if status != StatusEffectType::Dodging as i64 {
+                    return None;
+                }
+                match nd.get(6) {
+                    Some(arena_proto::NetDataValue::Float(v)) => Some(*v),
+                    _ => None,
+                }
+            })
+            .collect();
+        assert!(!durations.is_empty(), "an op51 Dodging must be emitted");
+        for d in &durations {
+            assert!(
+                (*d - 1.0).abs() < 1e-3,
+                "retail announces 1.0 on every one of 204 captured applies, got {d}"
+            );
+        }
+    }
+
+    /// The control: the pool's server-side expiry must still match what is
+    /// announced, so the client and the server disagree about nothing. A fix that
+    /// only changed the wire number would leave the two out of step.
+    #[test]
+    fn the_announced_duration_matches_the_pool_expiry() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        let u = uuid_of("DodgingStrike");
+        apply_shipped_effects(&mut c, 0, 1, u, 1, 500.0, 0, now);
+        let pool = &c.fighters[0].negation_pools[0];
+
+        // Alive just inside the window, gone just outside it.
+        assert!(pool.expires_at > now + Duration::from_millis(900));
+        assert!(pool.expires_at < now + Duration::from_millis(1_100));
+
+        c.fighters[0].prune_negation_pools(now + Duration::from_millis(1_500));
+        assert!(
+            c.fighters[0].negation_pools.is_empty(),
+            "the dodge window must close a second after it opened"
+        );
     }
 
     /// The three *Armor spells get a real shield. No op51: the elemental-armor status
