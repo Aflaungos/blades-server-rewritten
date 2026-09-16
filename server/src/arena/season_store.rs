@@ -329,23 +329,61 @@ pub async fn freeze_standings(
 /// frozen rather than from `guilds.trophies` — the guild row is a running
 /// total that the rollover does not reset, so using it would carry last
 /// season's score into this one's result.
+/// A guild member's share of their own trophies, by their rank INSIDE the guild.
+///
+/// Retail does not sum a guild's members flat — it weights them by standing, so a
+/// guild is carried by its strongest four and a tail of low-trophy members adds
+/// almost nothing. Guilds cap at 20 players (`UI.Help.Guilds.Description`), which is
+/// exactly the five brackets below.
+///
+/// **Measured**, not assumed. Pairing captured `guilds/leaderboard` scores against
+/// the arena leaderboard snapshot taken at the same moment (`arena_leaderboard_
+/// snapshots`, which carries each ranked player's `cups` and `guild_name`), over the
+/// 12 observations where at most 3 of a guild's members sat below the top-100 board:
+///
+/// | | exact | within 2% |
+/// | --- | --- | --- |
+/// | this table | 1 | **10 / 12** |
+/// | flat sum | 0 | **0 / 12** |
+///
+/// Shadowblades with 18 of 20 members on the board reported **2833** against 2833.2
+/// from this table, and 12,507 from a flat sum. The residuals on the rest are tens of
+/// trophies against totals of 3–5k, and they track how many members were missing from
+/// the board — which is what an undercount of the 10% tail looks like.
+const GUILD_MEMBER_WEIGHT: [f64; 20] = [
+    0.30, 0.30, 0.30, 0.30, // ranks 1-4
+    0.25, 0.25, 0.25, 0.25, // ranks 5-8
+    0.20, 0.20, 0.20, 0.20, // 9-12
+    0.15, 0.15, 0.15, 0.15, // 13-16
+    0.10, 0.10, 0.10, 0.10, // 17-20
+];
+
 pub fn guild_standings_from(season_id: Uuid, standings: &[StandingRow]) -> Vec<GuildStandingRow> {
-    let mut totals: HashMap<&str, (i64, i32)> = HashMap::new();
+    // Collect each guild's member trophies, then weight them by rank WITHIN the guild.
+    let mut members: HashMap<&str, Vec<i64>> = HashMap::new();
     for s in standings {
         if let Some(g) = s.guild_id.as_deref() {
-            let e = totals.entry(g).or_insert((0, 0));
-            e.0 += s.trophies;
-            e.1 += 1;
+            members.entry(g).or_default().push(s.trophies);
         }
     }
-    let mut rows: Vec<GuildStandingRow> = totals
+    let mut rows: Vec<GuildStandingRow> = members
         .into_iter()
-        .map(|(g, (trophies, members))| GuildStandingRow {
-            season_id,
-            guild_id: g.to_string(),
-            rank: 0,
-            trophies,
-            members,
+        .map(|(g, mut trophies)| {
+            let count = trophies.len() as i32;
+            // Highest first: the weight is for the member's standing in the guild.
+            trophies.sort_unstable_by(|a, b| b.cmp(a));
+            let score: f64 = trophies
+                .iter()
+                .zip(GUILD_MEMBER_WEIGHT.iter())
+                .map(|(t, w)| *t as f64 * w)
+                .sum();
+            GuildStandingRow {
+                season_id,
+                guild_id: g.to_string(),
+                rank: 0,
+                trophies: score.round() as i64,
+                members: count,
+            }
         })
         .collect();
     // Ties broken by guild id so two runs of the same data produce the same
@@ -463,21 +501,65 @@ mod tests {
     }
 
     #[test]
-    fn guild_ladder_sums_members_not_the_guild_row() {
-        let a = Uuid::new_v4();
-        let b = Uuid::new_v4();
-        let c = Uuid::new_v4();
+    fn guild_ladder_weights_members_by_rank_not_a_flat_sum() {
+        let g1 = Uuid::nil();
         let st = vec![
-            standing(a, 1, 100, Some("g1")),
-            standing(b, 2, 60, Some("g2")),
-            standing(c, 3, 50, Some("g1")),
+            standing(Uuid::from_u128(1), 1, 100, Some("g1")),
+            standing(Uuid::from_u128(2), 2, 50, Some("g1")),
+            standing(Uuid::from_u128(3), 3, 10, None),
         ];
-        let g = guild_standings_from(Uuid::nil(), &st);
-        assert_eq!(g.len(), 2);
+        let g = guild_standings_from(g1, &st);
+        assert_eq!(g.len(), 1, "the guildless character forms no guild");
         assert_eq!(g[0].guild_id, "g1");
-        assert_eq!(g[0].trophies, 150, "must sum its members");
         assert_eq!(g[0].members, 2);
-        assert_eq!(g[1].guild_id, "g2");
+        // Both sit in the top-4 bracket: 30% each. A flat sum would say 150.
+        assert_eq!(g[0].trophies, 45, "0.30*100 + 0.30*50 = 45, not the flat 150");
+    }
+
+    /// The bracket boundaries, walked one member at a time.
+    ///
+    /// 20 members of 100 trophies each: 4x30 + 4x25 + 4x20 + 4x15 + 4x10 = 400.
+    /// A flat sum would be 2000 — the 5x that made the flat rule obvious in the
+    /// captures.
+    #[test]
+    fn the_five_brackets_cover_exactly_twenty_members() {
+        let st: Vec<StandingRow> = (0..20)
+            .map(|i| standing(Uuid::from_u128(i + 1), i as i32 + 1, 100, Some("g1")))
+            .collect();
+        let g = guild_standings_from(Uuid::nil(), &st);
+        assert_eq!(g[0].members, 20);
+        assert_eq!(g[0].trophies, 400, "4x(30+25+20+15+10) of 100 = 400");
+    }
+
+    /// Rank is by TROPHIES inside the guild, so the order rows arrive in cannot
+    /// change the score — otherwise a guild's total would depend on the ladder's
+    /// tie-breaking.
+    #[test]
+    fn the_weighting_follows_trophies_not_arrival_order() {
+        let asc = vec![
+            standing(Uuid::from_u128(1), 9, 10, Some("g1")),
+            standing(Uuid::from_u128(2), 8, 900, Some("g1")),
+        ];
+        let desc = vec![
+            standing(Uuid::from_u128(2), 8, 900, Some("g1")),
+            standing(Uuid::from_u128(1), 9, 10, Some("g1")),
+        ];
+        let a = guild_standings_from(Uuid::nil(), &asc);
+        let b = guild_standings_from(Uuid::nil(), &desc);
+        assert_eq!(a[0].trophies, b[0].trophies);
+        assert_eq!(a[0].trophies, 273, "0.30*900 + 0.30*10");
+    }
+
+    /// A 21st member would fall off the table; guilds cap at 20, but the score must
+    /// not panic or start reading past the array if a stale row ever says otherwise.
+    #[test]
+    fn a_guild_over_twenty_members_ignores_the_overflow() {
+        let st: Vec<StandingRow> = (0..25)
+            .map(|i| standing(Uuid::from_u128(i + 1), i as i32 + 1, 100, Some("g1")))
+            .collect();
+        let g = guild_standings_from(Uuid::nil(), &st);
+        assert_eq!(g[0].members, 25, "the count still reports what was there");
+        assert_eq!(g[0].trophies, 400, "but only 20 members are weighted");
     }
 
     /// Two runs over the same ladder must produce the same guild order, or the
