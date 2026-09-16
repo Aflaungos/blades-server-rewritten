@@ -149,35 +149,49 @@ pub fn fallback_swing_interval(weight: Weight) -> std::time::Duration {
 // Combo ramp (capture-pinned — NOT shipped data)
 // ---------------------------------------------------------------------------
 
-/// The **capture-pinned** Light-weapon combo ramp, indexed by chain depth (0 = the
-/// fresh post-reset swing): the s506 recorded per-depth Slashing factors against the
-/// combo-0 base (`docs/arena-combat-reproduction-spec.md` §2a/§4.2). The ramp is
-/// **irregular** (step ratios 1.45 / 1.03 / 1.77 / 1.55), so it is an explicit table
-/// rather than a geometric series.
-pub const LIGHT_COMBO_RAMP: [f32; 5] = [1.00, 1.45, 1.50, 2.65, 4.12];
-/// The recorded Light combo ceiling (×4.12, seq 452).
+/// The Light-weapon combo ramp, indexed by chain depth (0 = the fresh post-reset
+/// swing).
 ///
-/// **LEFT AT 4.12 DELIBERATELY, and it is disputed.** A 2026-09-16 measurement of
-/// the retail corpus (281 distinct light attacks over 15 sessions) puts the light
-/// ramp at 1.00 / 1.88 / 2.23 / 1.97 / 1.29 — peaking at depth 2 and falling, never
-/// near 4.12. The same analysis found that the s506 series this table came from is
-/// damage Flappety *received*, dealt by an opponent wielding Serpentstrike, a
-/// **VERSATILE** weapon — so the "light" ramp may be calibrated off the wrong class
-/// entirely. Its indices (0/1/3/4) also disagree with the wire comboCount for those
-/// same values (0/1/1/2).
+/// **Was `[1.00, 1.45, 1.50, 2.65, 4.12]`. That table was wrong on three independent
+/// counts**, all established 2026-09-16 by re-deriving it from the raw s506 capture
+/// rather than from the spec document that quoted it:
 ///
-/// It is NOT changed here because the two pieces of evidence genuinely conflict and
-/// the s506 series is reproduced EXACTLY by this table
-/// (`s506_combo_ramp_reproduces_recorded_slashing`: 113.82 / 165.07 / 301.79 /
-/// 469.30). Lowering the cap breaks that reproduction, and a corpus median cannot
-/// simply overrule a directly reproduced chain — the disagreement means one of the
-/// two is mislabelled, and which one is not yet established.
+/// 1. **Wrong fighter.** The series was read as damage Flappety DEALT. Every one of
+///    the four events carries `netObjectId = 124`, and `netObjectId` is the VICTIM:
+///    cross-tabulating the `wasOptimalBlocking` flag against blocking intervals built
+///    from op51 gives 190/200 set-and-blocking with a perfect 0/970 control, and the
+///    attacker reading is refuted 0/200. Object 124 is Flappety (bound two ways: a
+///    netRole-3 Autonomous avatar carrying their char UUID, and the c2s input
+///    messages, which exist only on 124). So **Blank dealt this chain**, with gear
+///    that is not in our data — no `blades_alt_equipment` row, no
+///    `arena_session_loadout` row, and a full UUID harvest over every s506 packet
+///    returns zero item templates (control: both char UUIDs *are* found). The "light"
+///    label never had a basis.
+/// 2. **Wrong index.** The wire `comboCount` (propId 9) for the four values is
+///    **0 / 1 / 1 / 2**, not 0/1/3/4.
+/// 3. **Confounded magnitude.** 2.65 and 4.12 are the StaggeredWeakness-amplified
+///    combo-1 and combo-2 divided by the UN-amplified combo-0. Plain `Staggered` does
+///    not amplify (seq 277/287 reproduce 113.82/165.07 exactly); `StaggeredWeakness`
+///    does. They were never combo factors.
 ///
-/// Note that removing the combo×charge compounding (see `swing_components`) already
-/// cuts a full-charge deep light chain by 24.5% (×5.459 → ×4.12) WITHOUT touching
-/// this number. Resolving the provenance question is its own task; see
-/// docs/UNFIXED-ERRORS.md.
-pub const LIGHT_COMBO_CAP: f32 = 4.12;
+/// The replacement is depth-1 from the one clean, twice-replicated, zero-status wire
+/// measurement (113.82 → 165.07 = ×1.4502), and depths 2-4 from within-chain corpus
+/// medians over 95 retail sessions — 368 chains, 40 sessions, 184 distinct fighters,
+/// deduped and gated on constant status, no dodge/ward/absorb, and no
+/// StaggeredWeakness. Within-chain means base, armour, weapon and defender are
+/// constant by construction.
+///
+/// CONFIDENCE, stated because it is uneven: **high** that 4.12 had to go and that the
+/// cap belongs near 2.3; **medium** on 1.45 at depth 1; **low** on depths 2-4, where
+/// n falls to 86 / 17 / 5 after controls. The table is also now effectively
+/// class-agnostic — the corpus cannot separate weapon classes today, because the only
+/// class channel is a September equipment snapshot and gating June chains on it
+/// rejects 45% of them. Recovering contemporaneous equipment from the 179 inventory
+/// and 7,257 character bodies we already hold is the single blocking step for a real
+/// per-class ramp.
+pub const LIGHT_COMBO_RAMP: [f32; 5] = [1.00, 1.45, 1.75, 1.78, 2.30];
+/// The Light combo ceiling — the depth-4 within-chain corpus median.
+pub const LIGHT_COMBO_CAP: f32 = 2.30;
 
 /// The combo multiplier for a normal swing at chain depth `count` (0 = fresh).
 pub fn combo_factor(weight: Weight, count: u32) -> f32 {
@@ -551,18 +565,33 @@ mod tests {
         assert_eq!(enchant_damage(POISON, 3), None);
     }
 
-    /// The Light combo ramp reproduces the s506 recorded per-depth anchors.
+    /// The Light combo ramp.
+    ///
+    /// Only depth 0 and depth 1 are pinned to a recorded wire value — they are the two
+    /// clean, zero-status, replicated s506 events. Depths 2-4 are within-chain corpus
+    /// medians with n = 86 / 17 / 5, so they are asserted as a SHAPE (monotonic, under
+    /// the cap) rather than as exact anchors we do not have the evidence to defend.
+    ///
+    /// This test used to assert 1.50 / 2.65 / 4.12 at depths 2/3/4. Those came from a
+    /// circular row and two StaggeredWeakness-amplified events that the wire indexes
+    /// as combo 1 and 2 — see the note on `LIGHT_COMBO_RAMP`.
     #[test]
-    fn light_combo_ramp_matches_s506() {
+    fn light_combo_ramp_is_pinned_at_its_measured_depths() {
         assert_eq!(combo_factor(Weight::Light, 0), 1.0);
-        assert!((combo_factor(Weight::Light, 1) - 1.45).abs() < 1e-3);
-        assert!((combo_factor(Weight::Light, 2) - 1.50).abs() < 1e-3);
-        assert!((combo_factor(Weight::Light, 3) - 2.65).abs() < 1e-3);
-        assert!((combo_factor(Weight::Light, 4) - 4.12).abs() < 1e-3);
-        assert_eq!(combo_factor(Weight::Light, 9), 4.12);
+        assert!(
+            (combo_factor(Weight::Light, 1) - 1.45).abs() < 1e-3,
+            "depth 1 is the one exactly-replicated wire measurement (113.82 -> 165.07)"
+        );
+        // Shape, not anchors: monotonic and capped.
         for c in 0..8 {
             assert!(combo_factor(Weight::Light, c + 1) >= combo_factor(Weight::Light, c));
+            assert!(combo_factor(Weight::Light, c) <= LIGHT_COMBO_CAP);
         }
+        assert_eq!(combo_factor(Weight::Light, 9), LIGHT_COMBO_CAP);
+        assert!(
+            LIGHT_COMBO_CAP < 3.0,
+            "the old 4.12 ceiling was a status amplifier, not a combo factor"
+        );
     }
 
     #[test]

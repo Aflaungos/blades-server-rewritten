@@ -819,6 +819,26 @@ pub struct Loadout {
     /// The MAGNITUDE now lives in [`Self::enchant_damage`] — the shipped `_value`
     /// curve is per-family and convex, so `tier` alone cannot produce it.
     pub enchants: Vec<(DamageType, u8)>,
+    /// Every equipped item PROPERTY id, one entry per occurrence, across ALL equipped
+    /// items — weapon, armour, jewellery alike.
+    ///
+    /// This is what **Enchantment Synergy** actually keys on. Disassembled:
+    /// `ItemPropertyBonusInstance::GetXValueMultiplier` calls
+    /// `ActorBonusHandler.HasMatchingItemBonus(propertyId)`, which walks
+    /// `_bonusesByItem` across every equipped item and returns `matchCount > 1`. So
+    /// "stacked" means **two or more copies of the SAME specific property**, counted
+    /// actor-wide — not two enchants of the same element, and not per item.
+    ///
+    /// We keyed it on `DamageType` and looked only at the weapon's own enchant list,
+    /// which was wrong in both directions at once: "Weapon Fire Damage" plus "Fortify
+    /// Fire Damage" counted as stacked when they are different properties, while two
+    /// genuinely identical properties on a helmet and a cuirass counted as nothing.
+    pub property_ids: Vec<uuid::Uuid>,
+    /// The property id behind each entry of [`Loadout::enchants`], positionally
+    /// aligned. Kept beside `enchants` rather than folded into it so the many test
+    /// fixtures that build `enchants` directly keep working; an empty vector simply
+    /// means "no synergy information", never "not stacked".
+    pub enchant_property_ids: Vec<uuid::Uuid>,
     /// Attacker-side **Armor Piercing Rating**
     /// (`ArmorPiercingPhysicalPropertyLogic`) — subtracted from the defender's
     /// Armor Rating before the physical reduction. [Phase 3.3]

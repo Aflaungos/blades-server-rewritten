@@ -470,13 +470,35 @@ impl RetailDamageModel {
             0.0
         };
         let mut edoc_left = edoc;
-        for (ench_ty, magnitude) in enchant_tracks(attacker) {
+        for (idx, (ench_ty, magnitude)) in enchant_tracks(attacker).into_iter().enumerate() {
             // Fortify is a FLAT add and is paid once per hit in `finish_resolved`
             // step 0, alongside the Augmented* perks it shares its shape with — not
             // as a multiplier here, and not once per enchant track.
             let amp = target.element_amp_for(ench_ty);
+            // ENCHANTMENT SYNERGY — "Stacked enchantments are {0}% more effective."
+            //
+            // "Stacked" means TWO OR MORE COPIES OF THE SAME SPECIFIC PROPERTY,
+            // counted across every equipped item. Disassembled:
+            // `ItemPropertyBonusInstance::GetXValueMultiplier` gates the bonus on
+            // `ActorBonusHandler.HasMatchingItemBonus(propertyId)`, which walks
+            // `_bonusesByItem` over all items and ends `cmp w22, 1; cset w0, gt` —
+            // i.e. `matchCount > 1`. The perk itself is an 8-byte field read that
+            // counts nothing, so every "stacked" semantic lives here.
+            //
+            // We used to count enchants of the same DAMAGE TYPE on the weapon alone,
+            // which was wrong twice over: "Weapon Fire Damage" and "Fortify Fire
+            // Damage" are different properties and were counting as stacked, while
+            // two identical properties on a helmet and a cuirass counted as nothing.
+            //
+            // It is also a BINARY gate, not a scaling one — two copies and five copies
+            // both give `1 + bonusValue`.
             let stacked = synergy > 0.0
-                && attacker.enchants.iter().filter(|(t, _)| *t == ench_ty).count() > 1;
+                && attacker
+                    .enchant_property_ids
+                    .get(idx)
+                    .is_some_and(|id| {
+                        attacker.property_ids.iter().filter(|p| *p == id).count() > 1
+                    });
             let synergy_mult = if stacked { 1.0 + synergy } else { 1.0 };
             let mut v = magnitude * amp * synergy_mult;
             // Once per swing, on the first elemental track, mirroring PDOC.
@@ -1150,7 +1172,14 @@ mod tests {
         // Un-armored: the raw tempered base of 144.0.
         assert!((comp(&c0, DamageType::Slashing) - 144.0).abs() < 0.5);
         assert!((comp(&c1, DamageType::Slashing) - 144.0 * 1.45).abs() < 0.5);
-        assert!((comp(&c4, DamageType::Slashing) - 144.0 * 4.12).abs() < 1.0);
+        assert!(
+            (comp(&c4, DamageType::Slashing)
+                - 144.0 * super::tables::combo_factor(super::tables::Weight::Light, 4))
+            .abs()
+                < 1.0,
+            "depth-4 physical follows the ramp table rather than a literal, so a \
+             recalibration cannot leave this test asserting a stale constant"
+        );
         // The enchant track is combo-independent.
         assert!((comp(&c0, DamageType::Poison) - comp(&c1, DamageType::Poison)).abs() < 1e-3);
         assert!((comp(&c4, DamageType::Poison) - comp(&c0, DamageType::Poison)).abs() < 1e-3);
