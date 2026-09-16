@@ -136,54 +136,33 @@ const RANKED_CTE: &str = "
         ORDER BY starts_at DESC
         LIMIT 1
     ),
-    season_deltas AS (
+    season_wins AS (
         SELECT r.character_id,
-               r.recorded_at,
-               r.id,
-               (SUM(r.trophy_delta) OVER (
-                   PARTITION BY r.character_id
-                   ORDER BY r.recorded_at, r.id
-                   ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-               ))::bigint AS raw_score,
-               COUNT(*) FILTER (WHERE r.win) OVER (PARTITION BY r.character_id) AS wins,
-               ROW_NUMBER() OVER (
-                   PARTITION BY r.character_id ORDER BY r.recorded_at DESC, r.id DESC
-               ) AS latest
+               COUNT(*) FILTER (WHERE r.win) AS wins
         FROM arena_match_results r
         JOIN active_season s
-         ON r.recorded_at >= to_timestamp(s.starts_at)
+          ON r.recorded_at >= to_timestamp(s.starts_at)
          AND r.recorded_at < to_timestamp(s.cutoff)
-    ),
-    season_matches AS (
-        SELECT character_id,
-               raw_score - LEAST(
-                   0,
-                   MIN(raw_score) OVER (
-                       PARTITION BY character_id
-                       ORDER BY recorded_at, id
-                       ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
-                   )
-               ) AS score,
-               wins,
-               latest
-        FROM season_deltas
+        GROUP BY r.character_id
     ),
     ranked AS (
         SELECT c.id,
                c.user_id,
                COALESCE(c.character ->> 'name', '') AS name,
                g.name AS guild_name,
-               m.score,
+               COALESCE((c.character ->> 'pvpTrophies')::bigint, 0) AS score,
                COALESCE((c.character ->> 'pvpWinningStreak')::bigint, 0) AS streak,
-               m.wins,
+               COALESCE(w.wins, 0) AS wins,
                ROW_NUMBER() OVER (
-                   ORDER BY m.score DESC, m.wins DESC, c.id
+                   ORDER BY COALESCE((c.character ->> 'pvpTrophies')::bigint, 0) DESC,
+                            COALESCE(w.wins, 0) DESC,
+                            c.id
                ) AS rank
-        FROM season_matches m
-        JOIN characters c ON c.id = m.character_id
+        FROM characters c
+        LEFT JOIN season_wins w ON w.character_id = c.id
         LEFT JOIN guild_members gm ON gm.character_id = c.id
         LEFT JOIN guilds g ON g.id = gm.guild_id
-        WHERE m.latest = 1
+        WHERE COALESCE((c.character ->> 'pvpTrophies')::bigint, 0) > 0
     )
 ";
 
@@ -362,6 +341,71 @@ mod tests {
         };
         let v2: serde_json::Value = serde_json::to_value(&no_player).unwrap();
         assert!(v2.get("playerEntry").is_none());
+    }
+
+    /// The board must show the SAME number the player sees on their own screen.
+    ///
+    /// It did not. The board RECONSTRUCTED each score by summing
+    /// `arena_match_results.trophy_delta` over the season and then applying a
+    /// single retroactive zero-floor:
+    ///
+    /// ```sql
+    /// raw_score - LEAST(0, MIN(raw_score) OVER (...))
+    /// ```
+    ///
+    /// The live counter in `arena_economy` clamps at zero on EVERY match
+    /// (`(pre + delta).max(0)`), discarding each shortfall as it happens. Two
+    /// different algorithms for one number, and they disagree for anyone who has
+    /// ever bottomed out.
+    ///
+    /// Measured on production before the change (character 30581f3e, Flappety):
+    /// 126 season matches, deltas summing to 426, running minimum -123. The board
+    /// served 426 - (-123) = 549 while his screen showed 534. Worse, the board's
+    /// rank 1 "Deathbell" showed 725 against 321 actually held, and the highest
+    /// scorer on the server (1061) was absent entirely — a character with trophies
+    /// but no match rows this season never reached the reconstruction at all.
+    ///
+    /// This is a SOURCE assertion, and deliberately so: the projection is raw SQL
+    /// and the tests in this module have no database. It cannot prove the query
+    /// returns the right rows — the production measurement above does that — but
+    /// it does catch a silent revert to the reconstruction.
+    #[test]
+    fn the_board_scores_from_the_player_s_own_trophy_count() {
+        assert!(
+            RANKED_CTE.contains("c.character ->> 'pvpTrophies'"),
+            "score must come from the character's live trophy count"
+        );
+        assert!(
+            !RANKED_CTE.contains("trophy_delta"),
+            "the board must not reconstruct scores from match history: {RANKED_CTE}"
+        );
+        assert!(
+            !RANKED_CTE.contains("raw_score"),
+            "the retroactive zero-floor reconstruction must not come back"
+        );
+    }
+
+    /// Wins are still season-scoped, and a character with NO matches this season
+    /// still appears — with zero wins — rather than dropping off the board.
+    ///
+    /// That second half is the control: the obvious way to write this fix is to
+    /// keep the inner join to `arena_match_results`, which is exactly what hid the
+    /// server's highest scorer.
+    #[test]
+    fn wins_are_season_scoped_but_never_gate_membership() {
+        assert!(
+            RANKED_CTE.contains("LEFT JOIN season_wins"),
+            "wins must be a LEFT join — an inner join drops trophied characters \
+             who have not played this season"
+        );
+        assert!(
+            RANKED_CTE.contains("COALESCE(w.wins, 0)"),
+            "a character with no season matches must read as 0 wins, not NULL"
+        );
+        assert!(
+            RANKED_CTE.contains("active_season"),
+            "the win count is still scoped to the active season"
+        );
     }
 
     /// 890 entries at 100 per page is 9 pages — the exact arithmetic the captured
