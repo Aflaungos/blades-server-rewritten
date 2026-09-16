@@ -470,6 +470,9 @@ pub async fn update_loadout(
     let user_id = session.session.user_id;
     let character_id = path.into_inner();
     let body = body.into_inner();
+    // Cloned before the closure so the slot check can read game data inside it
+    // without borrowing `app_state` across the `conn` borrow (E0505).
+    let globals = app_state.get_ref().clone();
     let mut conn = app_state.db_pool.get().await.unwrap();
 
     conn.transaction(move |mut conn| {
@@ -482,6 +485,7 @@ pub async fn update_loadout(
                     &mut entry.inventory.0,
                     &body.equipment_updates,
                     &mut tracker,
+                    Some(&globals.game_data),
                 );
                 inventory_changed = true;
             }
