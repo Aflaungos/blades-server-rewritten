@@ -13,7 +13,14 @@ Weight-scaled — the shipped family carries three tables:
 
 | tier 10 | light | versatile | heavy |
 | --- | --- | --- | --- |
-| Ravage Stamina / Magicka | 31.66 | 42.00 | 52.66 |
+| Weapon Ravage Stamina / Magicka | 31.66 | 42.00 | 52.66 |
+| Weapon Ravage Health | 31.66 | **41.50** | 52.66 |
+
+Ravage Health's versatile column is 41.50, not 42.00 — the families are not
+interchangeable, so each is read from its own table.
+
+The **shield** families carry no weapon weight and ship a single curve: 52.66 at
+tier 10 for Stamina, Magicka and Health alike.
 
 Read with `gamedata::enchant_magnitude_for_weight`. Reading the base table for a
 versatile or heavy weapon under-reports by a quarter to a third.
@@ -47,7 +54,11 @@ magicka bar at all. Players who use this track the numbers in their heads.
 
 ## The model
 
-- Applied **per landed swing**, from the attacker's loadout onto the victim's maximum.
+- The **weapon** families apply **per landed swing**, from the attacker's loadout onto
+  the victim's maximum.
+- The **shield** families fire on the opposite event — *"on a blocked attack or Shield
+  Bash"* — and ravage whoever swung into the guard. They are held in a separate
+  `shield_ravage` list so the resolver cannot apply one as if it were the other.
 - Current pool is clamped down with the ceiling.
 - Scaled by the hit's **physical block factor**: a connected optimal block (physical
   x0) negates it, a late block takes a proportional bite. A dodged swing resolves no
@@ -64,8 +75,26 @@ swing's own physical factor is the assumption; it matches the owner's report tha
 high block modifies it and is the behaviour the tests pin. If a tester shows
 otherwise, `apply_ravage`'s `factor` argument is the single place to change.
 
-`RavageHealth` ships in the data and is deliberately **not** applied: max-Health is
-the arena's x3 pool and cutting it mid-round interacts with the death check.
+**Ravage Health** is applied on the same terms. The arena's x3 health cheat multiplies
+the POOL, not the effects acting on it, so the cut is flat against a tripled ceiling.
+The maximum is floored at 1: a zero maximum would make `wire_fraction` divide by zero
+and read as dead with nobody landing a blow. Ravage empties a pool, it does not
+execute.
+
+## Maximum Power
+
+Maximum Power requires a full magicka pool, and "full" is measured against the pool's
+TRUE ceiling (`max_magicka + ravaged_magicka`) — **so any Ravage Magicka landing in a
+round denies the perk for the rest of that round.**
+
+Measuring against the ravaged ceiling instead would let the victim refill to the
+reduced maximum and keep the perk, which inverts the counter: ravaging magicka is
+precisely how Maximum Power is denied in high play, where a Max-Power Ice Spike can
+stun through a Stahlrim shield.
+
+This is **not measurable from captures** — ravage is absent from the wire, so no
+session can show a ravaged caster's perk state. It follows the owner's reading, which
+the perk's own shipped text already agreed with ("if ravaged, then MP is void").
 
 ## Why it matters
 

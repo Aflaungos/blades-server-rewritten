@@ -342,11 +342,23 @@ fn apply_enchant(lo: &mut Loadout, id: &Uuid, tier: u8) {
         // 30 characters in the capture corpus carry Ravage Stamina and 24 Ravage
         // Magicka. Enough of it takes Reckless Fury (425 stamina) out of reach and
         // voids Maximum Power, which needs a FULL magicka pool.
-        "WeaponRavageStaminaPropertyLogic" | "ShieldRavageStaminaPropertyLogic" => {
-            push_ravage(lo, DamageType::Stamina, &uuid, tier)
+        // The WEAPON families ride a landed swing and ravage the victim.
+        "WeaponRavageStaminaPropertyLogic" => push_ravage(lo, DamageType::Stamina, &uuid, tier),
+        "WeaponRavageMagickaPropertyLogic" => push_ravage(lo, DamageType::Magicka, &uuid, tier),
+        "WeaponRavageHealthPropertyLogic" => push_ravage(lo, DamageType::Health, &uuid, tier),
+
+        // The SHIELD families fire on the opposite event — "on a blocked attack or
+        // Shield Bash" — so they ravage whoever swung INTO the guard. Same magnitude
+        // shape, opposite direction; kept in their own list so the resolver cannot
+        // apply one as if it were the other.
+        "ShieldRavageStaminaPropertyLogic" => {
+            push_shield_ravage(lo, DamageType::Stamina, magnitude)
         }
-        "WeaponRavageMagickaPropertyLogic" | "ShieldRavageMagickaPropertyLogic" => {
-            push_ravage(lo, DamageType::Magicka, &uuid, tier)
+        "ShieldRavageMagickaPropertyLogic" => {
+            push_shield_ravage(lo, DamageType::Magicka, magnitude)
+        }
+        "ShieldRavageHealthPropertyLogic" => {
+            push_shield_ravage(lo, DamageType::Health, magnitude)
         }
 
         // ---- elemental retaliation (Revenge) -------------------------------
@@ -474,6 +486,14 @@ fn push_ravage(lo: &mut Loadout, ty: DamageType, uuid: &str, tier: u8) {
     };
     if magnitude > 0.0 {
         lo.ravage.push((ty, magnitude));
+    }
+}
+
+/// A shield family carries one curve (no weapon weight), so the shared `magnitude`
+/// the dispatch already resolved is the right value.
+fn push_shield_ravage(lo: &mut Loadout, ty: DamageType, magnitude: f32) {
+    if magnitude > 0.0 {
+        lo.shield_ravage.push((ty, magnitude));
     }
 }
 

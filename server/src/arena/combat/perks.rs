@@ -306,7 +306,19 @@ impl<'a> CasterPerks<'a> {
     pub fn of(f: &'a super::state::Fighter) -> Self {
         CasterPerks {
             perks: &f.loadout.perks,
-            magicka_full: f.magicka >= f.max_magicka,
+            // Maximum Power needs a FULL magicka pool, and "full" means the pool's
+            // TRUE ceiling — `max_magicka + ravaged_magicka`, not the ceiling ravage
+            // has left behind. Once Ravage Magicka lands, the pool cannot reach it
+            // again inside that round, so the perk is void for the rest of the round.
+            //
+            // Comparing against the ravaged ceiling instead would let the victim
+            // refill to the reduced maximum and keep the perk, which is backwards:
+            // ravaging an opponent's magicka is precisely how Maximum Power is denied
+            // (a Max-Power Ice Spike can stun through a Stahlrim shield, and ravage is
+            // the counter). Not measurable from captures — ravage is absent from the
+            // wire entirely (docs/arena-ravage.md) — so this follows the owner's
+            // reading, which the perk's own shipped text already agreed with.
+            magicka_full: f.magicka >= f.max_magicka.saturating_add(f.ravaged_magicka),
             health_critical: health_is_critical(f.health, f.max_health),
             elem_resist_piercing: f.loadout.elem_resist_piercing,
             elem_resist_piercing_rating: f.loadout.elem_resist_piercing_rating,
