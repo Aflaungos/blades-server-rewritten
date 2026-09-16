@@ -131,12 +131,38 @@ async fn create_characters(
     body: web::Json<CharacterCreationRequest>,
 ) -> Result<web::Json<CharacterCreationResponse>, BladeApiError> {
     let session = session.get_session_or_error()?;
+    let created = build_starter_character(
+        &app_state,
+        session.session.user_id,
+        body.name.clone(),
+        body.0.data.customization,
+    )
+    .await
+    .map_err(|e| {
+        log::error!("character creation failed: {e}");
+        BladeApiError::new(actix_web::http::StatusCode::INTERNAL_SERVER_ERROR, 3, 0)
+    })?;
+    Ok(web::Json(created))
+}
 
+/// Build and persist one fresh character with retail's starter loadout.
+///
+/// Extracted from the POST route so the anonymous-login path can call it too.
+/// Our shipped APK has the FTUE patched out, so it never POSTs here: it asks
+/// for its characters, and if the list comes back empty it sits on the loading
+/// screen forever with every request answered 200. See
+/// [`ensure_starter_character`].
+pub(crate) async fn build_starter_character(
+    app_state: &ServerGlobal,
+    owner: Uuid,
+    name: String,
+    customization: serde_json::Value,
+) -> Result<CharacterCreationResponse, diesel::result::Error> {
     let mut new_character = CompleteCharacter::default();
-    new_character.name = body.name.clone();
+    new_character.name = name;
 
     let mut new_data = CompleteCharacterData::default();
-    new_data.customization = body.0.data.customization;
+    new_data.customization = customization;
 
     let character_uuid = Uuid::new_v4();
 
@@ -231,7 +257,7 @@ async fn create_characters(
 
     let to_insert = CharacterDbEntry {
         id: character_uuid,
-        user_id: session.session.user_id,
+        user_id: owner,
         character: JsonDbWrapper(new_character),
         data: JsonDbWrapper(new_data),
         wallet: JsonDbWrapper(CompleteWallet::default()),
@@ -240,23 +266,122 @@ async fn create_characters(
         town: None,
     };
 
-    let mut conn = app_state.db_pool.get().await.unwrap();
-    //TODO: convert error
-    //TODO: explicit no async commit (start a new transaction)
+    let mut conn = app_state
+        .db_pool
+        .get()
+        .await
+        .map_err(|_| diesel::result::Error::BrokenTransactionManager)?;
     insert_into(characters::table)
         .values(&to_insert)
         .execute(&mut conn)
-        .await
-        .unwrap();
+        .await?;
 
-    Ok(web::Json(CharacterCreationResponse {
+    Ok(CharacterCreationResponse {
         character: CompleteCharacterWithIdAndData {
             id: character_uuid,
             character: to_insert.character.0,
             data: to_insert.data.0,
         },
         inventory,
-    }))
+    })
+}
+
+/// Give a brand-new player a character if they have none.
+///
+/// WHY THIS EXISTS. Our shipped APK has the first-time-user experience patched
+/// out, so it never runs character creation. It logs in anonymously, asks for
+/// its characters, and on an empty list sits on the loading screen forever —
+/// with every single request answered 200, which is what makes it so hard to
+/// report. That is exactly what reports #155/#158 are: 40 login cycles from one
+/// device, each one `auth/anon` 200 → `sync` 200 → `characters` 200 with a
+/// 17-byte empty list, and never a request after it.
+///
+/// This was here before, and commit bb0ecc0 (upstream, 2026-09-04) removed it.
+/// That removal is right for a client that still has its FTUE and wrong for
+/// ours, and it left 118 of 282 accounts on prod with no character at all.
+///
+/// Best-effort on purpose: a failure here must never break the login itself,
+/// so the caller logs and carries on. `Ok(false)` means the player already had
+/// a character and nothing was done.
+pub(crate) async fn ensure_starter_character(
+    app_state: &ServerGlobal,
+    owner: Uuid,
+) -> Result<bool, diesel::result::Error> {
+    let mut conn = match app_state.db_pool.get().await {
+        Ok(c) => c,
+        Err(_) => return Ok(false),
+    };
+    let existing: i64 = {
+        use crate::schema::characters::dsl::*;
+        characters
+            .filter(user_id.eq(owner))
+            .count()
+            .get_result(&mut conn)
+            .await?
+    };
+    if existing > 0 {
+        return Ok(false);
+    }
+    drop(conn);
+
+    build_starter_character(
+        app_state,
+        owner,
+        STARTER_NAME.to_string(),
+        serde_json::Value::Object(serde_json::Map::new()),
+    )
+    .await?;
+    Ok(true)
+}
+
+/// The name a server-provisioned starter character is given. Players rename in
+/// game; this only has to be recognisable as "we made this for you".
+const STARTER_NAME: &str = "Adventurer";
+
+#[cfg(test)]
+mod starter_character_tests {
+    /// Every exit from `anon_log_in` must provision a starter character.
+    ///
+    /// The APK we ship has the FTUE patched out, so a player with no character
+    /// is never offered creation: the client asks for its characters, gets an
+    /// empty list, and sits on the loading screen forever with every request
+    /// answered 200. Reports #155/#158 are 40 such cycles from one device.
+    ///
+    /// This is a source assertion rather than a handler test because the
+    /// handler needs a database and a session, and the bug is precisely that
+    /// ONE path forgets the call. Counting them is what a compiler cannot do:
+    /// the previous version had it on two of the five, and adding a sixth exit
+    /// without the call is exactly how this regresses.
+    #[test]
+    fn every_anon_login_exit_provisions_a_character() {
+        let src = include_str!("authentification.rs");
+        let start = src
+            .find("async fn anon_log_in")
+            .expect("anon_log_in must exist");
+        let end = src[start..]
+            .find("\n#[cfg(test)]")
+            .map(|i| start + i)
+            .unwrap_or(src.len());
+        let body = &src[start..end];
+
+        let exits = body.matches("return Ok(web::Json(SessionResponse {").count();
+        let guards = body.matches("ensure_starter_character(&app_state").count();
+        assert!(exits > 0, "the function must still return a session");
+        assert_eq!(
+            guards, exits,
+            "every one of the {exits} anon-login exits must call \
+             ensure_starter_character; {guards} do",
+        );
+    }
+
+    /// The removal this restores was upstream commit bb0ecc0 (2026-09-04). It is
+    /// correct for a client that still has its FTUE and wrong for ours, and it
+    /// left 118 of 282 accounts on prod with no character. Pin the reason so a
+    /// future upstream merge does not quietly drop it again.
+    #[test]
+    fn the_starter_name_is_recognisable() {
+        assert_eq!(super::STARTER_NAME, "Adventurer");
+    }
 }
 
 #[cfg(test)]
