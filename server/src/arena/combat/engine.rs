@@ -666,13 +666,17 @@ impl MatchInstance {
             return out;
         }
 
-        // ConcedeMatch rides its own carrier byte (28), capture-pinned across
-        // 1,302 retail frames. A voluntary exit must enter the SAME terminal walk
-        // as a death/disconnect. Marking the match Finished here used to make the
-        // registry disconnect both peers before the client received
-        // BackendMatchEnd → Victory → PostMatch → DisconnectingPlayers; the exit
-        // dialog disappeared, but the player remained stranded in the arena.
-        if user_data.get(1) == Some(&(GameMessageId::ConcedeMatch as u8))
+        // ConcedeMatch — see [`messages::is_concede_match`] for the wire forms and
+        // why testing `user_data[1] == 28` alone never fired (report #153: the exit
+        // button did nothing, in any phase, because a real client frame carries the
+        // id inside carrier 0x36 rather than as a bare carrier byte).
+        //
+        // A voluntary exit must enter the SAME terminal walk as a death/disconnect.
+        // Marking the match Finished here used to make the registry disconnect both
+        // peers before the client received BackendMatchEnd → Victory → PostMatch →
+        // DisconnectingPlayers; the exit dialog disappeared, but the player remained
+        // stranded in the arena.
+        if messages::is_concede_match(user_data)
             && !matches!(self.combat.phase, FlowState::RoundEnd | FlowState::Finished)
         {
             return self.finish_by_concession(sender, now, "voluntary concede");
