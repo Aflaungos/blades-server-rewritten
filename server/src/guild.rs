@@ -2198,6 +2198,124 @@ struct CreateExchangeRequest {
     item_template_id: Uuid,
 }
 
+
+#[cfg(test)]
+mod exchange_amount_tests {
+    use super::*;
+
+    /// The amounts must come from the retail table, not a hardcoded 10/5. Asserted
+    /// differentially across several items so it cannot pass on a constant.
+    #[test]
+    fn exchange_amounts_are_item_specific() {
+        let u = |s: &str| uuid::Uuid::parse_str(s).unwrap();
+        // Transcendent Soul Gem: one, donated one at a time.
+        assert_eq!(exchange_amounts_for(u("d94bab85-53d5-4c9c-a637-acd94fc66c98")), (1, 1));
+        // Iron Ingot.
+        assert_eq!(exchange_amounts_for(u("55e82826-2d68-469c-8870-753665ca62cd")), (3, 1));
+        // Limestone — the big town-building material.
+        assert_eq!(exchange_amounts_for(u("fd67bbc6-20f4-44a3-9614-28265ebb8c67")), (50, 10));
+        // Honeycomb keeps the common 10/5.
+        assert_eq!(exchange_amounts_for(u("7116a2a8-ac2d-4cd9-8b7c-b80c397d3f50")), (10, 5));
+    }
+
+    /// An item retail never showed us falls back to the corpus's modal pair rather
+    /// than to something invented.
+    #[test]
+    fn an_unknown_item_falls_back_to_the_modal_pair() {
+        assert_eq!(
+            exchange_amounts_for(uuid::Uuid::nil()),
+            (10, 5),
+            "749 of 1,626 observed exchanges are 10/5"
+        );
+    }
+
+    /// Every mined row must be self-consistent: a donation cannot exceed the request,
+    /// and neither may be zero. Guards against a bad regeneration of the table.
+    #[test]
+    fn the_mined_table_is_self_consistent() {
+        for (t, req, max) in EXCHANGE_AMOUNTS {
+            assert!(*req > 0, "{t} requests {req}");
+            assert!(*max > 0, "{t} allows a {max} donation");
+            assert!(max <= req, "{t}: one donation ({max}) exceeds the whole request ({req})");
+            assert!(
+                uuid::Uuid::parse_str(t).is_ok(),
+                "{t} is not a uuid — the table was generated wrong"
+            );
+        }
+        assert_eq!(EXCHANGE_AMOUNTS.len(), 36, "36 templates were mined from retail");
+    }
+}
+
+/// Per-item guild-exchange amounts, `(itemTemplateId, requestedAmount, maxDonationAmount)`.
+///
+/// Every request used to be created with a hardcoded `requestedAmount: 10,
+/// maxDonationAmount: 5`, for every item. Retail did not work that way: mined from
+/// 1,626 exchange objects across 863 captured `guilds/current/exchanges` responses,
+/// there are **14 distinct (requested, maxDonation) pairs** over 36 item templates —
+/// 1/1 for a Transcendent Soul Gem, 3/1 for an Iron Ingot, 50/10 for Limestone.
+///
+/// `maxDonationAmount` is the size of ONE donation, not a number of donations
+/// required, and retail permits partial redemption (captures 9658→9659: a request
+/// for 10 got a single donation of 5, and the requester redeemed exactly 5).
+///
+/// Four templates were observed with more than one pair — Limestone, Lumber, Copper
+/// and Crystal, all town-building materials whose requests appear to scale. The modal
+/// pair is used; the alternatives are recorded here so the choice is visible:
+///   Limestone 50/10 (110 of 120; also 30/6, 10/2)
+///   Lumber    50/10 ( 97 of 118; also 40/8, 30/6, 10/2, 20/4)
+///   Copper    30/6  ( 50 of  75; also 24/5, 12/3)
+///   Crystal    2/1  (  9 of  13; also 3/1)
+const EXCHANGE_AMOUNTS: &[(&str, i64, i64)] = &[
+    ("4577fb2b-47f7-4112-b870-1479e2529b06", 10, 5), // Dragon Claw
+    ("05b4dd6b-796f-4088-a772-0e33ea3db976", 10, 5), // Frost Salts
+    ("7116a2a8-ac2d-4cd9-8b7c-b80c397d3f50", 10, 5), // Honeycomb
+    ("fd67bbc6-20f4-44a3-9614-28265ebb8c67", 50, 10), // Limestone
+    ("e7193116-d761-479b-8a20-5633737977f5", 50, 10), // Lumber
+    ("f9181a67-b094-4c37-a145-ced9dfe610d6", 5, 1), // Daedra Heart
+    ("d94bab85-53d5-4c9c-a637-acd94fc66c98", 1, 1), // Transcendent Soul Gem
+    ("42d91529-c88b-4c5b-815b-b55508b4e7ef", 30, 6), // Copper
+    ("07f380dd-f123-4ef7-9b12-8b9fdb03c3e1", 10, 5), // Imp Stool
+    ("89ece62c-9ff6-470a-a152-d45ef4e0c222", 3, 1), // Pearl
+    ("d523932f-8c7f-4192-9112-5dbd60883c2b", 5, 1), // Dragon Bones
+    ("fe3567e0-ec8e-4f41-8e77-a56f861ab898", 10, 5), // Daedroth Tooth
+    ("8b7d0044-3a38-4ee0-af45-d2892b0f508d", 10, 5), // Deathbell
+    ("a4d5e792-5a27-4bb3-851f-e0917c0962db", 8, 4), // Giant's Toe
+    ("f1c5c03c-5297-48fb-a9d2-5f32bffb467c", 10, 5), // Fire Salts
+    ("34ddfe0e-5119-4e52-8eef-a77b6bc810a7", 5, 1), // Dragon Scales
+    ("bafe6ed5-6473-4a4c-aef5-421d3af5c8cb", 1, 1), // Glorious Soul Gem
+    ("68d7941e-8c8d-47bf-9f66-becb058f1817", 1, 1), // Grand Soul Gem
+    ("55e82826-2d68-469c-8870-753665ca62cd", 3, 1), // Iron Ingot
+    ("74f091b5-fd88-464b-a98a-f60a5e8a0f25", 3, 1), // Orichalcum Ingot
+    ("70f2c013-813e-4f63-8b29-7a54a13b5e58", 1, 1), // Faerite
+    ("e80bee76-f92c-4005-9eff-20d1e8c64d24", 4, 1), // Quicksilver Ingot
+    ("8ac9076c-cba9-4cf4-a8a5-d2303aab22b0", 2, 1), // Crystal
+    ("9d9732a5-cd1c-4a93-8755-0bf92ee65d64", 3, 1), // Leather
+    ("75112030-b248-49b0-9c70-0da8dea150d1", 5, 1), // Ebony Ingot
+    ("b81952e0-c3c8-4a5c-92c0-8215d3eb71af", 3, 1), // Steel Ingot
+    ("9687d83c-aa7b-4cf3-a69f-0bba8204fa61", 10, 5), // Glow Dust
+    ("16e102fb-b1c0-42de-8106-0aa27e77f7f0", 1, 1), // Diamond
+    ("f00f350d-97c2-47cd-a554-e1a37c9ff7f2", 10, 5), // Lavender
+    ("51f7612f-a797-4417-8a92-493b0aae7f45", 3, 1), // Pelt
+    ("a3351353-f613-4368-bac7-05783f857b07", 1, 1), // Elevated Soul Gem
+    ("4312b0ed-e397-4815-9693-a511ecda71de", 4, 1), // Moonstone Ingot
+    ("10c54e43-a2a1-4833-9491-4c19149f43b5", 10, 5), // Void Salts
+    ("85ed5500-3581-4699-8095-4b5ff6514355", 4, 1), // Malachite Ingot
+    ("9df9233f-e7b9-47e8-bc75-f37707917759", 3, 1), // Garnet
+    ("b94c2028-dba7-44bd-b6f9-6f85ab0195b6", 3, 1), // Seeds
+];
+
+/// The `(requestedAmount, maxDonationAmount)` for an item, or the 10/5 default for a
+/// template retail never showed us. 10/5 is the most common pair in the corpus (749
+/// of 1,626), so an unknown item gets the modal behaviour rather than an invented one.
+pub fn exchange_amounts_for(item_template_id: uuid::Uuid) -> (i64, i64) {
+    let s = item_template_id.to_string();
+    EXCHANGE_AMOUNTS
+        .iter()
+        .find(|(t, _, _)| *t == s)
+        .map(|(_, req, max)| (*req, *max))
+        .unwrap_or((10, 5))
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CreateExchangeResponse {
@@ -2226,6 +2344,7 @@ pub async fn create_exchange(
         .await?
         .ok_or_else(|| BladeApiError::new(StatusCode::NOT_FOUND, GUILD_SERVICE_ID, 1))?;
 
+    let (requested_amount, max_donation_amount) = exchange_amounts_for(item_template_id);
     let ts = now_secs();
     let row = GuildExchangeRow {
         id: Uuid::new_v4().to_string(),
@@ -2233,8 +2352,8 @@ pub async fn create_exchange(
         requester_user_id: user_id,
         requester_character_id: character_id,
         item_template_id,
-        requested_amount: 10,
-        max_donation_amount: 5,
+        requested_amount,
+        max_donation_amount,
         donations: JsonDbWrapper(vec![]),
         donation_sum: 0,
         creation_time: ts,
@@ -2311,7 +2430,30 @@ pub async fn donate_exchange(
                 .next()
                 .ok_or_else(|| BladeApiError::new(StatusCode::NOT_FOUND, GUILD_SERVICE_ID, 11))?;
 
-            let donate_amount = exchange.max_donation_amount as u64;
+            // A donor may not donate twice to the same request. Nothing stopped a
+            // single player filling a request by themselves, repeatedly, which is
+            // neither what the feature is for nor what retail allowed.
+            if exchange
+                .donations
+                .0
+                .iter()
+                .any(|d| d.donator_user_id == donor_user_id)
+            {
+                return Err(BladeApiError::new(StatusCode::CONFLICT, GUILD_SERVICE_ID, 12));
+            }
+
+            // Never donate more than the request still needs. The amount was always
+            // the full `maxDonationAmount`, so the last donor to a nearly-complete
+            // request overshot it — spending items that the requester can never
+            // redeem, since redemption is capped at `requestedAmount`.
+            let remaining = (exchange.requested_amount - exchange.donation_sum).max(0);
+            if remaining == 0 {
+                return Err(BladeApiError::new(StatusCode::CONFLICT, GUILD_SERVICE_ID, 13));
+            }
+            let donate_amount = exchange.max_donation_amount.min(remaining).max(0) as u64;
+            if donate_amount == 0 {
+                return Err(BladeApiError::new(StatusCode::CONFLICT, GUILD_SERVICE_ID, 13));
+            }
 
             // Debit the donor's stackable.
             let mut entry = load_economy(conn, donor_character_id, donor_user_id).await?;
