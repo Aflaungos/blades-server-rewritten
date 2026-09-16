@@ -819,6 +819,26 @@ pub struct Loadout {
     /// The MAGNITUDE now lives in [`Self::enchant_damage`] — the shipped `_value`
     /// curve is per-family and convex, so `tier` alone cannot produce it.
     pub enchants: Vec<(DamageType, u8)>,
+    /// Every equipped item PROPERTY id, one entry per occurrence, across ALL equipped
+    /// items — weapon, armour, jewellery alike.
+    ///
+    /// This is what **Enchantment Synergy** actually keys on. Disassembled:
+    /// `ItemPropertyBonusInstance::GetXValueMultiplier` calls
+    /// `ActorBonusHandler.HasMatchingItemBonus(propertyId)`, which walks
+    /// `_bonusesByItem` across every equipped item and returns `matchCount > 1`. So
+    /// "stacked" means **two or more copies of the SAME specific property**, counted
+    /// actor-wide — not two enchants of the same element, and not per item.
+    ///
+    /// We keyed it on `DamageType` and looked only at the weapon's own enchant list,
+    /// which was wrong in both directions at once: "Weapon Fire Damage" plus "Fortify
+    /// Fire Damage" counted as stacked when they are different properties, while two
+    /// genuinely identical properties on a helmet and a cuirass counted as nothing.
+    pub property_ids: Vec<uuid::Uuid>,
+    /// The property id behind each entry of [`Loadout::enchants`], positionally
+    /// aligned. Kept beside `enchants` rather than folded into it so the many test
+    /// fixtures that build `enchants` directly keep working; an empty vector simply
+    /// means "no synergy information", never "not stacked".
+    pub enchant_property_ids: Vec<uuid::Uuid>,
     /// Attacker-side **Armor Piercing Rating**
     /// (`ArmorPiercingPhysicalPropertyLogic`) — subtracted from the defender's
     /// Armor Rating before the physical reduction. [Phase 3.3]
@@ -837,6 +857,17 @@ pub struct Loadout {
     /// same trick the piercing ratings already use), so a maneuver cannot leak its
     /// bonus into the next auto-attack.
     pub maneuver_bonus_damage: f32,
+
+    /// Multiplier on POISON damage for the maneuver being resolved — Venom Strikes'
+    /// `_poisonEffectIncrease` (0.08 = +8%), which was read by nobody, so the
+    /// maneuver was a plain strike with a misleading name.
+    ///
+    /// Set on a clone for one cast, like `maneuver_bonus_damage`. The `Default` is
+    /// 0.0 and the applying code tests `> 1.0`, so both 0.0 and 1.0 are inert.
+    /// (`_poisonDurationIncrease` is deliberately NOT wired: it is **0 on all 13
+    /// ranks** despite a loc string existing for it. That is the data, not an
+    /// omission.)
+    pub poison_effect_multiplier: f32,
 
     /// Resolved perk bonuses, computed once at parse time. `Default` (every
     /// field zero) for a fighter with no perks, which every application site
@@ -1033,6 +1064,14 @@ pub struct ActiveChannel {
     /// evaluated once, when the spell goes off — the cast itself spends magicka, so
     /// re-reading it per tick would turn the perk off for every tick but the first.
     pub magicka_full_at_cast: bool,
+    /// Seconds between this channel's ticks.
+    ///
+    /// Almost always the 0.2 s global PvP tick, but THUNDERSTORM is not a channel in
+    /// the DoT sense: it ships `_numberOfBolts` 3 over a `_duration` of 9 s, i.e. one
+    /// bolt every 3 s. The interval is DERIVED (duration / bolts) — no interval field
+    /// is authored — and it is per-channel because a hardcoded global tick turned
+    /// Thunderstorm into a single immediate hit.
+    pub interval_secs: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -1251,6 +1290,52 @@ pub struct Fighter {
     /// was resolved as one ordinary Middle weapon hit. That is the whole of the
     /// production report in match fffe01ca — the AI cast Fury and was stunned 2 s
     /// later, inside the window that is supposed to make it un-stunnable.
+    /// **Magicka Surge**: a flat magicka-per-second bonus until this instant, then a
+    /// blackout window in which magicka does not regenerate at all.
+    ///
+    /// `MagickaSurgeAbility` ships `_magickaRegenerationBonus` (81.84/s at rank 1),
+    /// `_duration` (10 s) and `_noMagickaRegenDuration` (10 s) — the drawback that
+    /// pays for the surge. All three were unread, so the spell cost magicka and did
+    /// nothing whatsoever.
+    /// **Reflecting Bash**: while this instant is in the future, damage the defender
+    /// takes is redirected back at its attacker, up to `reflect_remaining`.
+    ///
+    /// `_damageReduction` (110.67 at rank 1) is the cap on damage "absorbed AND
+    /// redirected". The reduction half was already applied as a transient resistance;
+    /// the REDIRECT half was never implemented, so Reflecting Bash was strictly worse
+    /// than Shield Bash — same guard, less damage, no reflection.
+    /// **Wall of Fire** is up until this instant. While it is, an attacker who lands
+    /// a hit on this fighter "passes through" the wall and is burned for
+    /// `firewall_damage`; the caster pays `firewall_self_pct` of that in fire itself.
+    ///
+    /// `FirewallAbility` ships `_damage` 93.33 **per attack passing through** (not per
+    /// second), `_duration` 5 s and `_selfDamagePercent` 0.2. The server resolved it
+    /// as one immediate hit and there was no wall at all.
+    pub firewall_until: Option<Instant>,
+    pub firewall_damage: f32,
+    pub firewall_self_pct: f32,
+
+    /// **Echo Weapon** is up until this instant; each landed weapon hit is echoed
+    /// `echo_delay` later for `echo_bonus` flat damage.
+    ///
+    /// `_duration` 8 s, `_weaponDelay` 0.5 s, and a per-weapon-class `_bonusDamages`
+    /// (Light 95.84 / Versatile 108.03 / Heavy 123.70). None of it was implemented —
+    /// the spell produced no echoes whatsoever.
+    pub echo_until: Option<Instant>,
+    pub echo_bonus: f32,
+    pub echo_delay: f32,
+
+    pub reflect_until: Option<Instant>,
+    /// Remaining redirect budget for the current Reflecting Bash window.
+    pub reflect_remaining: f32,
+
+    pub magicka_surge_until: Option<Instant>,
+    /// Flat magicka/second granted while `magicka_surge_until` is in the future.
+    pub magicka_surge_bonus: f32,
+    /// No magicka regenerates at all until this instant — Magicka Surge's drawback,
+    /// which begins when the surge itself ends.
+    pub no_magicka_regen_until: Option<Instant>,
+
     pub reckless_fury_until: Option<Instant>,
     /// Flat bonus damage Fury adds to each swing while active, chosen by the
     /// wielder's WEAPON CLASS from the rank's `bonusDamages` table
@@ -1363,6 +1448,15 @@ pub struct NegationPool {
     /// on a dodge that connects: it is the only number the data actually contains,
     /// and awarding nothing was the bug.
     pub on_absorb_restore: (f32, f32, f32),
+    /// Damage types this pool does NOT absorb — `_vulnerableDamageTypes`.
+    ///
+    /// Blizzard Armor ships `[4 Fire]`: the ice shield is weak to fire. The shipped
+    /// data names the TYPE and no magnitude, so the faithful reading with nothing
+    /// invented is that the shield simply does not stop it — fire passes straight
+    /// through a Blizzard Armor instead of being halved by it. Inventing a
+    /// "takes 1.5x fire" multiplier would be making up a number the game never
+    /// authored.
+    pub bypass_types: &'static [i32],
 }
 
 /// The sliding damage-history window length (`ElementalStatusEffectData._duration` ≈ 5 s
@@ -1436,6 +1530,17 @@ impl Fighter {
         Fighter {
             slot,
             net_object_id,
+            firewall_until: None,
+            firewall_damage: 0.0,
+            firewall_self_pct: 0.0,
+            echo_until: None,
+            echo_bonus: 0.0,
+            echo_delay: 0.0,
+            reflect_until: None,
+            reflect_remaining: 0.0,
+            magicka_surge_until: None,
+            magicka_surge_bonus: 0.0,
+            no_magicka_regen_until: None,
             reckless_fury_until: None,
             reckless_fury_bonus: 0.0,
             player_net_object_id: 0, // assigned by MatchInstance::new
@@ -2111,9 +2216,12 @@ impl Fighter {
             // Which components may this pool touch at all? Ward is elemental-only
             // (see `NegationPool::elemental_only`); everything else keeps the old
             // "any health component" reach.
+            let bypass = pool.bypass_types;
             let eligible_ty = |t: DamageType| {
                 super::damage::is_health_type(t)
                     && (!pool.elemental_only || super::damage::is_elemental(t))
+                    // `_vulnerableDamageTypes`: a Blizzard Armor does not stop fire.
+                    && !bypass.contains(&(t as i32))
             };
             // Did this hit exhaust the pool? Only then does the overflow clause fire.
             let had_budget = pool.remaining > 0.0;
@@ -2293,6 +2401,8 @@ pub struct MatchCombat {
     pub last_regen_tick: std::time::Instant,
     /// Swings committed but not yet landed — see [`PendingHit`].
     pub pending_hits: Vec<PendingHit>,
+    /// Echo Weapon follow-ups awaiting their `_weaponDelay`.
+    pub pending_echoes: Vec<PendingEcho>,
     /// Casts waiting on their shipped wind-up. See [`PendingImpact`].
     pub pending_impacts: Vec<PendingImpact>,
 }
@@ -2321,6 +2431,19 @@ pub struct PendingImpact {
     pub ability_uuid: String,
     pub level: u8,
     pub tag: AbilityTag,
+    /// Maximum Power's condition, frozen when the cast was accepted (before its own
+    /// magicka cost was deducted) — the order the client uses.
+    pub magicka_full_at_cast: bool,
+    pub due: Instant,
+}
+
+/// An **Echo Weapon** echo waiting to land: a flat follow-up hit `_weaponDelay`
+/// after the swing that produced it.
+#[derive(Debug, Clone)]
+pub struct PendingEcho {
+    pub sender: usize,
+    pub target: usize,
+    pub damage: f32,
     pub due: Instant,
 }
 
@@ -2357,6 +2480,7 @@ impl MatchCombat {
             interround_step: 0,
             last_regen_tick: now,
             pending_hits: Vec::new(),
+            pending_echoes: Vec::new(),
             pending_impacts: Vec::new(),
         }
     }
@@ -3096,6 +3220,7 @@ mod absorb_fraction_tests {
             elemental_only: false,
             consumes_overflow: false,
             on_absorb_restore: (0.0, 0.0, 0.0),
+            bypass_types: &[],
         }
     }
 
@@ -3150,6 +3275,7 @@ mod absorb_fraction_tests {
             elemental_only: true,
             consumes_overflow: true,
             on_absorb_restore: (0.0, 0.0, 0.0),
+            bypass_types: &[],
         }
     }
 
@@ -3255,6 +3381,7 @@ mod absorb_fraction_tests {
             elemental_only: false,
             consumes_overflow: false,
             on_absorb_restore: (43.5, 338.0, 4.0),
+            bypass_types: &[],
         });
         // A multi-component hit: the restoration must NOT be paid per component.
         let mut c = vec![
@@ -3283,6 +3410,7 @@ mod absorb_fraction_tests {
             elemental_only: false,
             consumes_overflow: false,
             on_absorb_restore: (43.5, 338.0, 4.0),
+            bypass_types: &[],
         });
         // Only a Magicka drain — not a health-type component, so nothing is absorbed.
         let mut c = vec![(DamageType::Magicka, 100.0)];
@@ -3307,6 +3435,7 @@ mod absorb_fraction_tests {
             elemental_only: false,
             consumes_overflow: false,
             on_absorb_restore: (0.0, 0.0, 0.0),
+            bypass_types: &[],
         });
         let mut c = vec![(DamageType::Slashing, 130.0)];
         let r = f.apply_negation_pools(&mut c);

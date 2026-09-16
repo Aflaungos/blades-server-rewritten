@@ -238,7 +238,19 @@ pub fn from_character(character: &CompleteCharacter, inventory: &CompleteInvento
         // --- enchantments, dispatched on the family's LOGIC CLASS (Phase 3.6/3.7) ---
         for prop in &eq.item.properties.enchanting {
             let tier = prop.tier.min(u8::MAX as u64) as u8;
+            // Record the property id for EVERY equipped item before dispatching.
+            // Enchantment Synergy counts identical property ids ACTOR-WIDE
+            // (`ActorBonusHandler.HasMatchingItemBonus` walks `_bonusesByItem` across
+            // all items and returns `matchCount > 1`), so armour and jewellery count
+            // just as much as the weapon.
+            lo.property_ids.push(prop.id);
+            let before = lo.enchants.len();
             apply_enchant(&mut lo, &prop.id, tier);
+            // Keep `enchant_property_ids` positionally aligned with `enchants`: an
+            // enchant that produced a damage track records the property behind it.
+            for _ in before..lo.enchants.len() {
+                lo.enchant_property_ids.push(prop.id);
+            }
         }
     }
 

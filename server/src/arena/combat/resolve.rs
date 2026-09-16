@@ -1161,8 +1161,30 @@ pub(super) fn resolve_ability_cast(
     let (stam_cost, mag_cost) = tables::ability_cost(&ea.ability_uuid, level);
     let short_of_stamina = stam_cost > 0 && combat.fighters[sender].stamina < stam_cost;
     let short_of_magicka = mag_cost > 0 && combat.fighters[sender].magicka < mag_cost;
-    if short_of_stamina || short_of_magicka {
-        if short_of_stamina {
+    // A SHIELD BASH needs a shield. There is no `requiresShield` field anywhere in
+    // the shipped data — the precondition lives in the client's
+    // `ShieldBashAbility.CanBeCast` — so it is keyed off the one thing that IS
+    // authored: the four bashes are exactly the maneuvers that ship a `_blockDuration`
+    // (0.50 s), because the bash IS a guard plus a strike. A player with no shield
+    // could bash freely, getting the guard window and the bonus damage for nothing.
+    //
+    // Verified against the shipped table: a non-zero `_blockDuration` is carried by
+    // EXACTLY the four player bashes (Harrying, Staggering, Reflecting, Shield Bash)
+    // — Guardbreaker correctly does not, it is a weapon maneuver — plus the
+    // enemy-only ShieldOfMania, which is excluded because an enemy's loadout does not
+    // model a shield and gating it would silently disarm the AI.
+    let needs_shield = super::gamedata::ability(&ea.ability_uuid)
+        .is_some_and(|a| !a.enemy_only)
+        && super::gamedata::ability_rank_clamped(&ea.ability_uuid, level as u16)
+            .is_some_and(|r| r.block_duration().is_some_and(|v| v > 0.0));
+    let no_shield = needs_shield && !combat.fighters[sender].loadout.has_shield;
+    if short_of_stamina || short_of_magicka || no_shield {
+        if no_shield {
+            debug!(
+                "combat: slot {sender} ability {} REJECTED — a bash needs a shield",
+                ea.ability_uuid,
+            );
+        } else if short_of_stamina {
             debug!(
                 "combat: slot {sender} ability {} REJECTED — insufficient stamina ({} < {} required)",
                 ea.ability_uuid, combat.fighters[sender].stamina, stam_cost,
@@ -1193,6 +1215,18 @@ pub(super) fn resolve_ability_cast(
         let frame = messages::player_stats_update(obj_id, packed, other_packed);
         return (0..combat.fighters.len()).map(|s| (s, frame.clone())).collect();
     }
+
+    // MAXIMUM POWER is evaluated at CAST time — "Spells are {0}% more effective when
+    // **cast while** Magicka is full" — and the client proves the order: in
+    // `Actor.ExecuteAbility` the effectiveness fold runs BEFORE `PayAbilityCost`, and
+    // the result is frozen into the AbilityExecution for every step and channel tick.
+    //
+    // We deducted the cost here and only read "is magicka full?" ~490 lines later, so
+    // for ANY spell with a magicka cost the perk could never fire. It was dead on
+    // arrival, and both existing tests hand-built `CasterPerks { magicka_full: true }`
+    // so neither could see it.
+    let magicka_full_at_cast =
+        combat.fighters[sender].magicka >= combat.fighters[sender].max_magicka;
 
     // Resource gate passed → commit: set cooldown and deduct the cost.
     combat
@@ -1401,7 +1435,8 @@ pub(super) fn resolve_ability_cast(
     let delay = ability_impact_delay(&ea.ability_uuid, level);
     if delay.is_zero() {
         out.extend(apply_ability_impact(
-            combat, sender, target_slot, &ea.ability_uuid, level, tag, now,
+            combat, sender, target_slot, &ea.ability_uuid, level, tag,
+            magicka_full_at_cast, now,
         ));
     } else {
         debug!(
@@ -1414,6 +1449,7 @@ pub(super) fn resolve_ability_cast(
             ability_uuid: ea.ability_uuid.clone(),
             level,
             tag,
+            magicka_full_at_cast,
             due: now + delay,
         });
     }
@@ -1555,6 +1591,10 @@ fn apply_ability_impact(
     ability_uuid: &str,
     level: u8,
     tag: super::state::AbilityTag,
+    // Was the caster's magicka full when the cast was ACCEPTED, i.e. BEFORE its own
+    // cost was deducted? Maximum Power's condition, frozen at cast the way the client
+    // freezes it (`Actor.ExecuteAbility` folds effectiveness before `PayAbilityCost`).
+    magicka_full_at_cast: bool,
     now: Instant,
 ) -> Vec<(usize, Vec<u8>)> {
     use super::state::AbilityTag;
@@ -1637,6 +1677,12 @@ fn apply_ability_impact(
                 // Reckless Fury ships 0/0 because it is a buff that swings nothing.
                 attacker_loadout.maneuver_bonus_damage +=
                     maneuver_bonus_damage(&r, !attacker_loadout.has_shield);
+                // Venom Strikes' `_poisonEffectIncrease` (0.08 → ×1.08 poison).
+                if let Some(inc) = r.get(super::gamedata::AbilityField::PoisonEffectIncrease) {
+                    if inc > 0.0 {
+                        attacker_loadout.poison_effect_multiplier = 1.0 + inc;
+                    }
+                }
             }
             // Middle is not part of a Left/Right chain, so it resets the combo — the
             // same rule `resolve_swing_with_side` applies to a Middle swing.
@@ -1663,7 +1709,20 @@ fn apply_ability_impact(
             // `AbilityTag`), and `ShieldManeuver (11)` almost certainly belongs to
             // them — but 11 appears in **none** of the 168, so there is no measurement
             // behind it and it is deliberately not guessed here.
-            let resolved = RetailDamageModel.resolve_attack(
+            // METTLE applies to MANEUVERS — and only to maneuvers. A maneuver is
+            // resolved through `resolve_attack`, which takes a Loadout and no
+            // `CasterPerks`, so the perk had no way to reach it: it was being applied
+            // to spells (where the client applies nothing) and to nothing here (where
+            // the client applies it). Scale the resolved magnitude by
+            // `ability_multiplier`, which is the whole-ability effectiveness the
+            // client's `AbilityExecution._effectivenessMultiplier` expresses.
+            let mettle = {
+                let f = &combat.fighters[sender];
+                f.loadout
+                    .perks
+                    .ability_multiplier(super::perks::health_is_critical(f.health, f.max_health))
+            };
+            let mut resolved = RetailDamageModel.resolve_attack(
                 &attacker_loadout,
                 &combat.fighters[target_slot],
                 DamageSource::WeaponManeuver,
@@ -1672,6 +1731,13 @@ fn apply_ability_impact(
                 0,
                 now,
             );
+            if mettle != 1.0 {
+                for (_, v) in resolved.components.iter_mut() {
+                    *v *= mettle;
+                }
+                resolved.total *= mettle;
+                debug!("combat: slot {sender} maneuver scaled ×{mettle:.2} by Mettle");
+            }
             info!(
                 "combat: slot {sender} maneuver {} → weapon damage {:.1} (Middle)",
                 ability_uuid, resolved.total,
@@ -1697,8 +1763,10 @@ fn apply_ability_impact(
             );
         }
         AbilityTag::Paralyze | AbilityTag::Damage | AbilityTag::Generic => {
-            let caster = super::perks::CasterPerks::of(&combat.fighters[sender]);
-            let magicka_full_at_cast = caster.magicka_full;
+            let caster = super::perks::CasterPerks {
+                magicka_full: magicka_full_at_cast,
+                ..super::perks::CasterPerks::of(&combat.fighters[sender])
+            };
             let resolved = RetailDamageModel.resolve_ability(
                 ability_uuid,
                 level,
@@ -1710,6 +1778,32 @@ fn apply_ability_impact(
             last_hit_total = resolved.total;
             block_flags = resolved.flags;
             out.extend(emit_damage(combat, sender, target_slot, &resolved, now));
+            // THUNDERSTORM is not a DoT — it ships `_numberOfBolts` (3) over a
+            // `_duration` (9 s) and a per-BOLT `_damage`, so `channel_ticks` (which
+            // keys off `_damagePerSecond`) never saw it and it landed as one
+            // immediate hit. Schedule the remaining bolts at duration/bolts.
+            let bolts = super::gamedata::ability_rank_clamped(ability_uuid, level as u16)
+                .and_then(|r| {
+                    let n = r.get(super::gamedata::AbilityField::NumberOfBolts)?;
+                    let span = r.duration()?;
+                    (n >= 2.0 && span > 0.0).then(|| (n as u32, span / n))
+                });
+            if let Some((n_bolts, interval)) = bolts {
+                combat.channels.push(super::state::ActiveChannel {
+                    caster_slot: sender,
+                    target_slot,
+                    ability_uuid: ability_uuid.to_string(),
+                    ability_level: level,
+                    remaining_ticks: n_bolts - 1,
+                    magicka_full_at_cast,
+                    next_tick_at: now + Duration::from_secs_f32(interval),
+                    interval_secs: interval,
+                });
+                info!(
+                    "combat: slot {sender} THUNDERSTORM {n_bolts} bolts, one every \
+                     {interval:.2}s ({ability_uuid})"
+                );
+            }
             // A CHANNELLED spell just emitted tick 1 of many. Schedule the rest;
             // `apply_channel_ticks` delivers them on the shipped PvP tick.
             if let Some(total_ticks) = super::damage::channel_ticks(ability_uuid, level) {
@@ -1723,6 +1817,7 @@ fn apply_ability_impact(
                         magicka_full_at_cast,
                         next_tick_at: now
                             + Duration::from_secs_f32(super::damage::CHANNEL_TICK_INTERVAL_SECS),
+                        interval_secs: super::damage::CHANNEL_TICK_INTERVAL_SECS,
                     });
                 }
             }
@@ -1843,11 +1938,82 @@ fn begin_ability_guard(
         ] {
             f.transient_resistances.push((ty, reduction, until));
         }
+        // …and REDIRECT it. `_damageReduction` caps damage "absorbed AND redirected";
+        // only the absorb half existed, which made Reflecting Bash strictly worse than
+        // a plain Shield Bash — the same guard, less damage, and no reflection.
+        //
+        // Verified against the shipped table: `_damageReduction` is carried by EXACTLY
+        // two abilities — ReflectingBash (110.67) and the enemy-only ShieldOfMania
+        // (50.11), which is its AI analogue. Shield Bash, Harrying Bash and
+        // Staggering Bash ship none, so they guard without reflecting, which is the
+        // distinction between them.
+        f.reflect_until = Some(until);
+        f.reflect_remaining = reduction;
         info!(
             "combat: slot {caster} bash reduction {reduction:.1} for {window:.2}s ({ability_uuid})"
         );
     }
     info!("combat: slot {caster} bash guard UP for {window:.2}s ({ability_uuid})");
+}
+
+/// Deliver **Echo Weapon** echoes whose `_weaponDelay` has elapsed.
+///
+/// An echo is a flat follow-up, not a re-swing: it carries the spell's per-weapon-class
+/// `_bonusDamages` and nothing else — no combo, no charge, no block interaction. It is
+/// therefore emitted directly rather than routed back through the swing resolver,
+/// which would re-apply the whole multiplier chain to it.
+fn land_due_echoes(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8>)> {
+    if combat.pending_echoes.is_empty() {
+        return Vec::new();
+    }
+    let (due, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut combat.pending_echoes)
+        .into_iter()
+        .partition(|e| now >= e.due);
+    combat.pending_echoes = waiting;
+
+    let mut out = Vec::new();
+    for e in due {
+        if e.sender >= combat.fighters.len() || e.target >= combat.fighters.len() {
+            continue;
+        }
+        // A round can end while an echo is in flight; landing it afterwards would
+        // deal damage into the next round (the same rule `land_due_hits` applies).
+        if !matches!(combat.phase, FlowState::StateTimeout) {
+            continue;
+        }
+        if combat.fighters[e.target].is_dead() || combat.fighters[e.sender].is_dead() {
+            continue;
+        }
+        combat.fighters[e.target].take_damage_at(e.damage.round().max(0.0) as u32, now);
+        let msg = {
+            let hit = &combat.fighters[e.target];
+            let other = &combat.fighters[e.sender];
+            messages::receive_damage(
+                hit.net_object_id,
+                NetObjectType::Avatar as u8,
+                hit.packed_stats(),
+                other.packed_stats(),
+                super::state::DamageSource::Spell,
+                super::damage::flags::SHOW_DAMAGE | super::damage::flags::HAS_ATTACKER,
+                e.damage,
+                0,
+                ActiveSide::Middle,
+                super::state::DamageType::None,
+                &[(super::state::DamageType::Health, e.damage)],
+            )
+        };
+        info!(
+            "combat: slot {} ECHO landed {:.1} on slot {}",
+            e.sender, e.damage, e.target
+        );
+        for v in 0..combat.fighters.len() {
+            out.push((v, msg.clone()));
+        }
+        if combat.fighters[e.target].is_dead() {
+            out.extend(on_round_ending_death(combat, e.sender, now));
+        }
+    }
+    out
 }
 
 /// Deliver casts whose wind-up has elapsed. Mirrors [`land_due_hits`].
@@ -1866,7 +2032,8 @@ pub(super) fn land_due_impacts(combat: &mut MatchCombat, now: Instant) -> Vec<(u
             continue;
         }
         out.extend(apply_ability_impact(
-            combat, p.sender, p.target, &p.ability_uuid, p.level, p.tag, now,
+            combat, p.sender, p.target, &p.ability_uuid, p.level, p.tag,
+            p.magicka_full_at_cast, now,
         ));
     }
     out
@@ -2040,6 +2207,91 @@ fn apply_shipped_effects(
         }
     }
 
+    // **WALL OF FIRE** (editor `Firewall`) — a persistent wall, not a hit. It ships
+    // `_damage` **per attack passing through**, `_duration`, and `_selfDamagePercent`.
+    // The server resolved it as a single immediate hit and there was no wall.
+    // `StatusEffectType::Firewall` (13) already exists, so the client can show it.
+    if let Some(dmg) = r.damage() {
+        if caster < viewers && super::gamedata::ability(ability_uuid)
+            .is_some_and(|a| a.editor_name == "Firewall")
+        {
+            let secs = r.duration().unwrap_or(0.0);
+            let self_pct = r
+                .get(super::gamedata::AbilityField::SelfDamagePercent)
+                .unwrap_or(0.0);
+            let f = &mut combat.fighters[caster];
+            f.firewall_until = Some(now + Duration::from_secs_f32(secs));
+            f.firewall_damage = dmg;
+            f.firewall_self_pct = self_pct;
+            let obj = f.net_object_id;
+            info!(
+                "combat: slot {caster} WALL OF FIRE {dmg:.1}/attack for {secs:.1}s \
+                 (self {:.0}%)",
+                self_pct * 100.0
+            );
+            let frame = messages::change_combat_status_effect(
+                obj, true, super::state::StatusEffectType::Firewall, secs,
+            );
+            for v in 0..viewers {
+                out.push((v, frame.clone()));
+            }
+        }
+    }
+
+    // **ECHO WEAPON** — for `_duration`, each landed weapon hit is echoed
+    // `_weaponDelay` later for a flat per-weapon-class bonus. Nothing was
+    // implemented: the spell produced no echoes at all.
+    if let Some(delay) = r.get(super::gamedata::AbilityField::WeaponDelay) {
+        if caster < viewers {
+            let secs = r.duration().unwrap_or(0.0);
+            let class_raw = combat.fighters[caster]
+                .loadout
+                .weapon_template
+                .map(|w| w.weapon_class as u8)
+                .unwrap_or(0);
+            let bonus = r
+                .bonus_damages
+                .iter()
+                .find(|(c, _)| *c == class_raw)
+                .or_else(|| r.bonus_damages.iter().find(|(c, _)| *c == 0))
+                .map(|(_, v)| *v)
+                .unwrap_or(0.0);
+            if bonus > 0.0 && secs > 0.0 {
+                let f = &mut combat.fighters[caster];
+                f.echo_until = Some(now + Duration::from_secs_f32(secs));
+                f.echo_bonus = bonus;
+                f.echo_delay = delay;
+                info!(
+                    "combat: slot {caster} ECHO WEAPON +{bonus:.1} after {delay:.2}s, \
+                     for {secs:.1}s (weapon class {class_raw})"
+                );
+            }
+        }
+    }
+
+    // **MAGICKA SURGE** — `_magickaRegenerationBonus` for `_duration`, then
+    // `_noMagickaRegenDuration` of nothing at all. All three were unread: the spell
+    // spent its cost and did literally nothing.
+    if let Some(bonus) = r.get(super::gamedata::AbilityField::MagickaRegenerationBonus) {
+        if bonus > 0.0 && caster < viewers {
+            let surge_secs = r.get(super::gamedata::AbilityField::Duration).unwrap_or(0.0);
+            let blackout_secs = r
+                .get(super::gamedata::AbilityField::NoMagickaRegenDuration)
+                .unwrap_or(0.0);
+            let f = &mut combat.fighters[caster];
+            f.magicka_surge_bonus = bonus;
+            f.magicka_surge_until = Some(now + Duration::from_secs_f32(surge_secs));
+            // The blackout begins when the surge ENDS, not at cast — it is the price
+            // paid afterwards, not a concurrent penalty that would cancel the surge.
+            f.no_magicka_regen_until =
+                Some(now + Duration::from_secs_f32(surge_secs + blackout_secs));
+            info!(
+                "combat: slot {caster} MAGICKA SURGE +{bonus:.1}/s for {surge_secs:.1}s, \
+                 then {blackout_secs:.1}s of no magicka regen ({ability_uuid})"
+            );
+        }
+    }
+
     // `_bonusResistance` — a FLAT all-damage resistance granted to the CASTER.
     // Indomitable Smash ships 250 at rank 1 and it was read by nobody, so the
     // maneuver cured conditions and then did nothing else defensively.
@@ -2126,6 +2378,7 @@ fn apply_shipped_effects(
                     r.get(super::gamedata::AbilityField::MaximumMagickaRestored).unwrap_or(0.0),
                     r.get(super::gamedata::AbilityField::MaximumCooldownReduction).unwrap_or(0.0),
                 ),
+                bypass_types: &[],
                 restoration_factor: 0.0,
                 absorb_fraction: 1.0,
                 elemental_only: false,
@@ -2163,6 +2416,11 @@ fn apply_shipped_effects(
                 // clause in their description — only Ward does.
                 elemental_only: false,
                 consumes_overflow: false,
+                // `_vulnerableDamageTypes` — Blizzard Armor ships [Fire]. The ice
+                // shield does not stop the element it is weak to. The data names the
+                // TYPE and no magnitude, so "does not absorb it" is the faithful
+                // reading; a "takes extra fire" multiplier would be invented.
+                bypass_types: r.vulnerable_damage_types,
             });
             let obj = combat.fighters[caster].net_object_id;
             info!("combat: slot {caster} storm-armor shield +{shield:.1} ({ability_uuid})");
@@ -2508,6 +2766,104 @@ fn emit_damage(
     // The DEFENDER's gear hits back. Emitted after the hit that provoked it and
     // before any death check, so a Revenge proc can itself be the killing blow —
     // which is how retail orders it (`op50 blocked` then `op50 src=Revenge`).
+    // WALL OF FIRE: an attacker who lands a hit has "passed through" the wall and is
+    // burned for its per-attack `_damage`; the caster pays `_selfDamagePercent` of
+    // that for standing in their own fire.
+    if attacker_slot != target_slot
+        && combat.fighters[target_slot].firewall_until.is_some_and(|t| now < t)
+    {
+        let burn = combat.fighters[target_slot].firewall_damage;
+        if burn > 0.0 {
+            let self_hit = burn * combat.fighters[target_slot].firewall_self_pct;
+            combat.fighters[attacker_slot].take_damage_at(burn.round().max(0.0) as u32, now);
+            if self_hit > 0.0 {
+                let f = &mut combat.fighters[target_slot];
+                // The caster's own fire never kills them outright: floor at 1.
+                let cost = self_hit.round().max(0.0) as u32;
+                f.health = f.health.saturating_sub(cost).max(1.min(f.health));
+            }
+            let msg = {
+                let hit = &combat.fighters[attacker_slot];
+                let other = &combat.fighters[target_slot];
+                messages::receive_damage(
+                    hit.net_object_id,
+                    NetObjectType::Avatar as u8,
+                    hit.packed_stats(),
+                    other.packed_stats(),
+                    super::state::DamageSource::StatusEffect,
+                    super::damage::flags::SHOW_DAMAGE,
+                    burn,
+                    0,
+                    ActiveSide::None,
+                    super::state::DamageType::Fire,
+                    &[(super::state::DamageType::Fire, burn)],
+                )
+            };
+            info!(
+                "combat: slot {attacker_slot} walked through slot {target_slot}'s WALL OF \
+                 FIRE for {burn:.1} (caster self {self_hit:.1})"
+            );
+            for v in 0..combat.fighters.len() {
+                out.push((v, msg.clone()));
+            }
+        }
+    }
+
+    // ECHO WEAPON: the attacker's landed weapon hit is echoed after `_weaponDelay`.
+    // Only a real weapon swing echoes — an echo cannot echo itself, and a spell is
+    // not a weapon.
+    if resolved.source == super::state::DamageSource::Attack
+        && combat.fighters[attacker_slot].echo_until.is_some_and(|t| now < t)
+    {
+        let f = &combat.fighters[attacker_slot];
+        let (bonus, delay) = (f.echo_bonus, f.echo_delay);
+        if bonus > 0.0 {
+            combat.pending_echoes.push(super::state::PendingEcho {
+                sender: attacker_slot,
+                target: target_slot,
+                damage: bonus,
+                due: now + Duration::from_secs_f32(delay),
+            });
+        }
+    }
+
+    // REFLECTING BASH: send part of what just landed back at the attacker, capped by
+    // the remaining budget. Placed beside Revenge because it is the same shape — a
+    // defender dealing damage back outside its own swing — and so shares its frame.
+    if attacker_slot != target_slot && combat.fighters[target_slot].reflect_until.is_some_and(|t| now < t) {
+        let budget = combat.fighters[target_slot].reflect_remaining;
+        let back = total.min(budget).max(0.0);
+        if back > 0.0 {
+            combat.fighters[target_slot].reflect_remaining -= back;
+            combat.fighters[attacker_slot].take_damage_at(back.round().max(0.0) as u32, now);
+            let msg = {
+                let hit = &combat.fighters[attacker_slot];
+                let other = &combat.fighters[target_slot];
+                messages::receive_damage(
+                    hit.net_object_id,
+                    NetObjectType::Avatar as u8,
+                    hit.packed_stats(),
+                    other.packed_stats(),
+                    super::state::DamageSource::Revenge,
+                    super::damage::flags::SHOW_DAMAGE | super::damage::flags::HAS_ATTACKER,
+                    back,
+                    0,
+                    ActiveSide::None,
+                    super::state::DamageType::None,
+                    &[(super::state::DamageType::Health, back)],
+                )
+            };
+            info!(
+                "combat: slot {target_slot} REFLECTED {back:.1} back at slot {attacker_slot} \
+                 ({:.1} of budget left)",
+                combat.fighters[target_slot].reflect_remaining
+            );
+            for v in 0..combat.fighters.len() {
+                out.push((v, msg.clone()));
+            }
+        }
+    }
+
     out.extend(apply_revenge(
         combat,
         target_slot,
@@ -3006,13 +3362,46 @@ fn apply_channel_ticks(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Ve
         );
         out.extend(emit_damage(combat, caster, target, &resolved, now));
 
+        // **CONSUMING INFERNO'S UPKEEP.** `_staminaCostPerSecond` (51.81) and
+        // `_healthCostPerSecond` (31.11) are what the spell costs its CASTER for
+        // every second it burns — two distinct drains, both unread, so the spell was
+        // pure upside: huge channelled damage for a one-off magicka cost.
+        //
+        // Charged per TICK, scaled by the tick interval, so the per-second figure
+        // stays a per-second figure whatever the tick rate is.
+        if let Some(rank) = super::gamedata::ability_rank_clamped(&uuid, level as u16) {
+            let per_tick = super::damage::CHANNEL_TICK_INTERVAL_SECS;
+            let stam = rank
+                .get(super::gamedata::AbilityField::StaminaCostPerSecond)
+                .unwrap_or(0.0)
+                * per_tick;
+            let health = rank
+                .get(super::gamedata::AbilityField::HealthCostPerSecond)
+                .unwrap_or(0.0)
+                * per_tick;
+            if stam > 0.0 || health > 0.0 {
+                let f = &mut combat.fighters[caster];
+                if stam > 0.0 {
+                    f.stamina = f.stamina.saturating_sub(stam.round().max(0.0) as u32);
+                }
+                if health > 0.0 {
+                    // Never self-kill on upkeep: floor at 1. A channel that killed its
+                    // own caster would end the round for the wrong player, and nothing
+                    // in the data says the cost is lethal.
+                    let cost = health.round().max(0.0) as u32;
+                    f.health = f.health.saturating_sub(cost).max(1.min(f.health));
+                }
+                f.stats_seq = f.stats_seq.wrapping_add(1);
+            }
+        }
+
         let c = &mut combat.channels[i];
         c.remaining_ticks = c.remaining_ticks.saturating_sub(1);
         // Advance from the SCHEDULED time, never from `now`. `on_tick` fires a little
         // after the instant a tick was due, and rebasing on the late arrival lets that
         // slack compound: measured, it dropped 4 of 15 ticks outside the channel and
         // stretched a 3.0 s cast to 3.6 s.
-        c.next_tick_at += Duration::from_secs_f32(super::damage::CHANNEL_TICK_INTERVAL_SECS);
+        c.next_tick_at += Duration::from_secs_f32(c.interval_secs);
     }
 
     combat.channels.retain(|c| c.remaining_ticks > 0);
@@ -3186,6 +3575,7 @@ fn apply_ward(
         // protection is the Armor Rating pushed below, not this pool.
         elemental_only: true,
         consumes_overflow: true,
+        bypass_types: &[],
     });
     // Add transient flat physical armor (subtracted from incoming physical as a
     // transient resistance on the caster — `DamageType::Health` is NOT physical;
@@ -3241,6 +3631,7 @@ fn apply_absorb(
         on_absorb_restore: (0.0, 0.0, 0.0),
         elemental_only: false,
         consumes_overflow: false,
+        bypass_types: &[],
     });
     let obj = f.net_object_id;
     info!("combat: slot {caster_slot} ABSORB r{rank} applied (pool {amount:.2}, heal ×{restoration}, {duration}s)");
@@ -3650,9 +4041,20 @@ pub(super) fn apply_regen_tick(combat: &mut MatchCombat, now: Instant) -> Vec<(u
             let regen = ((STAMINA_REGEN_RATE_PER_S * f.max_stamina as f32).round() as u32).max(1);
             f.stamina = (f.stamina + regen).min(f.max_stamina);
         }
-        // Magicka regen: 2.93 %/s — the captured wire rate (see the constant).
-        if !block_mag && f.magicka < f.max_magicka {
-            let regen = ((MAGICKA_REGEN_RATE_PER_S * f.max_magicka as f32).round() as u32).max(1);
+        // Magicka Surge's BLACKOUT: for `_noMagickaRegenDuration` after the surge
+        // ends, magicka does not regenerate at all. This is the drawback that pays
+        // for the surge and it is authored, not invented.
+        let surge_blackout = f.no_magicka_regen_until.is_some_and(|t| now < t);
+        // Magicka regen: 2.93 %/s — the captured wire rate (see the constant) — plus
+        // Magicka Surge's flat `_magickaRegenerationBonus` while it is up.
+        if !block_mag && !surge_blackout && f.magicka < f.max_magicka {
+            let mut regen =
+                ((MAGICKA_REGEN_RATE_PER_S * f.max_magicka as f32).round() as u32).max(1);
+            if f.magicka_surge_until.is_some_and(|t| now < t) {
+                // REGEN_TICK_INTERVAL is 1 s, so a per-second rate is the per-tick
+                // amount (the same equivalence the health block above relies on).
+                regen += f.magicka_surge_bonus.round().max(0.0) as u32;
+            }
             f.magicka = (f.magicka + regen).min(f.max_magicka);
         }
 
@@ -4006,6 +4408,7 @@ pub fn on_tick(combat: &mut MatchCombat, now: Instant, debug_hold: bool) -> Vec<
     // the bot's turn, so a swing thrown last tick resolves in the order it would have
     // if it had landed instantly (tracker #21).
     out.extend(land_due_hits(combat, now));
+    out.extend(land_due_echoes(combat, now));
     out.extend(land_due_impacts(combat, now));
     if matches!(combat.phase, FlowState::RoundEnd | FlowState::NextState) {
         // A landing blow just ended the round.
@@ -7133,6 +7536,95 @@ mod shipped_effects_tests {
         assert_eq!(fire, 0.0, "resistTypes is physical-only; Fire must not be covered");
     }
 
+    /// Magicka Surge: a flat regen bonus for its duration, THEN a blackout window in
+    /// which magicka does not regenerate at all. All three fields were unread, so the
+    /// spell spent its cost and did nothing.
+    #[test]
+    fn magicka_surge_grants_regen_then_a_blackout() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        apply_shipped_effects(&mut c, 0, 1, uuid_of("MagickaSurge"), 1, 500.0, 0, now);
+        let f = &c.fighters[0];
+        assert!(f.magicka_surge_bonus > 0.0, "a regen bonus was granted");
+        let surge_end = f.magicka_surge_until.expect("surge window");
+        let blackout_end = f.no_magicka_regen_until.expect("blackout window");
+        assert!(surge_end > now, "the surge is live now");
+        assert!(
+            blackout_end > surge_end,
+            "the blackout must START when the surge ENDS, not run concurrently — \
+             otherwise the drawback cancels the spell it is supposed to pay for"
+        );
+    }
+
+    /// Consuming Inferno charges its caster stamina AND health for every second it
+    /// burns. Both `_staminaCostPerSecond` and `_healthCostPerSecond` were unread, so
+    /// the spell was pure upside.
+    #[test]
+    fn consuming_inferno_drains_its_caster_while_it_burns() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        let u = uuid_of("ConsumingInferno");
+        let (stam0, hp0) = (c.fighters[0].stamina, c.fighters[0].health);
+        c.channels.push(super::super::state::ActiveChannel {
+            caster_slot: 0,
+            target_slot: 1,
+            ability_uuid: u.to_string(),
+            ability_level: 1,
+            remaining_ticks: 3,
+            magicka_full_at_cast: false,
+            next_tick_at: now,
+            interval_secs: super::super::damage::CHANNEL_TICK_INTERVAL_SECS,
+        });
+        let _ = super::apply_channel_ticks(&mut c, now);
+        assert!(c.fighters[0].stamina < stam0, "stamina must drain: {stam0} -> {}", c.fighters[0].stamina);
+        assert!(c.fighters[0].health < hp0, "health must drain: {hp0} -> {}", c.fighters[0].health);
+        assert!(!c.fighters[0].is_dead(), "upkeep must never self-kill");
+    }
+
+    /// Thunderstorm is three bolts over nine seconds, not one immediate hit. It ships
+    /// a per-BOLT `_damage`, so the DoT scheduler (which keys off `_damagePerSecond`)
+    /// never saw it.
+    #[test]
+    fn thunderstorm_schedules_its_authored_bolts() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        let u = uuid_of("Thunderstorm");
+        let out = apply_ability_impact(
+            &mut c, 0, 1, u, 1, super::super::state::AbilityTag::Damage, false, now,
+        );
+        assert!(!out.is_empty(), "the first bolt lands immediately");
+        let ch = c.channels.iter().find(|ch| ch.ability_uuid == u).expect("bolts scheduled");
+        assert_eq!(ch.remaining_ticks, 2, "3 bolts total = 1 now + 2 scheduled");
+        assert!(
+            (ch.interval_secs - 3.0).abs() < 0.01,
+            "9s / 3 bolts = 3s apart, got {}",
+            ch.interval_secs
+        );
+    }
+
+    /// A Blizzard Armor is weak to fire: `_vulnerableDamageTypes` is [Fire], so the
+    /// shield does not stop it. The shipped data names the TYPE and no magnitude, so
+    /// "does not absorb" is the reading that invents nothing.
+    #[test]
+    fn a_blizzard_armor_does_not_absorb_fire() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        apply_shipped_effects(&mut c, 0, 1, uuid_of("BlizzardArmor"), 1, 500.0, 0, now);
+        let pool = c.fighters[0].negation_pools.first().expect("a shield pool");
+        assert!(
+            pool.bypass_types.contains(&(super::super::state::DamageType::Fire as i32)),
+            "Fire must bypass the ice shield, got {:?}",
+            pool.bypass_types
+        );
+        use super::super::state::DamageType;
+        let mut fire = vec![(DamageType::Fire, 80.0)];
+        c.fighters[0].apply_negation_pools(&mut fire);
+        assert_eq!(fire[0].1, 80.0, "fire passes through in full");
+        let mut frost = vec![(DamageType::Frost, 80.0)];
+        c.fighters[0].apply_negation_pools(&mut frost);
+        assert!(frost[0].1 < 80.0, "…but frost is still absorbed");
+    }
+
     #[test]
     fn a_dodge_ability_gives_the_caster_a_dodge_pool() {
         let now = Instant::now();
@@ -8931,6 +9423,7 @@ mod report_31_high_block_stun {
             remaining_ticks: 6,
             next_tick_at: t0 + Duration::from_millis(200),
             magicka_full_at_cast: true,
+                    interval_secs: crate::arena::combat::damage::CHANNEL_TICK_INTERVAL_SECS,
         });
         c.pending_hits.push(PendingHit {
             sender: 0,
@@ -8947,6 +9440,7 @@ mod report_31_high_block_stun {
             level: 2,
             tag: AbilityTag::Paralyze,
             due: t0 + Duration::from_millis(1500),
+                    magicka_full_at_cast: false,
         });
 
         c.reset_fighters_for_next_round(t0 + Duration::from_secs(1));
