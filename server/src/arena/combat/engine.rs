@@ -345,7 +345,18 @@ pub struct MatchInstance {
     /// non-combat GameMessageId. Report #24's author pressed Ready during the
     /// between-rounds window (session 835, gmid 57 at 17:19:32) and the server did
     /// nothing with it.
-    skip_state_requested: bool,
+    /// The slots that have pressed it, NOT a single flag.
+    ///
+    /// It was a bool, so ONE player's Ready ended the break for both. Report
+    /// #113: "For the break to end and the fight to continue, either the limit is
+    /// reached or BOTH players have hit the button signifying they are ready to
+    /// proceed." His match bears that out — slot 0 pressed Ready, slot 1 never
+    /// did, and the walk advanced anyway, which is why the break "ended very
+    /// quickly" for the player who was still choosing.
+    ///
+    /// A solo/bot match has one human peer, so one press still skips immediately
+    /// and report #24's fix is untouched.
+    skip_state_requested: std::collections::BTreeSet<usize>,
     /// Round whose between-round profile relays are recorded in
     /// `interround_profiles_sent`. The client normally sends op36 for both fighters,
     /// and the SynchronizingLoadout step also has to cover a missing op36. Without
@@ -395,7 +406,7 @@ impl MatchInstance {
             debug_hold: debug_hold_window.is_some(),
             debug_hold_expires_at: debug_hold_window.map(|window| now + window),
             setup_step: 0,
-            skip_state_requested: false,
+            skip_state_requested: std::collections::BTreeSet::new(),
             interround_profile_round: None,
             interround_profiles_sent: vec![false; capacity],
         }
@@ -606,7 +617,7 @@ impl MatchInstance {
                     "combat c2s: slot {sender} op57 SkipCurrentState (Ready) in {} — advancing the pending MatchState on the next tick",
                     self.combat.phase_name(),
                 );
-                self.skip_state_requested = true;
+                self.skip_state_requested.insert(sender);
             } else {
                 debug!(
                     "combat c2s: slot {sender} op57 SkipCurrentState ignored in {} (no hold-driven walk running)",
@@ -1220,9 +1231,15 @@ impl MatchInstance {
         if hold_elapsed {
             return true;
         }
-        if self.skip_state_requested {
-            self.skip_state_requested = false;
-            info!("combat FSM: skipping the remaining hold — a client pressed Ready (op57)");
+        // EVERY human peer must have pressed Ready. Bots never press it, so the
+        // bar is the number of real peers rather than the number of fighters.
+        let needed = self.combat.expected_peers().max(1);
+        if self.skip_state_requested.len() >= needed {
+            let who: Vec<usize> = self.skip_state_requested.iter().copied().collect();
+            self.skip_state_requested.clear();
+            info!(
+                "combat FSM: skipping the remaining hold — all {needed} player(s) pressed Ready (op57), slots {who:?}"
+            );
             return true;
         }
         false
@@ -1835,6 +1852,76 @@ impl MatchInstance {
 
 #[cfg(test)]
 pub(in crate::arena::combat) mod tests {
+
+    /// Report #113: one player's Ready ended the between-rounds break for BOTH.
+    ///
+    /// The reporter, describing how retail behaves: "For the break to end and the
+    /// fight to continue, either the limit is reached or BOTH players have hit the
+    /// button signifying they are ready to proceed." His match log bears it out —
+    /// slot 0 pressed Ready, slot 1 never did, and the walk advanced anyway, which
+    /// is why the break "ended very quickly" while he was still choosing.
+    ///
+    /// `skip_state_requested` was a single bool, so the first press won.
+    #[test]
+    fn one_player_ready_does_not_end_a_two_player_break() {
+        let now = std::time::Instant::now();
+        let mut m = super::MatchInstance::new(2, 2, vec![], now);
+        m.skip_state_requested.insert(0);
+        assert!(
+            !m.take_skip_request(false),
+            "one of two players ready must NOT skip the hold"
+        );
+        m.skip_state_requested.insert(1);
+        assert!(
+            m.take_skip_request(false),
+            "both players ready must skip the hold"
+        );
+    }
+
+    /// The control that keeps report #24 fixed: a solo/bot match has ONE human
+    /// peer, so a single Ready must still skip immediately. A fix that simply
+    /// demanded two presses would strand every bot match on the loadout screen
+    /// for the full hold.
+    #[test]
+    fn one_ready_still_skips_in_a_solo_bot_match() {
+        let now = std::time::Instant::now();
+        // capacity 2 (player + bot) but only 1 real peer — the solo/bot shape.
+        let mut m = super::MatchInstance::new(2, 1, vec![], now);
+        m.skip_state_requested.insert(0);
+        assert!(
+            m.take_skip_request(false),
+            "the only human peer's Ready must still skip"
+        );
+    }
+
+    /// The timer still ends the break regardless of who pressed what — the other
+    /// half of the reporter's rule, and what stops an idle opponent freezing a
+    /// match forever.
+    #[test]
+    fn the_hold_expiring_ends_the_break_with_nobody_ready() {
+        let now = std::time::Instant::now();
+        let mut m = super::MatchInstance::new(2, 2, vec![], now);
+        assert!(
+            m.take_skip_request(true),
+            "an elapsed hold advances with no Ready presses at all"
+        );
+    }
+
+    /// A press must not bank: pressing Ready twice in one state cannot pay for the
+    /// next state too. The original code was careful about this and the change
+    /// must keep it.
+    #[test]
+    fn a_ready_press_does_not_bank_for_the_next_state() {
+        let now = std::time::Instant::now();
+        let mut m = super::MatchInstance::new(2, 2, vec![], now);
+        m.skip_state_requested.insert(0);
+        m.skip_state_requested.insert(1);
+        assert!(m.take_skip_request(false), "both ready — this state advances");
+        assert!(
+            !m.take_skip_request(false),
+            "the latch is consumed; the NEXT state waits for fresh presses"
+        );
+    }
 
     #[test]
     fn crossing_200_puts_transcendent_soul_gems_on_the_match_end_card() {
@@ -2923,8 +3010,18 @@ pub(in crate::arena::combat) mod tests {
         // (Slot 1 is still at 0 HP here — it lost round 1; the reset lands at InRound —
         //  so the assertion is that op57 changed nothing, not that anyone is healthy.)
         let hp_before = (m.fighter_health(0), m.fighter_health(1));
+        // BOTH slots press. This fixture is a two-HUMAN match (capacity 2,
+        // expected_peers 2), and a break ends on the timer or when every player has
+        // readied — report #113. It used to press only slot 0 and assert the walk
+        // advanced, which encoded the bug: one player's Ready cut the break short
+        // for an opponent still choosing their loadout. What this test is actually
+        // for — that op57 is read at all, rather than dropped as it was in report
+        // #24 — is unchanged, and the control below still proves the walk does not
+        // advance on its own.
         let op57 = c2s_handshake(m.combat.fighters[0].player_net_object_id, 57);
         assert!(m.on_c2s(0, &op57, now).is_empty(), "op57 itself emits nothing");
+        let op57_b = c2s_handshake(m.combat.fighters[1].player_net_object_id, 57);
+        assert!(m.on_c2s(1, &op57_b, now).is_empty(), "op57 itself emits nothing");
         assert_eq!(
             (m.fighter_health(0), m.fighter_health(1)),
             hp_before,
