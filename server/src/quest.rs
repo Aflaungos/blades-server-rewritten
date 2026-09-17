@@ -1740,12 +1740,17 @@ pub(crate) mod jobs_gen {
     // exact group retail picked for a given job is not recoverable; what matters for
     // the client is that the SHAPE is right and nothing is sent for scenery the
     // scene does not contain.
+    /// Referenced only by the tests, which assert it against `job_pools.json` —
+    /// the pruning below never needs to name a group it always keeps.
+    #[cfg(test)]
     pub(super) const JOB_ITEM_R1: Uuid =
         Uuid::from_u128(0x49adb60a_f5b2_4668_b96d_d69602a326cc_u128);
     pub(super) const JOB_ITEM_R2: Uuid =
         Uuid::from_u128(0xf1753fab_bd87_48a7_a2b4_79752b059c1c_u128);
     pub(super) const JOB_ITEM_R3: Uuid =
         Uuid::from_u128(0xf85079bc_4873_4773_b8fd_d78bf1a837c1_u128);
+    /// Test-only, for the same reason as [`JOB_ITEM_R1`].
+    #[cfg(test)]
     pub(super) const JOB_SECRET_ITEM_R1: Uuid =
         Uuid::from_u128(0xda153b3a_8a61_460c_9384_9e12ba8f50e3_u128);
     pub(super) const JOB_SECRET_ITEM_R2: Uuid =
