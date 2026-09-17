@@ -32,14 +32,38 @@ impl Attribute {
     }
 }
 
-/// Spend a level: +1 level and +1 point in the chosen attribute. (The client only
-/// calls this when the character has crossed an XP threshold, which it knows from its
-/// bundles; we trust it and apply the effect.)
+/// The last level that grants an attribute point.
+///
+/// `level_rewards.json` is explicit and unanimous: `attribute_points` is **1 for
+/// levels 1-50 and 0 for 51-100** — 50 entries each way, so the lifetime total
+/// caps at 50 however high the character goes.
+///
+/// This is a constant rather than a lookup because `level_rewards.json` lives in
+/// `deploy/static/`, which `.dockerignore` excludes from the image build — an
+/// `include_str!` reaching in there compiles locally and then fails only in the
+/// release build, which has already cost one broken deploy. The test
+/// `the_attribute_point_cap_matches_level_rewards_json` asserts the constant
+/// against the shipped file, so the data stays the authority without the trap.
+pub const MAX_ATTRIBUTE_POINT_LEVEL: u16 = 50;
+
+/// Spend a level: +1 level, and +1 point in the chosen attribute **only while the
+/// new level actually grants one**.
+///
+/// The point used to be unconditional, so a character kept earning one at every
+/// level for ever: at level 86 they would hold 85 where retail gives 50. Identity
+/// check against captured retail characters — levels 20, 36, 37, 38 and 41 all
+/// satisfy `stamina + magicka == level - 1` exactly, while the one captured
+/// level-56 character holds **49**, i.e. still capped at level 50's total.
+///
+/// (The client only calls this when the character has crossed an XP threshold,
+/// which it knows from its bundles; we trust it and apply the effect.)
 pub fn apply_levelup(ch: &mut CompleteCharacter, attribute: Attribute) {
     ch.level = ch.level.saturating_add(1);
-    match attribute {
-        Attribute::Stamina => ch.stamina_attribute_points = ch.stamina_attribute_points.saturating_add(1),
-        Attribute::Magicka => ch.magicka_attribute_points = ch.magicka_attribute_points.saturating_add(1),
+    if ch.level <= MAX_ATTRIBUTE_POINT_LEVEL {
+        match attribute {
+            Attribute::Stamina => ch.stamina_attribute_points = ch.stamina_attribute_points.saturating_add(1),
+            Attribute::Magicka => ch.magicka_attribute_points = ch.magicka_attribute_points.saturating_add(1),
+        }
     }
     ch.version += 1;
 }
@@ -565,5 +589,99 @@ mod tests {
         assert!(i.loadout.equipped_items.0.contains_key(&gear_slot), "gear equipped normally");
         assert_eq!(i.loadout.equipped_consumables, vec![potion], "potion routed to consumables, not dropped");
         assert!(t.modified_loadout.consumables_changed, "consumable change tracked for the diff");
+    }
+}
+
+#[cfg(test)]
+mod attribute_point_cap_tests {
+    use super::*;
+
+    fn at_level(level: u16) -> CompleteCharacter {
+        let mut ch = CompleteCharacter::default();
+        ch.level = level;
+        ch
+    }
+
+    /// THE CONSTANT MUST MATCH THE SHIPPED TABLE.
+    ///
+    /// `MAX_ATTRIBUTE_POINT_LEVEL` is hardcoded because `deploy/static/` is excluded
+    /// from the image build context, so it cannot be `include_str!`d. That is only
+    /// safe while something checks it against the file — otherwise the number drifts
+    /// silently and nothing ever notices.
+    #[test]
+    fn the_attribute_point_cap_matches_level_rewards_json() {
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../deploy/static/level_rewards.json");
+        let raw = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{p:?}: {e}"));
+        let table: std::collections::HashMap<String, serde_json::Value> =
+            serde_json::from_str(&raw).unwrap();
+
+        let granting: Vec<u16> = table
+            .iter()
+            .filter(|(_, v)| v["attribute_points"].as_i64() == Some(1))
+            .filter_map(|(k, _)| k.parse::<u16>().ok())
+            .collect();
+        let withholding: Vec<u16> = table
+            .iter()
+            .filter(|(_, v)| v["attribute_points"].as_i64() == Some(0))
+            .filter_map(|(k, _)| k.parse::<u16>().ok())
+            .collect();
+
+        assert!(!granting.is_empty() && !withholding.is_empty(), "both bands must exist");
+        assert_eq!(
+            granting.iter().copied().max().unwrap(),
+            MAX_ATTRIBUTE_POINT_LEVEL,
+            "the highest level granting a point must be the constant"
+        );
+        assert_eq!(
+            withholding.iter().copied().min().unwrap(),
+            MAX_ATTRIBUTE_POINT_LEVEL + 1,
+            "the first level withholding a point must be one above the constant"
+        );
+    }
+
+    /// Levelling INTO the cap still pays; levelling past it does not.
+    #[test]
+    fn the_point_stops_at_the_cap() {
+        // 49 -> 50 pays.
+        let mut ch = at_level(MAX_ATTRIBUTE_POINT_LEVEL - 1);
+        apply_levelup(&mut ch, Attribute::Stamina);
+        assert_eq!(ch.level, MAX_ATTRIBUTE_POINT_LEVEL);
+        assert_eq!(ch.stamina_attribute_points, 1, "the level that reaches the cap still pays");
+
+        // 50 -> 51 does not.
+        let mut ch = at_level(MAX_ATTRIBUTE_POINT_LEVEL);
+        apply_levelup(&mut ch, Attribute::Stamina);
+        assert_eq!(ch.level, MAX_ATTRIBUTE_POINT_LEVEL + 1);
+        assert_eq!(ch.stamina_attribute_points, 0, "the level past the cap pays nothing");
+    }
+
+    /// THE CONTROL: the level itself must keep rising, and the character must still
+    /// be written back. A fix that simply refused the level-up past 50 would satisfy
+    /// "no extra point" while silently capping progression — a worse bug.
+    #[test]
+    fn levelling_past_the_cap_still_levels_and_still_bumps_version() {
+        let mut ch = at_level(80);
+        let before = ch.version;
+        apply_levelup(&mut ch, Attribute::Magicka);
+        assert_eq!(ch.level, 81, "the level must still advance past the cap");
+        assert_eq!(ch.magicka_attribute_points, 0, "but no point is granted");
+        assert!(ch.version > before, "the character must still be persisted");
+    }
+
+    /// The retail identity this reproduces: total points == level - 1 below the cap,
+    /// and frozen at the cap above it. Measured on captured characters — levels 20,
+    /// 36, 37, 38, 41 match exactly; the one captured level-56 holds 49.
+    #[test]
+    fn total_points_track_retails_measured_shape() {
+        let mut ch = at_level(1);
+        for _ in 0..60 {
+            apply_levelup(&mut ch, Attribute::Stamina);
+        }
+        assert_eq!(ch.level, 61);
+        assert_eq!(
+            ch.stamina_attribute_points, 49,
+            "a character past the cap holds exactly what level 50 granted"
+        );
     }
 }
