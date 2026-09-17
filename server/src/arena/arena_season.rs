@@ -66,7 +66,6 @@
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use blades_lib::static_data::Announcement;
 use blades_lib::user_data::CompleteCharacter;
 
 /// Which trophy-scoring model a season runs.
@@ -248,60 +247,6 @@ pub fn roll_character_into(ch: &mut CompleteCharacter, season: &SeasonConfig) ->
     RolloverOutcome { reset: true, archived_under }
 }
 
-/// The in-game news entry announcing a season.
-///
-/// Shape is the captured `announcements.json` record verbatim — the five keys
-/// `assetUrl` / `id` / `startTime` / `ttl` / `type`, nothing more. All 156
-/// captured retail records are `"type": "BASIC"`, and 155 of them run for exactly
-/// `86_340` seconds (one day less a minute), which is what this reproduces.
-///
-/// The `assetUrl` follows retail's `/{YYYY}/{MM}/{DD}/{id}` path on
-/// `announcements.blades.bgs.services` — a host this server already answers on
-/// (see `status.rs`). **No banner image is shipped**: like the 156 replayed retail
-/// entries, the client will show the news item and quietly fail to load its
-/// artwork until someone drops a PNG at that path.
-pub fn season_announcement(season: &SeasonConfig) -> Announcement {
-    let (year, month, day) = ymd_from_unix(season.start_unix);
-    let id = announcement_id(season);
-    Announcement {
-        asset_url: format!(
-            "https://announcements.blades.bgs.services/{year:04}/{month:02}/{day:02}/{id}"
-        ),
-        id: id.to_string(),
-        start_time: season.start_unix,
-        ttl: season.start_unix + ANNOUNCEMENT_TTL_SECS,
-        r#type: "BASIC".to_string(),
-    }
-}
-
-/// Civil `(year, month, day)` in UTC for a unix timestamp.
-///
-/// Howard Hinnant's `civil_from_days`. Written out rather than pulling in a date
-/// crate for one call — and covered by a test against the two season boundaries,
-/// which are the only timestamps this is ever asked about.
-pub fn ymd_from_unix(unix: i64) -> (i32, u32, u32) {
-    let z = unix.div_euclid(86_400) + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = doy - (153 * mp + 2) / 5 + 1;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 };
-    ((y + i64::from(m <= 2)) as i32, m as u32, d as u32)
-}
-
-/// `ttl - startTime` on 155 of the 156 captured retail announcements.
-pub const ANNOUNCEMENT_TTL_SECS: i64 = 86_340;
-
-/// A deterministic announcement id derived from the season id, so regenerating
-/// the news file cannot produce a second entry for the same season.
-fn announcement_id(season: &SeasonConfig) -> Uuid {
-    // Flip the top nibble of the season id: stable, collision-free against the
-    // season id itself, and reproducible without a random source.
-    Uuid::from_u128(season.id.as_u128() ^ (0xF << 124))
-}
 
 #[cfg(test)]
 mod tests {
@@ -452,39 +397,4 @@ mod tests {
         assert!(season_at(SEASON_2026_09.end_unix).is_none(), "end is exclusive");
     }
 
-    #[test]
-    fn ymd_from_unix_agrees_with_the_season_boundaries() {
-        assert_eq!(ymd_from_unix(SEASON_2026_09.start_unix), (2026, 9, 1));
-        assert_eq!(ymd_from_unix(SEASON_2026_09.end_unix), (2026, 10, 1));
-        assert_eq!(ymd_from_unix(SEASON_2026_09.start_unix - 1), (2026, 8, 31));
-        assert_eq!(ymd_from_unix(0), (1970, 1, 1));
-        // A leap day, which the naive "days / 365" version gets wrong.
-        assert_eq!(ymd_from_unix(1_709_164_800), (2024, 2, 29));
-    }
-
-    #[test]
-    fn announcement_matches_the_captured_record_shape() {
-        let a = season_announcement(&SEASON_2026_09);
-        let v = serde_json::to_value(&a).unwrap();
-
-        // Exactly the five keys every one of the 156 captured records carries.
-        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(|s| s.as_str()).collect();
-        keys.sort_unstable();
-        assert_eq!(keys, ["assetUrl", "id", "startTime", "ttl", "type"]);
-
-        assert_eq!(v["type"], "BASIC");
-        assert_eq!(v["startTime"], SEASON_2026_09.start_unix);
-        assert_eq!(v["ttl"], SEASON_2026_09.start_unix + 86_340);
-        // Retail's own path layout: host/YYYY/MM/DD/<the record's own id>.
-        assert_eq!(
-            v["assetUrl"],
-            format!(
-                "https://announcements.blades.bgs.services/2026/09/01/{}",
-                v["id"].as_str().unwrap()
-            )
-        );
-        // …and the id is a UUID, like every captured record's.
-        assert!(Uuid::parse_str(v["id"].as_str().unwrap()).is_ok());
-        assert_ne!(v["id"].as_str().unwrap(), SEASON_2026_09.id.to_string());
-    }
 }
