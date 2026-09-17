@@ -15,4 +15,5 @@ pub mod global_shop;
 pub mod merchant;
 pub mod repair;
 pub mod salvage;
+pub mod store_bundles;
 pub mod level_up;
