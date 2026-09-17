@@ -710,16 +710,38 @@ pub fn on_c2s_input(
         return Vec::new();
     }
     // A STAGGERED sender can't act either, for `baseStaggerDuration` (1.5 s). [Phase 3.13]
+    //
+    // …with exactly ONE exception, and it is the whole point of the ability:
+    // Recovery Strikes. `Ability.Maneuver.RecoveryStrikes.Description` reads
+    //
+    //     "These Quick Strikes can be performed AT ANY TIME, EXCEPT WHEN PARALYZED.
+    //      They each deal {0} extra damage (no extra damage for two-handed weapons)."
+    //
+    // It is the only ability in the whole shipped description corpus that says this
+    // — a survey of every `*.Description` string for "at any time" / "staggered"
+    // returns Recovery Strikes and nothing else. A level-25, 5-point maneuver whose
+    // sole selling point is acting through a stun did nothing through a stun here,
+    // because this gate dropped every input from a staggered fighter.
+    //
+    // The paralysis gate above still applies, which is the one exception the text
+    // itself names, so it deliberately stays in front of this.
     if combat.fighters[sender].is_staggered(now) {
-        if matches!(parse_input_activate(user_data), Some(act) if !act.held) {
-            info!(
-                "combat attack_input: gsid={} input=player slot={sender} actor={} outcome=staggered",
-                combat.game_session_id,
-                combat.fighters[sender].loadout.display_name,
-            );
+        let recovery_strike = input::parse_execute_ability(user_data)
+            .is_some_and(|ea| is_recovery_strikes(&ea.ability_uuid));
+        if !recovery_strike {
+            if matches!(parse_input_activate(user_data), Some(act) if !act.held) {
+                info!(
+                    "combat attack_input: gsid={} input=player slot={sender} actor={} outcome=staggered",
+                    combat.game_session_id,
+                    combat.fighters[sender].loadout.display_name,
+                );
+            }
+            debug!("combat: slot {sender} input ignored — staggered");
+            return Vec::new();
         }
-        debug!("combat: slot {sender} input ignored — staggered");
-        return Vec::new();
+        info!(
+            "combat: slot {sender} acts THROUGH a stagger — Recovery Strikes (performable at any time)",
+        );
     }
 
     // `PlayerCombatInputActivate` (gmid 46) on the 0x36 carrier — the discrete
@@ -877,6 +899,16 @@ pub fn on_c2s_input(
         let side = classified_side_for(&combat.fighters[sender], now);
         resolve_swing_with_side(combat, sender, target_slot, 1.0, side, now)
     }
+}
+
+/// `Recovery Strikes` — the one maneuver the shipped data says may be performed
+/// while staggered. Pinned by uuid because that is what arrives on the wire; the
+/// test `the_recovery_strikes_uuid_still_names_recovery_strikes` checks the uuid
+/// against the shipped ability table, so a data change cannot silently unhook it.
+const RECOVERY_STRIKES_UUID: &str = "e08f95de-85bb-4829-ba7e-cf45bc6fb422";
+
+fn is_recovery_strikes(ability_uuid: &str) -> bool {
+    ability_uuid.eq_ignore_ascii_case(RECOVERY_STRIKES_UUID)
 }
 
 /// A weapon auto-attack (committed swing), throttled per attacker.
@@ -8673,6 +8705,81 @@ mod shipped_effects_tests {
         let out = apply_shipped_effects(&mut c, 0, 1, uuid_of("StaggeringBash"), 1, 0.0, 0, now);
         assert!(!c.fighters[1].is_staggered(now), "no damage → no stagger");
         assert_eq!(status_frames(&out, super::super::state::StatusEffectType::Staggered), 0);
+    }
+
+    /// RECOVERY STRIKES MUST WORK THROUGH A STUN. That is the entire ability.
+    ///
+    /// `Ability.Maneuver.RecoveryStrikes.Description`: *"These Quick Strikes can be
+    /// performed at any time, except when Paralyzed."* It is the ONLY ability in the
+    /// shipped description corpus that says so — surveying every `*.Description`
+    /// string for "at any time" / "staggered" returns Recovery Strikes and nothing
+    /// else.
+    ///
+    /// The staggered-input gate dropped every frame from a staggered fighter, so a
+    /// level-25, 5-ability-point maneuver bought purely to act through a stun did
+    /// nothing through a stun. Reported by Taheen (#113) as being unable to act out
+    /// of a stun.
+    #[test]
+    fn recovery_strikes_can_be_performed_while_staggered() {
+        let now = Instant::now();
+        let mut c = combat2(now);
+        c.fighters[0].apply_stagger_for(now, 2.5);
+        assert!(c.fighters[0].is_staggered(now), "the fixture must actually stun slot 0");
+
+        let obj = c.fighters[0].net_object_id;
+        let frame = messages::request_execute_ability(obj, RECOVERY_STRIKES_UUID);
+        let out = on_c2s_input(&mut c, 0, &frame, now + Duration::from_millis(100));
+
+        assert!(
+            !out.is_empty(),
+            "a staggered fighter must still be able to perform Recovery Strikes"
+        );
+    }
+
+    /// THE CONTROL, and it is the one that matters: the exception must be exactly one
+    /// ability wide. A gate that simply stopped blocking staggered input would pass
+    /// the test above while deleting the stun from the game.
+    #[test]
+    fn a_stagger_still_blocks_every_other_input() {
+        let now = Instant::now();
+        let at = now + Duration::from_millis(100);
+
+        // A different ability — Dodging Strike — is still refused.
+        let mut c = combat2(now);
+        c.fighters[0].apply_stagger_for(now, 2.5);
+        let obj = c.fighters[0].net_object_id;
+        let dodge = messages::request_execute_ability(obj, &uuid_of("DodgingStrike"));
+        assert!(
+            on_c2s_input(&mut c, 0, &dodge, at).is_empty(),
+            "a stagger must still block other abilities"
+        );
+
+        // …and so is an ordinary weapon swing.
+        let mut c2 = combat2(now);
+        c2.fighters[0].apply_stagger_for(now, 2.5);
+        assert!(
+            on_c2s_input(&mut c2, 0, &[0xBE, 0x36], at).is_empty(),
+            "a stagger must still block a plain swing"
+        );
+
+        // …and the un-staggered control proves the fixture is not simply inert:
+        // the same dodge frame DOES produce output with no stagger applied.
+        let mut c3 = combat2(now);
+        assert!(
+            !on_c2s_input(&mut c3, 0, &dodge, at).is_empty(),
+            "without a stagger the same frame must act — otherwise this proves nothing"
+        );
+    }
+
+    /// The uuid the gate pins must still be Recovery Strikes in the shipped table, so
+    /// a regenerated gamedata.rs cannot silently unhook the exception.
+    #[test]
+    fn the_recovery_strikes_uuid_still_names_recovery_strikes() {
+        let a = super::super::gamedata::ABILITIES
+            .iter()
+            .find(|a| a.uuid == RECOVERY_STRIKES_UUID)
+            .expect("the pinned uuid must exist in the shipped ability table");
+        assert_eq!(a.editor_name, "RecoveryStrikes");
     }
 
     /// And a dead target is not staggered — the pre-existing guard, kept.
