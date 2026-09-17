@@ -416,6 +416,11 @@ struct PurchaseResponse {
 fn grant_from_offer_contents(
     contents: Option<&OfferContents>,
     repair_data: &blades_lib::features::repair::RepairData,
+    // Varies per purchase, so buying the same arcane offer twice can roll two
+    // different grades — which is what retail did. Unlike dungeon loot this does
+    // NOT need to be reproducible: the purchase response IS the grant, there is
+    // nothing described in advance to stay consistent with.
+    roll_nonce: u64,
 ) -> Option<RewardGrant> {
     let c = contents?;
     // `NeedsRoll` is now grantable — that is the whole of this change: its gear is
@@ -444,13 +449,28 @@ fn grant_from_offer_contents(
         // table at that temper level.
         if entry.bucket == "items" {
             // `grading` empty on an arcane item means retail ROLLED the grade at
-            // purchase — 3 of the 73 identity-checked grants are exactly that, and
-            // their recorded grades differ from each other. Handing those over
-            // ungraded would short-change a player who paid, so the offer stays
-            // ungrantable until the roll is modelled.
-            if entry.grading.is_empty() && entry.arcane_tier > 0 {
-                return None;
-            }
+            // purchase; the APK records that a roll happens, never its outcome.
+            // Ninety offers are like this and they used to be refused outright,
+            // so most of the Sigil shop could not be bought at all (#167).
+            //
+            // The roll is now drawn from what retail actually handed out — 243
+            // grants, keyed by arcane tier, with the ungraded outcome kept
+            // because 111 of the 235 tier-2 grants had no grade. That is a
+            // distribution of outcomes and not retail's rule, which is not
+            // recoverable from anything we hold; the reporter was told so and
+            // asked for it anyway.
+            //
+            // A tier the corpus has never seen is still refused rather than
+            // handed over ungraded: that is the case the old refusal was right
+            // about.
+            let rolled_grading = if entry.grading.is_empty() && entry.arcane_tier > 0 {
+                Some(blades_lib::features::sigil_grades::roll_grading(
+                    entry.arcane_tier,
+                    roll_nonce,
+                )?)
+            } else {
+                None
+            };
             let durability = repair_data.max_durability(entry.item_template_id, entry.tempering_level)?;
             let properties = blades_lib::user_data::ItemPropertiesAll {
                 enchanting: entry
@@ -458,15 +478,25 @@ fn grant_from_offer_contents(
                     .iter()
                     .map(|p| blades_lib::user_data::ItemSingleProperty { id: p.id, tier: p.tier })
                     .collect(),
-                grading: entry
-                    .grading
-                    .iter()
-                    .map(|p| blades_lib::user_data::ItemSingleProperty { id: p.id, tier: p.tier })
-                    .collect(),
+                // The rolled grade when this offer leaves it to a roll, the
+                // authored one otherwise.
+                grading: rolled_grading.clone().unwrap_or_else(|| {
+                    entry
+                        .grading
+                        .iter()
+                        .map(|p| blades_lib::user_data::ItemSingleProperty {
+                            id: p.id,
+                            tier: p.tier,
+                        })
+                        .collect()
+                }),
             };
             // `grade` is the SUM of the grading tiers, not their count — 8/8
             // against the captured grants, where counting scores 2/8.
-            let grade: u64 = entry.grading.iter().map(|p| p.tier).sum();
+            let grade: u64 = match &rolled_grading {
+                Some(rolled) => rolled.iter().map(|p| p.tier).sum(),
+                None => entry.grading.iter().map(|p| p.tier).sum(),
+            };
             for _ in 0..entry.quantity.max(1) {
                 reward.items.push(blades_lib::economy::RewardItem {
                     // A fresh instance per purchase; the frozen ids in the
@@ -615,6 +645,13 @@ pub async fn purchase_global_shop(
                 .global_shop_offer_contents
                 .get(&body.global_shop_product_id),
             &app_state.repair_data,
+            // Fresh per purchase. Retail rolled the arcane grade every time, and
+            // the purchase response is the grant, so there is nothing described
+            // in advance that this has to stay consistent with.
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos() as u64 ^ d.as_secs())
+                .unwrap_or(0),
         )
         .ok_or_else(|| {
             // NOT a 404. This comment's own neighbour records why: a 404 here makes
@@ -1263,7 +1300,7 @@ mod replay_tests {
             .filter_map(|k| Uuid::parse_str(k).ok())
             .find(|id| {
                 !sd.global_shop_grants.contains_key(id)
-                    && grant_from_offer_contents(sd.global_shop_offer_contents.get(id), &repair_data()).is_none()
+                    && grant_from_offer_contents(sd.global_shop_offer_contents.get(id), &repair_data(), 1).is_none()
             });
         let id = undeliverable.expect(
             "the corpus must still contain undeliverable offers, or this test is moot",
@@ -1475,6 +1512,7 @@ mod replay_tests {
                 || grant_from_offer_contents(
                     sd.global_shop_offer_contents.get(&uuid),
                     &repair_data(),
+                    1,
                 )
                 .is_some();
             if grantable {
@@ -1704,6 +1742,9 @@ mod offer_contents_fallback {
     const GOLD: Uuid = Uuid::from_u128(0xf8d27767_a85e_4fd6_a5bb_bf8a13d0daa2);
     const CLAY: Uuid = Uuid::from_u128(0x42d91529_c88b_4c5b_815b_b55508b4e7ef);
     const SWORD: Uuid = Uuid::from_u128(0x0000_0001);
+    /// SigilShop_Armor_ChitinGauntlets_Arcane02 — a REAL arcane offer template
+    /// with a durability row, so a refusal here can only be about the grade.
+    const ARCANE_GAUNTLETS: Uuid = Uuid::from_u128(0x208d05ed_74bf_4fef_b5e1_ed407d52432f);
 
     fn entry(id: Uuid, qty: u64, bucket: &str) -> OfferContentEntry {
         OfferContentEntry {
@@ -1729,7 +1770,7 @@ mod offer_contents_fallback {
             OfferContentsKind::Literal,
             vec![entry(GOLD, 10_000, "currencies"), entry(CLAY, 85, "stackableItems")],
         );
-        let r = grant_from_offer_contents(Some(&o), &repair_data()).expect("literal must be grantable");
+        let r = grant_from_offer_contents(Some(&o), &repair_data(), 1).expect("literal must be grantable");
         assert_eq!(r.currencies.get(&GOLD), Some(&10_000));
         assert_eq!(r.stackable_items.get(&CLAY), Some(&85));
         assert!(r.items.is_empty(), "nothing may be invented into `items`");
@@ -1757,7 +1798,7 @@ mod offer_contents_fallback {
             if recorded.items.len() != 1 {
                 continue;
             }
-            let Some(built) = grant_from_offer_contents(sd.global_shop_offer_contents.get(id), &rd)
+            let Some(built) = grant_from_offer_contents(sd.global_shop_offer_contents.get(id), &rd, 1)
             else {
                 continue;
             };
@@ -1787,15 +1828,20 @@ mod offer_contents_fallback {
     ///
     /// Three of the identity-checked grants are exactly this shape — same
     /// enhancement, but retail's recorded instances carry 3, 3 and 1 grading
-    /// properties, differing between them. There is no authored answer, so granting
-    /// one would short-change a player who paid.
+    /// properties, differing between them. There is no AUTHORED answer, which is
+    /// why this was refused outright until the roll was modelled from 243
+    /// recorded retail grants (#167). It is now granted with a drawn grade, and
+    /// a tier the corpus has never seen is still refused.
     #[test]
-    fn an_arcane_item_with_no_authored_grading_is_refused() {
+    fn an_arcane_item_with_no_authored_grading_has_its_grade_rolled() {
         let arcane_no_grading = OfferContents {
             kind: OfferContentsKind::NeedsRoll,
             town_xp: 0,
             contents: vec![OfferContentEntry {
-                item_template_id: GOLD,
+                // A real arcane template with a durability row. GOLD has none,
+                // so the old fixture was refused for the missing durability as
+                // much as for the missing grade — it could not tell them apart.
+                item_template_id: ARCANE_GAUNTLETS,
                 quantity: 1,
                 bucket: "items".into(),
                 tempering_level: 0,
@@ -1804,9 +1850,38 @@ mod offer_contents_fallback {
                 grading: Vec::new(),
             }],
         };
+        // This used to assert the offer was REFUSED, and that was right while the
+        // roll was unmodelled — inventing a grade would have short-changed a
+        // player who paid. The roll is now drawn from 243 recorded retail grants
+        // (#167), so the correct behaviour is the opposite: it is granted, and
+        // two purchases can come out differently.
+        let mut outcomes = std::collections::HashSet::new();
+        for nonce in 0..80u64 {
+            let r = grant_from_offer_contents(Some(&arcane_no_grading), &repair_data(), nonce)
+                .expect("an arcane offer must now be grantable");
+            // indexed, not `.first()`: diesel's prelude brings its own `first`
+            // into scope here and it shadows the slice method.
+            assert_eq!(r.items.len(), 1, "one item");
+            let item = &r.items[0].item;
+            outcomes.insert(format!("{:?}", item.properties.grading));
+            assert_eq!(
+                item.grade.unwrap_or(0),
+                item.properties.grading.iter().map(|p| p.tier).sum::<u64>(),
+                "grade must be the SUM of the rolled grading tiers"
+            );
+        }
         assert!(
-            grant_from_offer_contents(Some(&arcane_no_grading), &repair_data()).is_none(),
-            "a rolled grade must not be invented"
+            outcomes.len() > 1,
+            "every purchase rolled the same grade; retail's did not"
+        );
+
+        // An arcane tier the corpus has never seen stays refused — that is the
+        // case the old refusal was right about, and it must not regress.
+        let mut unknown_tier = arcane_no_grading.clone();
+        unknown_tier.contents[0].arcane_tier = 9;
+        assert!(
+            grant_from_offer_contents(Some(&unknown_tier), &repair_data(), 1).is_none(),
+            "a grade must not be invented for a tier retail never showed"
         );
 
         // …and the same entry WITH authored grading is grantable, so the refusal is
@@ -1818,7 +1893,7 @@ mod offer_contents_fallback {
         }];
         // (Only reaches the durability lookup; a template with no durability row is
         // still refused, which is asserted separately.)
-        let _ = grant_from_offer_contents(Some(&graded), &repair_data());
+        let _ = grant_from_offer_contents(Some(&graded), &repair_data(), 1);
     }
 
     /// The refusals that REMAIN.
@@ -1840,14 +1915,14 @@ mod offer_contents_fallback {
         ] {
             let o = offer(kind, vec![entry(GOLD, 1, "currencies")]);
             assert!(
-                grant_from_offer_contents(Some(&o), &repair_data()).is_none(),
+                grant_from_offer_contents(Some(&o), &repair_data(), 1).is_none(),
                 "{kind:?} must not be grantable from template data"
             );
         }
         // control: the identical contents under `Literal` ARE grantable, so the
         // refusals above are about the kind and not about the contents.
         let o = offer(OfferContentsKind::Literal, vec![entry(GOLD, 1, "currencies")]);
-        assert!(grant_from_offer_contents(Some(&o), &repair_data()).is_some());
+        assert!(grant_from_offer_contents(Some(&o), &repair_data(), 1).is_some());
     }
 
     /// A gear entry inside an otherwise-literal offer must sink the whole offer,
@@ -1859,7 +1934,7 @@ mod offer_contents_fallback {
             vec![entry(GOLD, 500, "currencies"), entry(SWORD, 1, "items")],
         );
         assert!(
-            grant_from_offer_contents(Some(&o), &repair_data()).is_none(),
+            grant_from_offer_contents(Some(&o), &repair_data(), 1).is_none(),
             "a partial grant is a silent short-change"
         );
     }
@@ -1868,9 +1943,9 @@ mod offer_contents_fallback {
     /// the price is charged before the reward is applied.
     #[test]
     fn an_empty_or_absent_offer_is_not_a_purchase() {
-        assert!(grant_from_offer_contents(None, &repair_data()).is_none(), "unknown product");
+        assert!(grant_from_offer_contents(None, &repair_data(), 1).is_none(), "unknown product");
         let o = offer(OfferContentsKind::Literal, vec![]);
-        assert!(grant_from_offer_contents(Some(&o), &repair_data()).is_none(), "empty reward");
+        assert!(grant_from_offer_contents(Some(&o), &repair_data(), 1).is_none(), "empty reward");
     }
 
     /// townXp rides through, and on its own is enough to be a real reward —
@@ -1879,7 +1954,7 @@ mod offer_contents_fallback {
     fn town_xp_rides_through() {
         let mut o = offer(OfferContentsKind::Literal, vec![entry(GOLD, 5, "currencies")]);
         o.town_xp = 40;
-        let r = grant_from_offer_contents(Some(&o), &repair_data()).expect("grantable");
+        let r = grant_from_offer_contents(Some(&o), &repair_data(), 1).expect("grantable");
         assert_eq!(r.town_xp, 40);
     }
 
@@ -1890,7 +1965,7 @@ mod offer_contents_fallback {
             OfferContentsKind::Literal,
             vec![entry(GOLD, 100, "currencies"), entry(GOLD, 25, "currencies")],
         );
-        let r = grant_from_offer_contents(Some(&o), &repair_data()).expect("grantable");
+        let r = grant_from_offer_contents(Some(&o), &repair_data(), 1).expect("grantable");
         assert_eq!(r.currencies.get(&GOLD), Some(&125));
     }
 }
