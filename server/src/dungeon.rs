@@ -978,19 +978,32 @@ mod dungeon_settings_resolution {
             .dungeons
             .get(&settings_id)
             .expect("served id is a dungeon");
-        let mut served: Vec<Uuid> = dungeon
+        let served: std::collections::HashSet<Uuid> = dungeon
             .spawn_info
             .enemy_spawn_groups
             .keys()
             .copied()
             .collect();
-        let mut carried: Vec<Uuid> = generated.enemy_generated_data.keys().copied().collect();
-        served.sort();
-        carried.sort();
+        let carried: std::collections::HashSet<Uuid> =
+            generated.enemy_generated_data.keys().copied().collect();
         assert!(!carried.is_empty(), "a job must have enemies to kill");
-        assert_eq!(
-            served, carried,
-            "the dungeon we tell the client to load must be the one its data describes"
+
+        // SUBSET, not equality.
+        //
+        // The danger is generated data naming a spawn group the dungeon does not
+        // have — nothing spawns, the Abyss failure. A dungeon carrying groups the
+        // data does not mention is the opposite, and it is what retail does: a job
+        // with no secret room simply has no entry for the secret-room boss, and a
+        // Duel carries three of the reference's six.
+        //
+        // This asserted equality, and only passed because the non-duel path used to
+        // emit all six groups unconditionally — the very defect of report #168. The
+        // Duel path has contradicted it since PR #203 and duels work; the fixture
+        // here just never exercised a Duel.
+        let missing: Vec<&Uuid> = carried.difference(&served).collect();
+        assert!(
+            missing.is_empty(),
+            "generated data names spawn groups the served dungeon does not have: {missing:?}"
         );
     }
 }
