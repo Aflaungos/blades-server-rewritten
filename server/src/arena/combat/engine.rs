@@ -1464,6 +1464,27 @@ impl MatchInstance {
             .map(|d| d.as_secs().min(i64::MAX as u64) as i64)
             .unwrap_or(0);
 
+        // The per-round (winner, loser) pairs the card's RoundInfos carries — the same
+        // cumulative array op48 sends, built the same way. `round_winners` records the
+        // winning SLOT of each round in order; `rounds_won` is only a tally and cannot
+        // say WHICH round each side took.
+        let round_results: Vec<(String, String)> = self
+            .combat
+            .round_winners
+            .iter()
+            .map(|&w| {
+                let l = 1 - w;
+                let uuid = |s: usize| {
+                    self.combat
+                        .fighters
+                        .get(s)
+                        .map(|f| f.loadout.character_uuid.clone())
+                        .unwrap_or_default()
+                };
+                (uuid(w), uuid(l))
+            })
+            .collect();
+
         // Pre-match PvP state per slot, read off the loaded character profiles. The
         // opponent's trophies feed the Elo swing, so both sides are resolved up front.
         let pre: Vec<PrePvpState> = (0..n)
@@ -1640,6 +1661,7 @@ impl MatchInstance {
             );
             let frame = messages::match_end_match(
                 self.combat.match_net_object_id,
+                &round_results,
                 &winner_uuid,
                 &loser_uuid,
                 MATCH_END_RESULT_CODE,
