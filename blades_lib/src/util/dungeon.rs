@@ -1264,15 +1264,40 @@ mod floor_pile_tests {
 
     /// The same pile, described twice, must be identical — the client is told
     /// once what is on the floor and must still find it there.
+    ///
+    /// Compared per spawn, NOT by serialising the two maps and diffing the
+    /// strings: `item_generated_data` is a `HashMap`, whose iteration order is
+    /// randomised per process, so the string comparison passes locally and fails
+    /// in CI for a reason that has nothing to do with stability. It did exactly
+    /// that once.
     #[test]
     fn a_pile_is_stable_between_descriptions() {
+        // Over EVERY dungeon, not `dungeons.keys().next()`: that picks an
+        // arbitrary entry out of a HashMap and most dungeons have no floor
+        // items at all, so the test compared nothing and failed its own guard
+        // at random. It did exactly that before this comment existed.
         let game_data = game_data();
-        let dungeon_id = *game_data.dungeons.keys().next().unwrap();
-        let a = generate_for_dungeon(&game_data, &dungeon_id, 20, 5).unwrap();
-        let b = generate_for_dungeon(&game_data, &dungeon_id, 20, 5).unwrap();
-        assert_eq!(
-            serde_json::to_string(&a.item_generated_data).unwrap(),
-            serde_json::to_string(&b.item_generated_data).unwrap()
-        );
+        let mut compared = 0;
+        for dungeon_id in game_data.dungeons.keys() {
+            let a = generate_for_dungeon(&game_data, dungeon_id, 20, 5).unwrap();
+            let b = generate_for_dungeon(&game_data, dungeon_id, 20, 5).unwrap();
+            assert_eq!(a.item_generated_data.len(), b.item_generated_data.len());
+            for (spawn, first) in &a.item_generated_data {
+                let second = b
+                    .item_generated_data
+                    .get(spawn)
+                    .unwrap_or_else(|| panic!("spawn {spawn} vanished between descriptions"));
+                assert_eq!(first.len(), second.len(), "pile size moved for spawn {spawn}");
+                for (x, y) in first.iter().zip(second.iter()) {
+                    assert_eq!(
+                        serde_json::to_value(&x.loot_table_loot).unwrap(),
+                        serde_json::to_value(&y.loot_table_loot).unwrap(),
+                        "contents moved for spawn {spawn}"
+                    );
+                    compared += 1;
+                }
+            }
+        }
+        assert!(compared > 1_000, "only {compared} floor results compared");
     }
 }
