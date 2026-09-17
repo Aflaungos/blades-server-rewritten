@@ -1677,6 +1677,42 @@ pub(crate) mod jobs_gen {
     pub(super) const JOB_BOSS_SPAWN_GROUP: Uuid =
         Uuid::from_u128(0x690d51c4_46c3_4546_bf82_e267289aca02_u128);
 
+    // The remaining groups the reference dungeon carries, from
+    // `job_pools.json` → `globals.enemySpawnGroups` and `parsed.json`'s
+    // `JobSpawnGroupsReference` (where `b7c5dbab` is named "Gather").
+    //
+    // A NON-duel job needs the same pruning a Duel got. The comment above says the
+    // old generator "gives the Duel scene data for objects that do not exist there
+    // and leaves the client waiting at load" — that is true of ordinary jobs too,
+    // and the duel fix only ever pruned `jobType == 5`.
+    //
+    // Retail's rules, over 1395 captured non-duel jobs, all three perfect bijections
+    // with no counterexample:
+    //
+    //   secret-boss group present  <=>  jobSetup.secretBossEnemyFamilyId present
+    //                                   (233/233 yes, 0/1162 no; and 0/789 of
+    //                                    `secretRoom:false` jobs carry it)
+    //   primary spawner count      ==   jobSetup.primaryEnemyCount   (1395/1395)
+    //   secondary spawner count    ==   jobSetup.secondaryEnemyCount (1395/1395)
+    //   "Gather" item group        <=>  jobSetup.gatherItemId present
+    //                                   (288/288 yes, 0/1107 no)
+    //
+    // We sent all six enemy groups and all seven item groups on every job, with the
+    // reference's own authored counts (6 primary, 4 secondary). On the live board
+    // that put the secret-room boss into 219 of 564 job entries whose own setup says
+    // there is no secret room — 39%, which is the "some jobs" of report #168.
+    //
+    // Keyed on `secretBossEnemyFamilyId`, NOT on `secretRoom`: retail has 373 jobs
+    // with a secret room and no secret boss, so the two are not the same condition.
+    pub(super) const JOB_PRIMARY_SPAWN_GROUP: Uuid =
+        Uuid::from_u128(0xb2a7471e_7a44_47a6_b483_503a9e5cae3d_u128);
+    pub(super) const JOB_SECONDARY_SPAWN_GROUP: Uuid =
+        Uuid::from_u128(0xc9ad5aae_200b_48fd_860e_ad45e0349ef0_u128);
+    pub(super) const JOB_SECRET_BOSS_SPAWN_GROUP: Uuid =
+        Uuid::from_u128(0xdf0f7a93_5f9d_4d36_b9f9_c087da9858de_u128);
+    pub(super) const JOB_GATHER_ITEM_SPAWN_GROUP: Uuid =
+        Uuid::from_u128(0xb7c5dbab_14b9_4157_a3f3_b1d34e676864_u128);
+
     /// Stored JOB `quests` rows are tagged with this sentinel `gldQuestId` so the
     /// /quests handler can (a) keep them out of the `quests[]` array and (b)
     /// recognise a prior-window job row when pruning. It is a fixed, otherwise
@@ -2131,6 +2167,48 @@ pub(crate) mod jobs_gen {
                 for enemies in spawners {
                     for enemy in enemies {
                         enemy.enemy_level = level;
+                        enemy.given_xp = xp;
+                    }
+                }
+            }
+        } else {
+            // An ORDINARY job needs the same treatment for the same reason. See the
+            // constants above for the three measured rules and their sample counts.
+
+            // 1. The secret-room boss only exists when the job has one.
+            if setup.get("secretBossEnemyFamilyId").is_none_or(Value::is_null) {
+                data.enemy_generated_data.remove(&JOB_SECRET_BOSS_SPAWN_GROUP);
+            }
+
+            // 2. The packs carry the job's OWN declared counts, not the reference
+            //    dungeon's authored 6 and 4.
+            for (group, key) in [
+                (JOB_PRIMARY_SPAWN_GROUP, "primaryEnemyCount"),
+                (JOB_SECONDARY_SPAWN_GROUP, "secondaryEnemyCount"),
+            ] {
+                let want = get_i64(&setup, key, -1);
+                if want < 0 {
+                    continue;
+                }
+                if let Some(spawners) = data.enemy_generated_data.get_mut(&group) {
+                    spawners.truncate(want as usize);
+                }
+            }
+
+            // 3. The Gather pickup only exists on a Gather job.
+            if setup.get("gatherItemId").is_none_or(Value::is_null) {
+                data.item_generated_data.remove(&JOB_GATHER_ITEM_SPAWN_GROUP);
+            }
+
+            // 4. And the boss is levelled, as it already is for a Duel. Every enemy
+            //    was flat at `difficultyLevel`, leaving non-duel bosses 4-8 levels
+            //    under retail (1395/1395 carry `difficultyLevel + bossLevelDelta`).
+            let boss_level = enemy_level + get_i64(&setup, "bossLevelDelta", 0);
+            if let Some(spawners) = data.enemy_generated_data.get_mut(&JOB_BOSS_SPAWN_GROUP) {
+                let xp = QuestLevelScaling::default().given_xp(boss_level);
+                for enemies in spawners {
+                    for enemy in enemies {
+                        enemy.enemy_level = boss_level;
                         enemy.given_xp = xp;
                     }
                 }
@@ -3218,6 +3296,98 @@ mod report85_job_generated_data_tests {
             jobs_gen::generated_data_for_job(&gd, ordinary).expect("ordinary job generates");
         assert!(ordinary_data.enemy_generated_data.len() > 3);
         assert!(!ordinary_data.item_generated_data.is_empty());
+    }
+
+    /// AN ORDINARY JOB MUST NOT BE SENT THE SECRET-ROOM BOSS IT DOES NOT HAVE.
+    ///
+    /// Same defect the Duel fix removed, on the path that fix never touched. Retail,
+    /// over 1395 captured non-duel jobs, is a perfect bijection with no
+    /// counterexample: the secret-boss group is present exactly when
+    /// `jobSetup.secretBossEnemyFamilyId` is, 233/233 yes and 0/1162 no.
+    ///
+    /// Keyed on that field and NOT on `secretRoom` — 373 captured jobs have a secret
+    /// room and no secret boss, so the two conditions are not the same one.
+    ///
+    /// On the live board this was putting the secret-room boss into 219 of 564 job
+    /// entries whose own setup says there is no secret room. Report #168.
+    #[test]
+    fn an_ordinary_job_only_gets_the_groups_its_setup_declares() {
+        let gd = game_data();
+        let jobs = board();
+        let mut checked_without = 0usize;
+        let mut checked_with = 0usize;
+
+        for job in jobs.iter().filter(|j| j["jobSetup"]["jobType"] != 5) {
+            let setup = &job["jobSetup"];
+            let data = jobs_gen::generated_data_for_job(&gd, job).expect("job generates");
+            let has_secret_boss = !setup["secretBossEnemyFamilyId"].is_null();
+            let carries = data
+                .enemy_generated_data
+                .contains_key(&jobs_gen::JOB_SECRET_BOSS_SPAWN_GROUP);
+            assert_eq!(
+                carries, has_secret_boss,
+                "secret-boss group must be present exactly when the job declares one"
+            );
+            if has_secret_boss {
+                checked_with += 1;
+            } else {
+                checked_without += 1;
+            }
+
+            // The Gather pickup follows the same shape.
+            let has_gather = !setup["gatherItemId"].is_null();
+            assert_eq!(
+                data.item_generated_data
+                    .contains_key(&jobs_gen::JOB_GATHER_ITEM_SPAWN_GROUP),
+                has_gather,
+                "Gather item group must be present exactly when the job declares one"
+            );
+
+            // The packs carry the job's own declared counts, not the reference's 6/4.
+            for (group, key) in [
+                (jobs_gen::JOB_PRIMARY_SPAWN_GROUP, "primaryEnemyCount"),
+                (jobs_gen::JOB_SECONDARY_SPAWN_GROUP, "secondaryEnemyCount"),
+            ] {
+                if let (Some(spawners), Some(want)) =
+                    (data.enemy_generated_data.get(&group), setup[key].as_i64())
+                {
+                    assert_eq!(
+                        spawners.len() as i64,
+                        want,
+                        "{key}: spawner count must match the job's declared count"
+                    );
+                }
+            }
+
+            // The boss is levelled, as the Duel's already was.
+            let difficulty = job["difficultyLevel"].as_i64().unwrap_or(1);
+            let boss_delta = setup["bossLevelDelta"].as_i64().unwrap_or(0);
+            if let Some(spawners) = data
+                .enemy_generated_data
+                .get(&jobs_gen::JOB_BOSS_SPAWN_GROUP)
+            {
+                assert!(
+                    spawners
+                        .iter()
+                        .flatten()
+                        .all(|e| e.enemy_level == difficulty + boss_delta),
+                    "the job boss must sit at difficultyLevel + bossLevelDelta"
+                );
+            }
+        }
+
+        // THE CONTROL. A board that happened to contain only one kind of job would
+        // satisfy every assertion above while proving nothing about the other kind.
+        // Both cases must actually occur, or this test is vacuous.
+        assert!(
+            checked_without > 0,
+            "the fixture board must contain a job with NO secret boss"
+        );
+        assert!(
+            checked_with > 0,
+            "the fixture board must contain a job WITH a secret boss — otherwise the \
+             bijection is only tested in one direction"
+        );
     }
 
     /// The measured identity of the reference dungeon, pinned.
