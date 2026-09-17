@@ -471,6 +471,55 @@ fn lifetime_purchase_cap(
     (n > 0).then_some(n)
 }
 
+/// The offer's PER-WINDOW cap and the key that counts against it.
+///
+/// `maxPurchaseLimits` carries three forms of tracking id; the one that ends in a
+/// window start (`<product>::override::<override>::<startTimeSecs>`) is the
+/// per-window cap. 112 of the catalogue's entries carry a non-zero one — 69 at 1,
+/// 35 at 3, 8 at 5 — and nothing enforced any of them. One player bought a
+/// 3-per-window offer 109 times.
+///
+/// The key returned is the whole tracking id, which is what makes the reset free:
+/// `shift_to_now` moves that embedded timestamp with the rotation, so a new window
+/// is a new key and the count starts again at zero. Counting these against the
+/// lifetime `globalShopPurchases` instead would bar the offer for ever after its
+/// first window — the shape of bug that locked a player out of an event
+/// permanently.
+///
+/// `None` when the offer has no windowed limit, or the limit is 0 (unlimited).
+fn window_purchase_cap(
+    static_data: &blades_lib::static_data::StaticData,
+    product_id: Uuid,
+    now: i64,
+) -> Option<(String, u64)> {
+    let current = apply_authored(
+        shift_to_now(&static_data.global_shop_overrides, now),
+        &static_data.global_shop_authored,
+    );
+    let limits = current
+        .get("globalShopOverrides")?
+        .as_object()?
+        .get(&product_id.to_string())?
+        .get("maxPurchaseLimits")?
+        .as_array()?;
+    for lim in limits {
+        let tid = lim.get("purchaseTrackingId")?.as_str()?;
+        // The windowed form, and only it: its last segment is the window start.
+        let is_windowed = tid
+            .rsplit("::")
+            .next()
+            .is_some_and(|tail| !tail.is_empty() && tail.chars().all(|c| c.is_ascii_digit()));
+        if !is_windowed {
+            continue;
+        }
+        let n = lim.get("limit").and_then(Value::as_u64).unwrap_or(0);
+        if n > 0 {
+            return Some((tid.to_string(), n));
+        }
+    }
+    None
+}
+
 /// `POST /…/globalshops/current/purchase` — buy a global-shop product: validate the
 /// client price, debit it, grant the product, bump the purchase count.
 #[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/globalshops/current/purchase")]
@@ -556,6 +605,7 @@ pub async fn purchase_global_shop(
     let prices = body.expected_prices;
     // Resolved here, not inside the transaction: the closure takes `app_state`.
     let lifetime_cap = lifetime_purchase_cap(&app_state.static_data, product_id, now);
+    let window_cap = window_purchase_cap(&app_state.static_data, product_id, now);
     let mut conn = app_state.db_pool.get().await.unwrap();
 
     conn.transaction(move |mut conn| {
@@ -592,6 +642,25 @@ pub async fn purchase_global_shop(
                     log::info!(
                         "[shop] character {character_id} is at the lifetime cap for product \
                          {product_id} ({owned}/{cap}) — refusing"
+                    );
+                    return Err(map_purchase_err(PurchaseError::InvalidPrice));
+                }
+            }
+
+            // …and the per-window cap, counted under the offer's own tracking id so a
+            // new window starts again at zero. Also before the wallet is touched.
+            if let Some((ref key, cap)) = window_cap {
+                let used = entry
+                    .server_state
+                    .0
+                    .global_shop_window_purchases
+                    .get(key)
+                    .copied()
+                    .unwrap_or(0);
+                if used >= cap {
+                    log::info!(
+                        "[shop] character {character_id} is at this window's cap for product \
+                         {product_id} ({used}/{cap}) — refusing"
                     );
                     return Err(map_purchase_err(PurchaseError::InvalidPrice));
                 }
@@ -658,6 +727,14 @@ pub async fn purchase_global_shop(
                 .global_shop_purchases
                 .entry(product_id)
                 .or_insert(0) += 1;
+            if let Some((key, _)) = window_cap {
+                *entry
+                    .server_state
+                    .0
+                    .global_shop_window_purchases
+                    .entry(key)
+                    .or_insert(0) += 1;
+            }
 
             let inventory = entry.inventory.0.generate_client_update(&tracker);
             let wallet = entry.wallet.0.clone();
@@ -1187,6 +1264,86 @@ mod replay_tests {
             lifetime_purchase_cap(&sd, id, now),
             None,
             "a windowed limit must not be read as a lifetime cap"
+        );
+    }
+
+    /// THE WINDOWED CAPS ARE REAL AND WERE NEVER ENFORCED.
+    ///
+    /// 112 catalogue entries carry a non-zero per-window limit — 69 at 1, 35 at 3,
+    /// 8 at 5 — and nothing read any of them. One player bought a 3-per-window
+    /// offer 109 times.
+    #[test]
+    fn the_incident_product_has_a_windowed_cap_we_can_now_read() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../deploy/static");
+        let sd = crate::static_loader::load(&dir);
+        let now = 1_783_000_000 + 400 * 86_400;
+
+        let id = Uuid::parse_str("6ec8f67f-2cef-41aa-a7fc-f46237ae809c").unwrap();
+        let (key, cap) = window_purchase_cap(&sd, id, now)
+            .expect("the product bought 109 times must expose its windowed cap");
+        assert_eq!(cap, 3, "the catalogue declares 3 per window");
+        assert!(
+            key.rsplit("::").next().is_some_and(|t| t.chars().all(|c| c.is_ascii_digit())),
+            "the counter key must be the WINDOWED tracking id, or it cannot reset"
+        );
+    }
+
+    /// THE RESET. The key must change when the window does — that is the whole
+    /// mechanism, and getting it wrong bars the offer for ever after one window,
+    /// which is the bug that locked a player out of an event permanently.
+    #[test]
+    fn the_window_key_changes_with_the_rotation() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../deploy/static");
+        let sd = crate::static_loader::load(&dir);
+        let id = Uuid::parse_str("6ec8f67f-2cef-41aa-a7fc-f46237ae809c").unwrap();
+
+        let base = 1_783_000_000 + 400 * 86_400;
+        let first = window_purchase_cap(&sd, id, base).map(|(k, _)| k);
+        // A full replay period later the rotation has moved on.
+        let later = window_purchase_cap(&sd, id, base + REPLAY_PERIOD).map(|(k, _)| k);
+
+        assert!(first.is_some(), "precondition: the offer has a windowed cap now");
+        assert_ne!(
+            first, later,
+            "a later window must produce a different counter key, or the cap never resets"
+        );
+    }
+
+    /// THE CONTROL: an offer with no windowed limit must yield no key, so the
+    /// enforcement cannot bite products that were never capped. 432 of the
+    /// catalogue's windowed entries have limit 0, which means unlimited.
+    #[test]
+    fn an_uncapped_offer_yields_no_window_key() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../deploy/static");
+        let sd = crate::static_loader::load(&dir);
+        let now = 1_783_000_000 + 400 * 86_400;
+
+        let uncapped = sd.global_shop_overrides["globalShopOverrides"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .filter_map(|(k, v)| {
+                let any_windowed_nonzero = v["maxPurchaseLimits"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .any(|l| {
+                        let t = l["purchaseTrackingId"].as_str().unwrap_or("");
+                        let windowed = t
+                            .rsplit("::")
+                            .next()
+                            .is_some_and(|x| !x.is_empty() && x.chars().all(|c| c.is_ascii_digit()));
+                        windowed && l["limit"].as_u64().unwrap_or(0) > 0
+                    });
+                (!any_windowed_nonzero).then(|| Uuid::parse_str(k).ok()).flatten()
+            })
+            .next()
+            .expect("some offer has no windowed cap");
+
+        assert_eq!(
+            window_purchase_cap(&sd, uncapped, now),
+            None,
+            "an uncapped offer must not be given a cap"
         );
     }
 
