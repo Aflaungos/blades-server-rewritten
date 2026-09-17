@@ -440,6 +440,37 @@ fn grant_from_offer_contents(contents: Option<&OfferContents>) -> Option<RewardG
     Some(reward)
 }
 
+/// The product's LIFETIME purchase cap, or `None` when it is unlimited.
+///
+/// `maxPurchases` is the per-product total, and `0` means unlimited — 485 of the
+/// 547 catalogue entries are 0, and the other 62 carry 1, 3, 5, 10 or 20. That maps
+/// exactly onto `server_state.globalShopPurchases`, which counts purchases per
+/// product for the life of the character.
+///
+/// Deliberately NOT the `maxPurchaseLimits` array. Those are per-WINDOW caps — 112
+/// of them are non-zero — and their tracking id embeds the window start
+/// (`<product>::override::<id>::<startTimeSecs>`). Enforcing one against a lifetime
+/// counter would cap the product for ever after the first window, which is the
+/// exact bug just fixed for event tiers. Doing them properly needs a per-window
+/// counter we do not store, so they are left alone rather than half-enforced.
+fn lifetime_purchase_cap(
+    static_data: &blades_lib::static_data::StaticData,
+    product_id: Uuid,
+    now: i64,
+) -> Option<u64> {
+    let current = apply_authored(
+        shift_to_now(&static_data.global_shop_overrides, now),
+        &static_data.global_shop_authored,
+    );
+    let n = current
+        .get("globalShopOverrides")
+        .and_then(Value::as_object)?
+        .get(&product_id.to_string())?
+        .get("maxPurchases")
+        .and_then(Value::as_u64)?;
+    (n > 0).then_some(n)
+}
+
 /// `POST /…/globalshops/current/purchase` — buy a global-shop product: validate the
 /// client price, debit it, grant the product, bump the purchase count.
 #[post("/blades.bgs.services/api/game/v1/public/characters/{character_id}/globalshops/current/purchase")]
@@ -523,6 +554,8 @@ pub async fn purchase_global_shop(
 
     let product_id = body.global_shop_product_id;
     let prices = body.expected_prices;
+    // Resolved here, not inside the transaction: the closure takes `app_state`.
+    let lifetime_cap = lifetime_purchase_cap(&app_state.static_data, product_id, now);
     let mut conn = app_state.db_pool.get().await.unwrap();
 
     conn.transaction(move |mut conn| {
@@ -540,6 +573,29 @@ pub async fn purchase_global_shop(
                     .next()
                     .ok_or_else(|| BladeApiError::new(StatusCode::NOT_FOUND, 20000, 2))?
             };
+
+            // A product with a lifetime cap must not exceed it. Nothing read
+            // `maxPurchases` before, so every cap in the catalogue was decorative:
+            // one player bought a capped product 109 times.
+            //
+            // Checked BEFORE the wallet is touched, so a refused purchase costs
+            // nothing.
+            if let Some(cap) = lifetime_cap {
+                let owned = entry
+                    .server_state
+                    .0
+                    .global_shop_purchases
+                    .get(&product_id)
+                    .copied()
+                    .unwrap_or(0);
+                if owned >= cap {
+                    log::info!(
+                        "[shop] character {character_id} is at the lifetime cap for product \
+                         {product_id} ({owned}/{cap}) — refusing"
+                    );
+                    return Err(map_purchase_err(PurchaseError::InvalidPrice));
+                }
+            }
 
             // Charge the (validated) price; fail on insufficient funds.
             entry
@@ -1049,6 +1105,88 @@ mod replay_tests {
             actix_web::ResponseError::status_code(&map_purchase_err(PurchaseError::NoSuchProduct)),
             StatusCode::NOT_FOUND,
             "a genuinely unknown product should still be a 404"
+        );
+    }
+
+    /// THE CAPS IN THE CATALOGUE WERE DECORATIVE.
+    ///
+    /// Nothing ever read `maxPurchases`, so a product capped at a handful could be
+    /// bought without limit. One player bought a capped product **109 times**.
+    ///
+    /// 62 of the 547 catalogue entries carry a non-zero lifetime cap (1, 3, 5, 10 or
+    /// 20); the other 485 are 0, which means unlimited.
+    #[test]
+    fn the_catalogue_really_does_declare_lifetime_caps() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../deploy/static");
+        let sd = crate::static_loader::load(&dir);
+        let now = 1_783_000_000 + 400 * 86_400;
+
+        let mut capped = 0usize;
+        let mut uncapped = 0usize;
+        for id in sd.global_shop_overrides["globalShopOverrides"]
+            .as_object()
+            .expect("an object")
+            .keys()
+            .filter_map(|k| Uuid::parse_str(k).ok())
+        {
+            match lifetime_purchase_cap(&sd, id, now) {
+                Some(n) => {
+                    assert!(n > 0, "a cap of 0 must read as unlimited, not as a cap");
+                    capped += 1;
+                }
+                None => uncapped += 1,
+            }
+        }
+        assert!(capped > 0, "no capped product found — the enforcement is inert");
+        assert!(
+            uncapped > capped,
+            "most products are uncapped; if that flipped, the reading of maxPurchases is wrong"
+        );
+    }
+
+    /// THE CONTROL, and the one that matters: the per-WINDOW limits must NOT be
+    /// enforced against the lifetime counter.
+    ///
+    /// `maxPurchaseLimits` entries whose tracking id ends in a window start are
+    /// per-window caps. Enforcing one against `globalShopPurchases`, which counts
+    /// for the life of the character, would cap the product for ever after its first
+    /// window — exactly the bug just fixed for event tiers.
+    ///
+    /// The product a player bought 109 times is one of these: its `maxPurchases` is
+    /// 0 and its only real limit is a windowed 3. So this fix deliberately does NOT
+    /// cover that case, and this test pins that it is a decision rather than an
+    /// oversight.
+    #[test]
+    fn windowed_limits_are_not_treated_as_lifetime_caps() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../deploy/static");
+        let sd = crate::static_loader::load(&dir);
+        let now = 1_783_000_000 + 400 * 86_400;
+
+        // The product from the incident: windowed limit 3, maxPurchases 0.
+        let id = Uuid::parse_str("6ec8f67f-2cef-41aa-a7fc-f46237ae809c").unwrap();
+        let entry = &sd.global_shop_overrides["globalShopOverrides"][id.to_string()];
+        assert!(!entry.is_null(), "the incident product must still be in the catalogue");
+
+        let windowed: Vec<i64> = entry["maxPurchaseLimits"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|l| {
+                l["purchaseTrackingId"]
+                    .as_str()
+                    .and_then(|t| t.rsplit("::").next().map(|s| s.chars().all(|c| c.is_ascii_digit())))
+                    .unwrap_or(false)
+            })
+            .filter_map(|l| l["limit"].as_i64())
+            .collect();
+        assert!(
+            windowed.iter().any(|n| *n > 0),
+            "the incident product must still carry a non-zero WINDOWED limit"
+        );
+        assert_eq!(
+            lifetime_purchase_cap(&sd, id, now),
+            None,
+            "a windowed limit must not be read as a lifetime cap"
         );
     }
 
