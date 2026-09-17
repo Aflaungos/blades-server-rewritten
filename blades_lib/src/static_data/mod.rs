@@ -1155,9 +1155,38 @@ pub enum OfferContentsKind {
 /// One entry of an offer's contents.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct PropertyRef {
+    pub id: Uuid,
+    pub tier: u64,
+}
+
+/// One template in an offer, with the enhancement the APK authors onto it.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct OfferContentEntry {
     pub item_template_id: Uuid,
     pub quantity: u64,
+    /// The authored item enhancement. Every field defaults, so the file that
+    /// shipped before these existed still loads.
+    ///
+    /// These are what made 365 of 493 Sigil offers ungrantable: the extractor
+    /// read the template and the quantity and dropped
+    /// `ItemTemplateWithQuantity._itemEnhancementPointer`, which is the whole of
+    /// what is ON the item. Identity-checked against the captured retail grants
+    /// the APK did not produce: template, temperingLevel, arcaneTier and
+    /// enchanting all 73/73; ignoring the pointer scores 41/73.
+    #[serde(default)]
+    pub tempering_level: u64,
+    #[serde(default)]
+    pub arcane_tier: u64,
+    #[serde(default)]
+    pub enchanting: Vec<PropertyRef>,
+    /// Authored GRADING properties. **Empty does not mean none** when
+    /// `arcane_tier > 0` — retail rolled the grade at purchase for those, which is
+    /// the 3 of 73 the identity check misses. Those offers stay ungrantable rather
+    /// than being handed over ungraded.
+    #[serde(default)]
+    pub grading: Vec<PropertyRef>,
     /// Which wire bucket this template lands in — `currencies`,
     /// `stackableItems`, `items`, or `unknown`. Determined by the extractor from
     /// the captured purchase responses (the bucket a template actually landed
