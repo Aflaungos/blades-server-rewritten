@@ -14,7 +14,11 @@
 
 use std::time::{Duration, Instant};
 
-use arena_proto::{GameMessageId, NetDataValue};
+// `GameMessageId` is used only by the tests below; importing it here made every
+// release build warn. See report #169.
+#[cfg(test)]
+use arena_proto::GameMessageId;
+use arena_proto::NetDataValue;
 use log::{debug, info};
 
 use super::messages;
