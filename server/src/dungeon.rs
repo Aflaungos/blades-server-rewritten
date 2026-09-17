@@ -419,6 +419,24 @@ async fn handle_event_dungeon_exit(
     };
 
     let mut completion = EventCompletion::get_or_create(conn, char_id, quest_id).await?;
+    // Drop a count left over from a PREVIOUS window before reading it, exactly as
+    // `enter_event_dungeon` does.
+    //
+    // Only the enter path reset, and that is not enough: this is the path that
+    // decides WHICH TIER pays and what the client's checkmarks are told. A row
+    // still carrying a finished window's count reads as exhausted here, so
+    // `payout_for_completion` returns None, the increment below is skipped
+    // because it is gated on a payout, and the stale number is what gets mirrored
+    // into `completedQuests`. Rewards stop, the counter stops, and the tick never
+    // appears — "event tiers are not progressing, they are not getting
+    // checkmarked" (#166).
+    //
+    // A player can reach this with a stale row whenever the window rolls between
+    // entering and exiting, and for any entry that did not go through the enter
+    // path's reset.
+    if let Some(window_start) = current_event_window_start(app_state, quest_id) {
+        completion.reset_if_before(conn, window_start).await?;
+    }
     let completion_index = completion.completion_count as usize;
     let tier_count = event_template.rewards.len();
 
@@ -1245,4 +1263,33 @@ async fn handle_event_dungeon_entry(
         .scope_boxed()
     })
     .await
+}
+
+#[cfg(test)]
+mod event_window_reset_tests {
+    /// Both event-dungeon paths must drop a previous window's count before they
+    /// read it.
+    ///
+    /// A source assertion rather than a handler test, for the same reason
+    /// `every_anon_login_exit_provisions_a_character` is one: the handlers need a
+    /// database and a session, and the bug is precisely that ONE of the two paths
+    /// forgot the call. Counting them is what the compiler cannot do.
+    ///
+    /// The exit path is the one that decides which tier pays and what the
+    /// client's checkmarks are told, so a stale count there stops rewards, stops
+    /// the counter and never ticks the box (#166). Adding a third path that reads
+    /// `completion_count` without resetting first is exactly how this regresses.
+    #[test]
+    fn every_path_that_reads_a_completion_count_resets_the_window_first() {
+        let src = include_str!("dungeon.rs");
+
+        let readers = src.matches("completion.completion_count as usize").count();
+        let resets = src.matches("completion.reset_if_before(conn, window_start).await?").count();
+        assert!(readers > 0, "the completion count must still be read somewhere");
+        assert_eq!(
+            resets, readers,
+            "{readers} path(s) read a stored completion count but only {resets} reset the \
+             window first; a stale count makes an event pay nothing and never tick"
+        );
+    }
 }
