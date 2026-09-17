@@ -26,7 +26,7 @@ use uuid::Uuid;
 use crate::{
     game_data::GameData,
     user_data::{
-        ChestGeneratedData, DungeonEnemyResult, DungeonGeneratedData, DungeonItemResult,
+        ChestGeneratedData, DungeonEnemyResult, DungeonGeneratedData, DungeonItemResult, Item,
         LootTableResult,
     },
 };
@@ -165,6 +165,226 @@ fn roll_loot_table(dungeon_uuid: &Uuid, spawn_id: &Uuid, table_id: &Uuid) -> Loo
     out
 }
 
+// -- enemy loot -------------------------------------------------------------
+//
+// Enemies dropped nothing: every `DungeonEnemyResult` was pushed with
+// `loot_table_loot: HashMap::default()` and nothing ever filled it, so
+// `merged_loot_table()` was empty for every corpse in the game (#152).
+//
+// Retail put the answer on the wire. Its dungeon-generation response carries,
+// per enemy, the loot that enemy will yield -- rolled at generation time,
+// exactly as we already do for breakables. Two corpora mined from captured
+// retail traffic reproduce it:
+//
+//   enemy_loot.json         WHAT each loot table drops. Whole results with an
+//                           observation count, 19 tables over 49,602
+//                           observations. Level-keyed where retail's content
+//                           moves with enemy level, which is most of the
+//                           payout: the gold table is 59% of all observations
+//                           and pays 5 gold at level 1 and 343 at level 90
+//                           (r=0.968). Drawing it level-blind would hand a
+//                           level-1 enemy 376 gold.
+//   enemy_group_tables.json WHICH tables an enemy of a given spawn group rolls.
+//                           parsed.json does not say -- its enemy spawn groups
+//                           carry `quantity` and nothing else -- so without
+//                           this the first corpus cannot be addressed at all.
+static ENEMY_LOOT_RAW: &str = include_str!("../enemy_loot.json");
+static ENEMY_GROUP_TABLES_RAW: &str = include_str!("../enemy_group_tables.json");
+
+/// The gold table, and the fallback for a spawn group the corpus never saw.
+///
+/// 1,066 of parsed.json's 1,956 enemy spawn groups were observed (51.6% of enemy
+/// instances). For the rest there is no observed answer, and "drop nothing" is
+/// the wrong guess: 90.7% of all observed enemy results roll this table, and
+/// gold is the only drop whose amount the corpus can scale to any level. An
+/// unobserved enemy therefore pays level-appropriate gold and nothing else --
+/// modest, never a boss item on a level-3 rat, and visibly better than a corpse
+/// that is always empty.
+const GOLD_LOOT_TABLE_ID: u128 = 0x871c2e9b_7e7a_4564_a022_e435dfb8a436;
+
+fn enemy_loot() -> &'static serde_json::Value {
+    static TABLE: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        serde_json::from_str(ENEMY_LOOT_RAW)
+            .unwrap_or_else(|_| serde_json::json!({ "tables": {} }))
+    })
+}
+
+fn enemy_group_tables() -> &'static serde_json::Value {
+    static TABLE: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        serde_json::from_str(ENEMY_GROUP_TABLES_RAW)
+            .unwrap_or_else(|_| serde_json::json!({ "groups": {} }))
+    })
+}
+
+/// splitmix64 as a stream, so the successive draws that make up one enemy's
+/// loot -- which table set, which result per table, which instance id per item
+/// -- do not correlate with each other. Deterministic: the same enemy in the
+/// same dungeon is described identically every time the client asks, which is
+/// the same guarantee `roll_loot_table` gives a barrel.
+struct LootRng(u64);
+
+impl LootRng {
+    fn next(&mut self) -> u64 {
+        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        let mut z = self.0;
+        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z ^ (z >> 31)
+    }
+
+    /// A uuid4-shaped instance id. Retail minted a fresh uuid4 for every gear
+    /// drop and the corpus strips them, so one must be made here -- but it is
+    /// derived from the stream rather than random, because the generated data
+    /// is re-served on every quest-list fetch and the id the client was told
+    /// must still be the id it finds on the corpse.
+    fn uuid(&mut self) -> Uuid {
+        let (hi, lo) = (self.next(), self.next());
+        let mut b = (((hi as u128) << 64) | lo as u128).to_be_bytes();
+        b[6] = (b[6] & 0x0f) | 0x40;
+        b[8] = (b[8] & 0x3f) | 0x80;
+        Uuid::from_bytes(b)
+    }
+}
+
+fn enemy_rng(
+    dungeon_uuid: &Uuid,
+    spawn_group_id: &Uuid,
+    spawner_index: usize,
+    enemy_index: usize,
+) -> LootRng {
+    LootRng(
+        (dungeon_uuid.as_u128() as u64)
+            ^ (spawn_group_id.as_u128() as u64).rotate_left(21)
+            ^ ((dungeon_uuid.as_u128() >> 64) as u64).rotate_left(11)
+            ^ (spawner_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ (enemy_index as u64).rotate_left(37),
+    )
+}
+
+/// Draw one entry from an array of `{..., "n": weight}` observations.
+fn draw_weighted<'a>(rng: &mut LootRng, options: &'a [serde_json::Value]) -> Option<&'a serde_json::Value> {
+    let total: u64 = options.iter().filter_map(|o| o["n"].as_u64()).sum();
+    if total == 0 {
+        return None;
+    }
+    let mut pick = rng.next() % total;
+    for o in options {
+        let n = o["n"].as_u64().unwrap_or(0);
+        if pick < n {
+            return Some(o);
+        }
+        pick -= n;
+    }
+    options.last()
+}
+
+/// The results to draw from for one table at one enemy level.
+///
+/// `levelKeyed` is measured, not assumed, and only some tables carry it; for the
+/// rest `results` is pooled over every level and `byLevel` is null. The nearest
+/// band is used when no band contains the level, which is what happens above
+/// and below the level range retail was observed at -- clamping is better than
+/// dropping the table, whose only alternative outcome is an empty corpse.
+fn enemy_table_results<'a>(entry: &'a serde_json::Value, enemy_level: i64) -> Option<&'a Vec<serde_json::Value>> {
+    if entry["levelKeyed"].as_bool() != Some(true) {
+        return entry["results"].as_array();
+    }
+    let bands = entry["byLevel"].as_array()?;
+    let mut nearest: Option<(i64, &serde_json::Value)> = None;
+    for band in bands {
+        let lo = band["minEnemyLevel"].as_i64().unwrap_or(i64::MIN);
+        let hi = band["maxEnemyLevel"].as_i64().unwrap_or(i64::MAX);
+        if enemy_level >= lo && enemy_level <= hi {
+            return band["results"].as_array();
+        }
+        let distance = if enemy_level < lo { lo - enemy_level } else { enemy_level - hi };
+        if nearest.map_or(true, |(d, _)| distance < d) {
+            nearest = Some((distance, band));
+        }
+    }
+    nearest.and_then(|(_, b)| b["results"].as_array())
+}
+
+/// One enemy's `lootTableLoot`, rolled the way retail rolled it.
+///
+/// Two draws, because the two corpora answer two different questions. First
+/// WHICH tables this enemy rolls: a spawn group's table set is usually fixed,
+/// but the four groups that vary hold more than half of all observed enemy
+/// results -- they spawn a mix of enemy types -- so the set is drawn from the
+/// distribution the group was observed with rather than pinned to its
+/// commonest. Then WHAT each of those tables gives at this enemy's level.
+///
+/// A whole result is drawn per table, not item by item: retail's results
+/// routinely carry a stack and a coin drop together, and independent per-item
+/// draws cannot express which things appeared TOGETHER (the bug that once left
+/// a barrel unable to yield more than one stack, fork #104). The empty result
+/// is one of the outcomes for the same reason -- an enemy that drops nothing is
+/// what retail did most of the time on most tables.
+pub fn roll_enemy_loot(
+    dungeon_uuid: &Uuid,
+    spawn_group_id: &Uuid,
+    spawner_index: usize,
+    enemy_index: usize,
+    enemy_level: i64,
+) -> HashMap<Uuid, LootTableResult> {
+    let mut rng = enemy_rng(dungeon_uuid, spawn_group_id, spawner_index, enemy_index);
+    let mut out = HashMap::new();
+
+    let group = enemy_group_tables()["groups"].get(spawn_group_id.to_string());
+    let tables: Vec<Uuid> = match group.and_then(|g| g["sets"].as_array()) {
+        Some(sets) => draw_weighted(&mut rng, sets)
+            .and_then(|s| s["tables"].as_array())
+            .map(|ts| ts.iter().filter_map(|t| t.as_str()?.parse().ok()).collect())
+            .unwrap_or_default(),
+        // Never observed: see GOLD_LOOT_TABLE_ID.
+        None => vec![Uuid::from_u128(GOLD_LOOT_TABLE_ID)],
+    };
+
+    for table_id in tables {
+        let Some(entry) = enemy_loot()["tables"].get(table_id.to_string()) else {
+            // A table left out of the corpus as too thin to model. Retail keyed
+            // it on this enemy, so the key is sent, empty -- dropping the key
+            // would be a shape retail never sent.
+            out.insert(table_id, LootTableResult::default());
+            continue;
+        };
+        let mut result = LootTableResult::default();
+        if let Some(results) = enemy_table_results(entry, enemy_level) {
+            if let Some(drawn) = draw_weighted(&mut rng, results) {
+                let loot = &drawn["loot"];
+                if let Some(stacks) = loot["stackableItems"].as_object() {
+                    for (id, qty) in stacks {
+                        if let (Ok(uuid), Some(q)) = (Uuid::parse_str(id), qty.as_u64()) {
+                            result.stackable_items.insert(uuid, q);
+                        }
+                    }
+                }
+                if let Some(currencies) = loot["currencies"].as_object() {
+                    for (id, amount) in currencies {
+                        if let (Ok(uuid), Some(a)) = (Uuid::parse_str(id), amount.as_u64()) {
+                            result.currencies.insert(uuid, a);
+                        }
+                    }
+                }
+                for raw in loot["items"].as_array().into_iter().flatten() {
+                    // The corpus stores a gear instance in retail's own wire
+                    // shape, so `Item` deserializes it directly. A malformed
+                    // one is skipped, never fatal: a partial corpus must not
+                    // take down dungeon generation.
+                    if let Ok(item) = serde_json::from_value::<Item>(raw.clone()) {
+                        result.item.0.insert(rng.uuid(), item);
+                    }
+                }
+            }
+        }
+        out.insert(table_id, result);
+    }
+
+    out
+}
+
 /// Which dungeon owns this enemy spawn group, if exactly one does.
 ///
 /// THE VARIANT MISMATCH (#174). Retail builds several versions of a dungeon —
@@ -214,12 +434,21 @@ pub fn generate_for_dungeon(
             .iter()
             .map(|(spawn_group_id, spawn_group)| {
                 let mut enemies_info = Vec::new();
-                for _ in 0..spawn_group.quantity.max(1) {
+                for spawner_index in 0..spawn_group.quantity.max(1) as usize {
                     enemies_info.push(vec![DungeonEnemyResult {
                         enemy_level,
                         given_xp,
+                        // Retail's own `spawnGroupLoot` is left empty deliberately:
+                        // 38 of 66,994 captured enemy results carried one and every
+                        // observation is the same single item, too little to model.
                         spawn_group_loot: HashMap::default(),
-                        loot_table_loot: HashMap::default(),
+                        loot_table_loot: roll_enemy_loot(
+                            dungeon_uuid,
+                            spawn_group_id,
+                            spawner_index,
+                            0,
+                            enemy_level,
+                        ),
                     }]);
                 }
                 (*spawn_group_id, enemies_info)
@@ -580,6 +809,285 @@ mod variant_owner_tests {
             dungeon_owning_spawn_group(&gd, &Uuid::from_u128(0xDEADBEEF)),
             None,
             "an unknown group must not be attributed to any dungeon"
+        );
+    }
+}
+
+#[cfg(test)]
+mod enemy_loot_tests {
+    use super::*;
+
+    /// Retail's gold currency.
+    const GOLD_CURRENCY: &str = "f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2";
+
+    fn game_data() -> GameData {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../deploy/static/parsed.json");
+        let raw = std::fs::read_to_string(path).expect("read parsed.json");
+        serde_json::from_str(&raw).expect("parse game data")
+    }
+
+    fn all_spawn_groups(game_data: &GameData) -> Vec<(Uuid, Uuid)> {
+        let mut out = Vec::new();
+        for (dungeon_id, dungeon) in &game_data.dungeons {
+            for group_id in dungeon.spawn_info.enemy_spawn_groups.keys() {
+                out.push((*dungeon_id, *group_id));
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Both corpora must actually be compiled in. Everything below is vacuous
+    /// without them, and an `include_str!` that silently resolves to something
+    /// else is exactly how the chest sidecar broke once.
+    #[test]
+    fn the_enemy_loot_corpora_load() {
+        let tables = enemy_loot()["tables"].as_object().expect("loot tables");
+        assert_eq!(tables.len(), 19, "the mined loot tables");
+        assert_eq!(
+            enemy_loot()["_meta"]["observations"].as_u64(),
+            Some(49_602),
+            "loot corpus observation count"
+        );
+
+        let groups = enemy_group_tables()["groups"].as_object().expect("groups");
+        assert_eq!(groups.len(), 1066, "the mined spawn groups");
+        assert_eq!(
+            enemy_group_tables()["_meta"]["enemyResults"].as_u64(),
+            Some(32_592),
+            "group corpus observation count"
+        );
+    }
+
+    /// Every spawn group in the group corpus must be a group parsed.json really
+    /// has. A mined id that matches nothing would mean the mapping was keyed on
+    /// the wrong field and every lookup silently falls through to the gold
+    /// fallback -- which looks like working code.
+    #[test]
+    fn every_corpus_group_is_a_real_dungeon_spawn_group() {
+        let game_data = game_data();
+        let known: std::collections::HashSet<Uuid> = all_spawn_groups(&game_data)
+            .into_iter()
+            .map(|(_, g)| g)
+            .collect();
+        let mut unknown = Vec::new();
+        for id in enemy_group_tables()["groups"].as_object().unwrap().keys() {
+            let group: Uuid = id.parse().expect("group id is a uuid");
+            if !known.contains(&group) {
+                unknown.push(group);
+            }
+        }
+        assert!(unknown.is_empty(), "corpus groups absent from parsed.json: {unknown:?}");
+    }
+
+    /// THE BUG (#152): every corpse in the game was empty.
+    #[test]
+    fn enemies_now_drop_things() {
+        let game_data = game_data();
+        let mut paid = 0;
+        let mut total = 0;
+        for (dungeon_id, group_id) in all_spawn_groups(&game_data) {
+            let loot = roll_enemy_loot(&dungeon_id, &group_id, 0, 0, 20);
+            total += 1;
+            if loot.values().any(|l| {
+                !l.currencies.is_empty() || !l.stackable_items.is_empty() || !l.item.is_empty()
+            }) {
+                paid += 1;
+            }
+        }
+        assert!(total > 1_900, "expected every parsed.json spawn group, got {total}");
+        assert!(
+            paid * 2 > total,
+            "only {paid} of {total} enemies dropped anything -- corpses are still mostly empty"
+        );
+    }
+
+    /// Empty is a real outcome. A build where every enemy pays is as wrong as
+    /// one where none do.
+    #[test]
+    fn an_empty_corpse_remains_possible() {
+        let game_data = game_data();
+        let groups = all_spawn_groups(&game_data);
+        let mut empty = 0;
+        let mut total = 0;
+        for (dungeon_id, group_id) in &groups {
+            for spawner in 0..6 {
+                let loot = roll_enemy_loot(dungeon_id, group_id, spawner, 0, 20);
+                total += 1;
+                if loot.values().all(|l| {
+                    l.currencies.is_empty() && l.stackable_items.is_empty() && l.item.is_empty()
+                }) {
+                    empty += 1;
+                }
+            }
+        }
+        assert!(empty > 0, "every one of {total} corpses paid out; retail's did not");
+        assert!(empty < total, "not one of {total} corpses paid out");
+    }
+
+    /// THE LEVEL CONTROL. The gold table is 59% of all observations and its
+    /// payout scales with enemy level (r=0.968 over 29,556 observations):
+    /// weighted mean 5 gold at level 1, 343 at levels 89-100. A consumer that
+    /// ignored `levelKeyed` and pooled the table would hand a level-1 enemy
+    /// several hundred gold, which is both a broken economy and indistinguishable
+    /// from working code without this test.
+    #[test]
+    fn gold_scales_with_enemy_level() {
+        let game_data = game_data();
+        let gold: Uuid = GOLD_CURRENCY.parse().unwrap();
+        let groups = all_spawn_groups(&game_data);
+
+        let mean_at = |level: i64| -> f64 {
+            let mut sum = 0u64;
+            let mut n = 0u64;
+            for (dungeon_id, group_id) in &groups {
+                for spawner in 0..4 {
+                    let loot = roll_enemy_loot(dungeon_id, group_id, spawner, 0, level);
+                    sum += loot.values().filter_map(|l| l.currencies.get(&gold)).sum::<u64>();
+                    n += 1;
+                }
+            }
+            sum as f64 / n as f64
+        };
+
+        let low = mean_at(1);
+        let high = mean_at(90);
+        assert!(low > 0.0, "level-1 enemies paid no gold at all");
+        assert!(
+            low < 25.0,
+            "level-1 enemies averaged {low:.1} gold -- retail's weighted mean at level 1 is 5, so \
+             the level bands are being ignored and the table drawn pooled"
+        );
+        assert!(
+            high > 150.0,
+            "level-90 enemies averaged only {high:.1} gold -- retail's is 343"
+        );
+        assert!(high > low * 10.0, "gold barely moved with level: {low:.1} -> {high:.1}");
+    }
+
+    /// A group the corpus never saw still pays, and pays only gold.
+    #[test]
+    fn an_unobserved_spawn_group_falls_back_to_gold_alone() {
+        let game_data = game_data();
+        let observed = enemy_group_tables()["groups"].as_object().unwrap();
+        let unobserved: Vec<(Uuid, Uuid)> = all_spawn_groups(&game_data)
+            .into_iter()
+            .filter(|(_, g)| !observed.contains_key(&g.to_string()))
+            .collect();
+        assert!(
+            unobserved.len() > 800,
+            "expected the ~890 unobserved groups, got {}",
+            unobserved.len()
+        );
+
+        let gold_table = Uuid::from_u128(GOLD_LOOT_TABLE_ID);
+        let gold: Uuid = GOLD_CURRENCY.parse().unwrap();
+        let mut paid = 0;
+        for (dungeon_id, group_id) in unobserved.iter().take(200) {
+            let loot = roll_enemy_loot(dungeon_id, group_id, 0, 0, 50);
+            assert_eq!(
+                loot.keys().collect::<Vec<_>>(),
+                vec![&gold_table],
+                "an unobserved group must roll the gold table and nothing else"
+            );
+            if loot[&gold_table].currencies.contains_key(&gold) {
+                paid += 1;
+            }
+        }
+        assert!(paid > 100, "only {paid} of 200 unobserved enemies paid gold");
+    }
+
+    /// Only tables the group was actually observed rolling may come back.
+    #[test]
+    fn a_drawn_table_is_one_the_group_was_observed_with() {
+        let game_data = game_data();
+        let corpus = enemy_group_tables()["groups"].as_object().unwrap();
+        let mut checked = 0;
+        for (dungeon_id, group_id) in all_spawn_groups(&game_data) {
+            let Some(entry) = corpus.get(&group_id.to_string()) else {
+                continue;
+            };
+            let allowed: std::collections::HashSet<String> = entry["sets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .flat_map(|s| s["tables"].as_array().unwrap())
+                .map(|t| t.as_str().unwrap().to_string())
+                .collect();
+            for spawner in 0..4 {
+                for table in roll_enemy_loot(&dungeon_id, &group_id, spawner, 0, 30).keys() {
+                    assert!(
+                        allowed.contains(&table.to_string()),
+                        "group {group_id} was never observed rolling {table}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 1_000, "only {checked} tables checked");
+    }
+
+    /// Gear must come out as real items, with an instance id that is unique
+    /// across enemies and stable for one enemy. Retail minted a uuid4 per drop
+    /// and the corpus strips it; replaying one id everywhere would give every
+    /// player the same instance, which the arena ships to the opponent client.
+    #[test]
+    fn gear_drops_get_unique_stable_instance_ids() {
+        let game_data = game_data();
+        let mut ids = std::collections::HashSet::new();
+        let mut items = 0;
+        let mut collisions = 0;
+        for (dungeon_id, group_id) in all_spawn_groups(&game_data) {
+            for spawner in 0..4 {
+                let loot = roll_enemy_loot(&dungeon_id, &group_id, spawner, 0, 60);
+                // stable: the same enemy, described again, is the same item
+                let again = roll_enemy_loot(&dungeon_id, &group_id, spawner, 0, 60);
+                for (table, result) in &loot {
+                    let repeat = &again[table];
+                    assert_eq!(
+                        result.item.0.keys().collect::<std::collections::HashSet<_>>(),
+                        repeat.item.0.keys().collect::<std::collections::HashSet<_>>(),
+                        "the same corpse was described with different instance ids"
+                    );
+                    for (id, item) in &result.item.0 {
+                        items += 1;
+                        if !ids.insert(*id) {
+                            collisions += 1;
+                        }
+                        assert_eq!(id.get_version_num(), 4, "instance ids must look like uuid4");
+                        assert!(!item.item_template_id.is_nil(), "gear with no template");
+                    }
+                }
+            }
+        }
+        assert!(items > 50, "only {items} gear drops over the whole game -- expected more");
+        assert_eq!(collisions, 0, "{collisions} of {items} gear drops shared an instance id");
+    }
+
+    /// The loot the client is told about is the loot the server will pay out:
+    /// `generate_for_dungeon` must put it on every enemy, not just return it.
+    #[test]
+    fn generated_dungeons_carry_the_loot() {
+        let game_data = game_data();
+        let mut with_loot = 0;
+        let mut enemies = 0;
+        for dungeon_id in game_data.dungeons.keys() {
+            let generated = generate_for_dungeon(&game_data, dungeon_id, 40, 10).unwrap();
+            for spawners in generated.enemy_generated_data.values() {
+                for spawner in spawners {
+                    for enemy in spawner {
+                        enemies += 1;
+                        if !enemy.merged_loot_table().currencies.is_empty() {
+                            with_loot += 1;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(enemies > 2_000, "only {enemies} enemies generated");
+        assert!(
+            with_loot * 2 > enemies,
+            "only {with_loot} of {enemies} generated enemies carry currency"
         );
     }
 }
