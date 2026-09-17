@@ -711,8 +711,8 @@ pub fn on_c2s_input(
     }
     // A STAGGERED sender can't act either, for `baseStaggerDuration` (1.5 s). [Phase 3.13]
     //
-    // …with exactly ONE exception, and it is the whole point of the ability:
-    // Recovery Strikes. `Ability.Maneuver.RecoveryStrikes.Description` reads
+    // …with two exceptions — see `performable_while_staggered`. The first is
+    // Recovery Strikes, and it is the whole point of the ability: `Ability.Maneuver.RecoveryStrikes.Description` reads
     //
     //     "These Quick Strikes can be performed AT ANY TIME, EXCEPT WHEN PARALYZED.
     //      They each deal {0} extra damage (no extra damage for two-handed weapons)."
@@ -726,9 +726,9 @@ pub fn on_c2s_input(
     // The paralysis gate above still applies, which is the one exception the text
     // itself names, so it deliberately stays in front of this.
     if combat.fighters[sender].is_staggered(now) {
-        let recovery_strike = input::parse_execute_ability(user_data)
-            .is_some_and(|ea| is_recovery_strikes(&ea.ability_uuid));
-        if !recovery_strike {
+        let acts_through = input::parse_execute_ability(user_data)
+            .is_some_and(|ea| performable_while_staggered(&ea.ability_uuid));
+        if !acts_through {
             if matches!(parse_input_activate(user_data), Some(act) if !act.held) {
                 info!(
                     "combat attack_input: gsid={} input=player slot={sender} actor={} outcome=staggered",
@@ -739,9 +739,7 @@ pub fn on_c2s_input(
             debug!("combat: slot {sender} input ignored — staggered");
             return Vec::new();
         }
-        info!(
-            "combat: slot {sender} acts THROUGH a stagger — Recovery Strikes (performable at any time)",
-        );
+        info!("combat: slot {sender} acts THROUGH a stagger (Recovery Strikes / dodge)");
     }
 
     // `PlayerCombatInputActivate` (gmid 46) on the 0x36 carrier — the discrete
@@ -909,6 +907,56 @@ const RECOVERY_STRIKES_UUID: &str = "e08f95de-85bb-4829-ba7e-cf45bc6fb422";
 
 fn is_recovery_strikes(ability_uuid: &str) -> bool {
     ability_uuid.eq_ignore_ascii_case(RECOVERY_STRIKES_UUID)
+}
+
+/// May this ability be performed while STAGGERED?
+///
+/// Two families, and only two.
+///
+/// **Recovery Strikes** says so itself —
+/// `Ability.Maneuver.RecoveryStrikes.Description`: *"These Quick Strikes can be
+/// performed at any time, except when Paralyzed."* It is the only ability in the
+/// shipped description corpus that carries that sentence.
+///
+/// **The dodges** say nothing, so this one is measured. Counting every ability
+/// execution (gmid 37/38) that falls inside a `Staggered` (3) op51 apply→remove
+/// window, over 11 retail sessions:
+///
+/// ```text
+///   RecoveryStrikes    64 while staggered / 221 free   22.5%   (documented)
+///   DodgingStrike      50 / 218                        18.7%
+///   AdrenalineDodge    44 / 314                        12.3%
+///   ---------------------------------------------------------
+///   QuickStrikes        0 / 294                         0.0%
+///   LightningBolt       0 / 219                         0.0%
+///   HarryingBash        0 / 213                         0.0%
+///   Ward                0 / 70                          0.0%
+/// ```
+///
+/// The zeros are the point: comparably-sampled abilities are never once executed
+/// inside a stun window, so this is a real distinction and not a measurement floor.
+/// Note it does NOT follow the maneuver/spell split — QuickStrikes and HarryingBash
+/// are maneuvers and score zero.
+///
+/// The obvious confound is a lagging `Staggered` remove making post-stun uses look
+/// mid-stun. Measuring WHERE in the window each use falls rules that out: 30 % of
+/// DodgingStrike's stunned uses sit in the FIRST HALF of the stun, earlier than
+/// Recovery Strikes' own 14 %. The method self-checks too — StaggeringBash, the
+/// ability that CAUSES a stagger, lands at median position 0.10, i.e. right at the
+/// window's start, exactly where it must.
+///
+/// Keyed on the shipped dodge field rather than a uuid list, so all four dodge
+/// maneuvers are covered and a data change cannot leave one behind.
+///
+/// Reported by Taheen (#113), who said dodges free you from a stun the way Recovery
+/// Strikes does. He was right.
+fn performable_while_staggered(ability_uuid: &str) -> bool {
+    if is_recovery_strikes(ability_uuid) {
+        return true;
+    }
+    super::gamedata::ability_rank_clamped(ability_uuid, 1)
+        .and_then(|r| r.maximum_damage_dodged())
+        .is_some_and(|cap| cap > 0.0)
 }
 
 /// A weapon auto-attack (committed swing), throttled per attacker.
@@ -8736,38 +8784,82 @@ mod shipped_effects_tests {
         );
     }
 
-    /// THE CONTROL, and it is the one that matters: the exception must be exactly one
-    /// ability wide. A gate that simply stopped blocking staggered input would pass
-    /// the test above while deleting the stun from the game.
+    /// THE DODGES ACT THROUGH A STUN TOO — measured, since the data does not say.
+    ///
+    /// Counting every ability execution (gmid 37/38) inside a `Staggered` op51
+    /// apply→remove window across 11 retail sessions:
+    ///
+    /// ```text
+    ///   RecoveryStrikes  64 stunned / 221 free  22.5%   (documented stun-proof)
+    ///   DodgingStrike    50 / 218               18.7%
+    ///   AdrenalineDodge  44 / 314               12.3%
+    ///   QuickStrikes      0 / 294                0.0%
+    ///   LightningBolt     0 / 219                0.0%
+    ///   Ward              0 / 70                 0.0%
+    /// ```
+    ///
+    /// The hard zeros at comparable sample sizes are what make this a real
+    /// distinction rather than a measurement floor. A lagging stagger-remove would
+    /// be the obvious confound; measuring position WITHIN the window rules it out
+    /// (30 % of DodgingStrike's stunned uses fall in the first half, vs Recovery
+    /// Strikes' 14 %), and StaggeringBash — which CAUSES the stagger — lands at
+    /// median position 0.10, confirming the window logic.
+    ///
+    /// Report #113 (Taheen), who said dodges free you from a stun. They do.
+    #[test]
+    fn the_dodge_maneuvers_can_also_be_performed_while_staggered() {
+        let now = Instant::now();
+        let at = now + Duration::from_millis(100);
+        for name in ["DodgingStrike", "AdrenalineDodge", "RenewingDodge", "FocusingDodge"] {
+            let mut c = combat2(now);
+            c.fighters[0].apply_stagger_for(now, 2.5);
+            assert!(c.fighters[0].is_staggered(now), "{name}: the fixture must stun slot 0");
+            let obj = c.fighters[0].net_object_id;
+            let frame = messages::request_execute_ability(obj, &uuid_of(name));
+            assert!(
+                !on_c2s_input(&mut c, 0, &frame, at).is_empty(),
+                "{name} must be performable while staggered"
+            );
+        }
+    }
+
+    /// THE CONTROL, and it is the one that matters: the exception must stay NARROW.
+    /// A gate that simply stopped blocking staggered input would pass both tests
+    /// above while deleting the stun from the game.
     #[test]
     fn a_stagger_still_blocks_every_other_input() {
         let now = Instant::now();
         let at = now + Duration::from_millis(100);
 
-        // A different ability — Dodging Strike — is still refused.
-        let mut c = combat2(now);
-        c.fighters[0].apply_stagger_for(now, 2.5);
-        let obj = c.fighters[0].net_object_id;
-        let dodge = messages::request_execute_ability(obj, &uuid_of("DodgingStrike"));
-        assert!(
-            on_c2s_input(&mut c, 0, &dodge, at).is_empty(),
-            "a stagger must still block other abilities"
-        );
+        // Abilities measured at 0 uses inside a stun window across 11 retail
+        // sessions are still refused: QuickStrikes 0/294, LightningBolt 0/219,
+        // Ward 0/70. QuickStrikes in particular is a MANEUVER, so this also pins
+        // that the rule is not "maneuvers pass, spells do not".
+        for name in ["QuickStrikes", "LightningBolt", "Ward"] {
+            let mut c = combat2(now);
+            c.fighters[0].apply_stagger_for(now, 2.5);
+            let obj = c.fighters[0].net_object_id;
+            let frame = messages::request_execute_ability(obj, &uuid_of(name));
+            assert!(
+                on_c2s_input(&mut c, 0, &frame, at).is_empty(),
+                "{name} must still be blocked by a stagger"
+            );
 
-        // …and so is an ordinary weapon swing.
+            // …and the un-staggered control proves the fixture is not simply inert:
+            // the same frame DOES act with no stagger applied.
+            let mut free = combat2(now);
+            assert!(
+                !on_c2s_input(&mut free, 0, &frame, at).is_empty(),
+                "{name} must act when NOT staggered — otherwise this proves nothing"
+            );
+        }
+
+        // …and an ordinary weapon swing is still blocked.
         let mut c2 = combat2(now);
         c2.fighters[0].apply_stagger_for(now, 2.5);
         assert!(
             on_c2s_input(&mut c2, 0, &[0xBE, 0x36], at).is_empty(),
             "a stagger must still block a plain swing"
-        );
-
-        // …and the un-staggered control proves the fixture is not simply inert:
-        // the same dodge frame DOES produce output with no stagger applied.
-        let mut c3 = combat2(now);
-        assert!(
-            !on_c2s_input(&mut c3, 0, &dodge, at).is_empty(),
-            "without a stagger the same frame must act — otherwise this proves nothing"
         );
     }
 
