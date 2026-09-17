@@ -253,6 +253,26 @@ fn town_building_ids(town: &Value) -> std::collections::HashSet<Uuid> {
     out
 }
 
+/// Is this job FINISHED and pinned to a building the client will never show it on?
+///
+/// Both halves matter and neither alone is sufficient:
+///
+/// * **on a real building** — the job is about to be detached (see `get_crafts`),
+///   and a detached job has no building for the client to draw a Collect button on.
+/// * **finished** — only then can it be paid out. An unfinished job still has to be
+///   detached and left alone, because collecting it early would hand over an item
+///   the player has not waited for.
+///
+/// A finished job on a building the player does NOT own is already harmless: it is
+/// never detached, so the client can still collect it normally.
+fn is_stuck_finished(
+    job: &CraftJob,
+    owned_buildings: &std::collections::HashSet<Uuid>,
+    now_ms: i64,
+) -> bool {
+    owned_buildings.contains(&job.building_id) && job.completed_at_ms <= now_ms
+}
+
 /// A stable stand-in id that cannot name a real building.
 ///
 /// Same trick `arena_season` uses for its archive key: flip high bits of the
@@ -278,7 +298,82 @@ pub async fn get_crafts(
 
     conn.transaction(move |mut conn| {
         async move {
-            let entry = load_owned(&mut conn, character_id, user_id).await?;
+            let mut entry = load_owned(&mut conn, character_id, user_id).await?;
+
+            // COLLECT a finished job that would otherwise be detached forever.
+            //
+            // Detaching (below) keeps the player out of the town-build hang, but a
+            // job served under an id that names no building is a job the client can
+            // never offer a Collect button for. A FINISHED one is then stuck twice
+            // over: the item is never handed out, and the bench it occupies is never
+            // freed, so that station can never craft again.
+            //
+            // Reported as "I can't craft any weapon in town smithy — there seems to
+            // be an issue with buildingid" (#165): a Dragonbone Longsword completed
+            // 2026-07-10, sitting on a Forge, uncollectable.
+            //
+            // For a finished job there is a strictly better move than detaching: pay
+            // it out and remove it, exactly as `POST /crafts/{id}/finish` would. The
+            // player gets the item — which is what the detach comment says it is
+            // protecting — and nothing is left pointing at a real building.
+            //
+            // This does NOT loosen the containment. An UNFINISHED job on a real
+            // building is still detached, because it cannot be paid out early. The
+            // measured rule that any resolvable buildingId stalls the client is
+            // untouched.
+            let owned_buildings: std::collections::HashSet<Uuid> = {
+                use crate::schema::characters::dsl as ch;
+                let town: Option<Option<JsonDbWrapper<Value>>> = ch::characters
+                    .filter(ch::id.eq(character_id))
+                    .select(ch::town)
+                    .first(&mut conn)
+                    .await
+                    .optional()?;
+                town.flatten()
+                    .map(|JsonDbWrapper(v)| town_building_ids(&v))
+                    .unwrap_or_default()
+            };
+
+            let now = now_ms();
+            let collectable: Vec<CraftJob> = if owned_buildings.is_empty() {
+                Vec::new()
+            } else {
+                let mut taken = Vec::new();
+                entry.server_state.0.craft_jobs.retain(|j| {
+                    if is_stuck_finished(j, &owned_buildings, now) {
+                        taken.push(j.clone());
+                        return false;
+                    }
+                    true
+                });
+                taken
+            };
+            if !collectable.is_empty() {
+                let mut tracker = InventoryChangeTracker::default();
+                for job in &collectable {
+                    let (_, repaired) =
+                        repaired_craft_fields(job, &globals.static_data, &globals.repair_data);
+                    let reward = reward_from_results(&repaired);
+                    apply_reward(
+                        &reward,
+                        &mut entry.wallet.0,
+                        &mut entry.inventory.0,
+                        &mut entry.character.0,
+                        &mut tracker,
+                    );
+                    if !reward.stackable_items.is_empty() || !reward.items.is_empty() {
+                        entry.inventory.0.backpack_version += 1;
+                    }
+                }
+                log::warn!(
+                    "character {character_id}: collected {} finished craft job(s) that were \
+                     stuck on a real town building and could never be claimed (#165)",
+                    collectable.len(),
+                );
+                write_back(&mut conn, entry).await?;
+                entry = load_owned(&mut conn, character_id, user_id).await?;
+            }
+
             let mut wires = craft_wires(
                 &entry.server_state.0.craft_jobs,
                 user_id,
@@ -309,18 +404,6 @@ pub async fn get_crafts(
             //
             // This is a containment, NOT the fix, and it should be deleted the
             // moment the real cause is found. See docs/craft-town-hang.md.
-            let owned_buildings: std::collections::HashSet<Uuid> = {
-                use crate::schema::characters::dsl as ch;
-                let town: Option<Option<JsonDbWrapper<Value>>> = ch::characters
-                    .filter(ch::id.eq(character_id))
-                    .select(ch::town)
-                    .first(&mut conn)
-                    .await
-                    .optional()?;
-                town.flatten()
-                    .map(|JsonDbWrapper(v)| town_building_ids(&v))
-                    .unwrap_or_default()
-            };
             if !owned_buildings.is_empty() {
                 let mut detached = 0usize;
                 for w in wires.iter_mut() {
@@ -2946,5 +3029,66 @@ mod town_hang_containment_tests {
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         assert_ne!(detached_building_id(a), detached_building_id(b));
+    }
+}
+
+#[cfg(test)]
+mod stuck_craft_tests {
+    use super::*;
+
+    fn job(building: Uuid, completed_at_ms: i64) -> CraftJob {
+        CraftJob {
+            id: Uuid::from_u128(1),
+            recipe_id: Uuid::from_u128(2),
+            building_id: building,
+            crafting_type_id: Uuid::from_u128(3),
+            completed_at_ms,
+            results: serde_json::json!({}),
+        }
+    }
+
+    const NOW: i64 = 1_000_000;
+
+    /// A FINISHED job on one of the player's own buildings is collectable.
+    ///
+    /// It is about to be detached to avoid the measured town-build hang, and a
+    /// detached job has no building for the client to draw a Collect button on — so
+    /// the item is never handed out and the bench is never freed. Report #165: a
+    /// Dragonbone Longsword finished 2026-07-10, sitting on a Forge, unclaimable,
+    /// blocking every later smithing craft.
+    #[test]
+    fn a_finished_job_on_an_owned_building_is_collected() {
+        let b = Uuid::from_u128(0xB1);
+        let owned = std::collections::HashSet::from([b]);
+        assert!(is_stuck_finished(&job(b, NOW - 1), &owned, NOW));
+        assert!(is_stuck_finished(&job(b, NOW), &owned, NOW), "exactly due counts as finished");
+    }
+
+    /// THE CONTROL, and the one that matters: this must NOT loosen the containment.
+    ///
+    /// The detach exists because a job whose `buildingId` resolves to a real
+    /// building stalls the client's town-build coroutine — measured on a clean rig,
+    /// and it bricked three players. An UNFINISHED job on a real building must still
+    /// be left for the detach path, because it cannot be paid out early.
+    #[test]
+    fn an_unfinished_job_is_left_to_the_detach_path() {
+        let b = Uuid::from_u128(0xB1);
+        let owned = std::collections::HashSet::from([b]);
+        assert!(
+            !is_stuck_finished(&job(b, NOW + 1), &owned, NOW),
+            "a job that has not finished must not be collected early"
+        );
+    }
+
+    /// THE SECOND CONTROL: a finished job on a building the player does not own is
+    /// already fine — it is never detached, so the client can collect it normally
+    /// and the server must not take it away from them.
+    #[test]
+    fn a_finished_job_on_an_unowned_building_is_untouched() {
+        let owned = std::collections::HashSet::from([Uuid::from_u128(0xB1)]);
+        assert!(!is_stuck_finished(&job(Uuid::from_u128(0xB2), NOW - 1), &owned, NOW));
+        // …and with no town at all, nothing is ever collected.
+        let empty = std::collections::HashSet::new();
+        assert!(!is_stuck_finished(&job(Uuid::from_u128(0xB1), NOW - 1), &empty, NOW));
     }
 }
