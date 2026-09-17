@@ -43,6 +43,7 @@
 // consume them (Phase B/C).
 #![allow(dead_code)]
 
+pub mod trace;
 pub mod damage;
 pub mod engine;
 pub mod gamedata;
