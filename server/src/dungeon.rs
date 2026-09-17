@@ -229,7 +229,10 @@ pub async fn exit_quest_dungeon(
 
     if is_event {
         // Clear event dungeon state instead
-        return handle_event_dungeon_exit(&mut conn, char_id, gld_quest_id, &app_state).await;
+        // Both ids: the TEMPLATE keys the event tables, the INSTANCE keys the
+        // client's completedQuests mirror. See `handle_event_dungeon_exit`.
+        return handle_event_dungeon_exit(&mut conn, char_id, gld_quest_id, quest_id, &app_state)
+            .await;
     }
 
     conn.transaction(move |mut conn| {
@@ -370,10 +373,15 @@ pub(crate) fn event_dungeon_data(
     Ok((dungeon_uuid, generated_data))
 }
 
+/// `quest_id` is the event TEMPLATE (`gldQuestId`); `instance_quest_id` is the
+/// player's own row id from the URL. They are never equal on an event quest — 1271
+/// of 1271 captured event rows have `questId != gldQuestId` — and they key
+/// different things, which is the whole of report #166.
 async fn handle_event_dungeon_exit(
     conn: &mut AsyncPgConnection,
     char_id: Uuid,
     quest_id: Uuid,
+    instance_quest_id: Uuid,
     app_state: &ServerGlobal,	
 ) -> Result<Json<ExitDungeonResponse>, BladeApiError> {
     use crate::schema::event_dungeons::dsl::*;
@@ -439,12 +447,29 @@ async fn handle_event_dungeon_exit(
         completion.increment_completion(conn).await?;
     }
 
-    // Mirror complete_quest's write into the character's completedQuests JSON
-    // (`{ "<gldQuestId>": <completion_count> }`) — this is what the client's
-    // quest-list checkboxes actually read. increment_completion only updates the
-    // separate event_completions table, which gates rewards/tiers server-side but
-    // is invisible to that UI, so without this the tier pays out correctly but
-    // never shows as completed.
+    // Mirror the completion into the character's completedQuests JSON — this is
+    // what the client's tier checkmarks read. `increment_completion` only updates
+    // the separate event_completions table, which gates rewards server-side but is
+    // invisible to that UI.
+    //
+    // KEYED BY THE INSTANCE ID, NOT THE TEMPLATE (report #166).
+    //
+    // This used to write the `gldQuestId`, on the stated belief that it was "what
+    // the client's quest-list checkboxes actually read". The captured retail
+    // corpus says otherwise. Across 773 recorded `/quests` bodies:
+    //
+    //     event gldQuestIds appearing as a completedQuests key    0 / 39
+    //     event INSTANCE questIds appearing as a key            110 / 1071
+    //
+    // and the control that explains why this survived so long: for an ordinary
+    // quest `questId == gldQuestId`, so both readings score 71/71 and the bug is
+    // invisible there. Only event quests distinguish them.
+    //
+    // The value is the tier counter: over 185 samples it takes values 1-5, and
+    // every one of those rows has exactly 5 tiers.
+    //
+    // So rewards paid, `event_completions` advanced, and the client was told none
+    // of it — "event tiers are not progressing, they are not getting checkmarked".
     if !character_data.character.0.completed_quests.is_object() {
         character_data.character.0.completed_quests = json!({});
     }
@@ -455,7 +480,7 @@ async fn handle_event_dungeon_exit(
         .as_object_mut()
         .unwrap()
         .insert(
-            quest_id.to_string(),
+            instance_quest_id.to_string(),
             json!(completion.completion_count),
     );
 

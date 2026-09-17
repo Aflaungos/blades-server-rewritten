@@ -31,6 +31,38 @@ use crate::{
     util,
 };
 
+/// Which id keys this quest in `character.completedQuests`.
+///
+/// An EVENT quest is keyed by its own instance id; everything else by its
+/// template (`gldQuestId`). For an ordinary quest the two are equal, so the
+/// distinction is invisible there — and that is precisely why keying everything
+/// by `gldQuestId` looked right for so long.
+///
+/// Measured over 773 captured retail `/quests` bodies:
+///
+/// ```text
+///   event gldQuestIds appearing as a completedQuests key      0 / 39
+///   event INSTANCE questIds appearing as a key              110 / 1071
+///   CONTROL - ordinary quests, gldQuestId as key             71 / 71
+///   CONTROL - ordinary quests, questId as key                71 / 71
+/// ```
+///
+/// The two controls are the argument: the probe finds ordinary quests under
+/// either reading, so the zero for event templates is a real absence and not a
+/// broken probe.
+///
+/// The value stored under this key is the tier counter the client checkmarks
+/// from — 1..5 over 185 samples, every one of those rows carrying exactly 5
+/// tiers. Written to the wrong key, rewards paid and `event_completions`
+/// advanced while the client was told nothing at all. Report #166.
+fn completed_quests_key(quest: &blades_lib::user_data::Quest, instance_id: Uuid) -> String {
+    if matches!(quest.r#type, blades_lib::user_data::QuestType::GameEvent) {
+        instance_id.to_string()
+    } else {
+        quest.gld_quest_id.to_string()
+    }
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetQuestsResponse {
@@ -1170,7 +1202,14 @@ pub async fn complete_quest(
             }
 
             // Update the character's completedQuests JSON.
-            // The client expects: { "<gldQuestId>": <completion_count> }
+            //
+            // The key is the quest's OWN id for an event, and its template id
+            // otherwise. For an ordinary quest the two are equal, so this is a
+            // no-op there — which is exactly why keying everything by
+            // `gldQuestId` looked correct: the captured corpus scores 71/71 for
+            // both readings on ordinary quests, and 0/39 vs 110/1071 on events.
+            // See `dungeon::handle_event_dungeon_exit` for the full measurement.
+            // Report #166.
             if !entry.character.0.completed_quests.is_object() {
                 entry.character.0.completed_quests = json!({});
             }
@@ -1182,7 +1221,7 @@ pub async fn complete_quest(
                 .as_object_mut()
                 .unwrap();
 
-            let key = quest_entry.info.0.gld_quest_id.to_string();
+            let key = completed_quests_key(&quest_entry.info.0, quest_id);
 
             let current_count = completed_quests
                 .get(&key)
@@ -4732,4 +4771,61 @@ mod jobs_wire_diff {
         }
     }
 
+}
+
+#[cfg(test)]
+mod completed_quests_key_tests {
+    use super::*;
+    use blades_lib::user_data::{Quest, QuestType};
+
+    fn quest(kind: QuestType, gld: Uuid) -> Quest {
+        Quest {
+            version: 1,
+            r#type: kind,
+            objective_statuses: Default::default(),
+            difficulty_level: 1,
+            seed: serde_json::Number::from(1),
+            gld_quest_id: gld,
+            game_event_quest_data: None,
+            rewards: None,
+            final_reward: None,
+            job_reward: None,
+            completed: false,
+        }
+    }
+
+    /// AN EVENT QUEST IS KEYED BY ITS OWN ID, NOT ITS TEMPLATE.
+    ///
+    /// The retail corpus is unambiguous: event `gldQuestId`s appear as a
+    /// `completedQuests` key 0 times in 39, while event instance ids appear 110
+    /// times in 1071. Keying by the template meant the tier counter was written
+    /// where the client never looks, so rewards paid and nothing ever
+    /// checkmarked (report #166).
+    #[test]
+    fn an_event_quest_is_keyed_by_its_instance_id() {
+        let gld = Uuid::from_u128(0xAAAA);
+        let instance = Uuid::from_u128(0xBBBB);
+        assert_ne!(gld, instance, "the fixture must distinguish them");
+        assert_eq!(
+            completed_quests_key(&quest(QuestType::GameEvent, gld), instance),
+            instance.to_string(),
+        );
+    }
+
+    /// THE CONTROL, and it is why this bug survived: for an ordinary quest the
+    /// two ids are equal in practice, so both readings agree (71/71 either way in
+    /// the corpus). The rule must still pick the TEMPLATE there, so that a
+    /// NORMAL quest whose ids happen to differ is unaffected by this change.
+    #[test]
+    fn a_normal_quest_is_still_keyed_by_its_template() {
+        let gld = Uuid::from_u128(0xAAAA);
+        let instance = Uuid::from_u128(0xBBBB);
+        for kind in [QuestType::Normal, QuestType::Job] {
+            assert_eq!(
+                completed_quests_key(&quest(kind, gld), instance),
+                gld.to_string(),
+                "{kind:?} must keep the template key",
+            );
+        }
+    }
 }
