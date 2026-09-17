@@ -524,6 +524,27 @@ pub async fn purchase_global_shop(
                 .try_pay(&prices)
                 .map_err(BladeApiError::from_economy)?;
 
+            // MINT A FRESH INSTANCE ID PER PURCHASE.
+            //
+            // The grants are capture-derived, so each one carries the item instance
+            // uuid from the ORIGINAL retail purchase it was mined from — 97 distinct
+            // frozen ids across the 85 grants that award items, not one of them null.
+            // `apply_reward` inserts into `backpack.items` keyed by that id, so
+            // buying the same product twice overwrites the first copy: the player
+            // pays twice and owns one. It also hands every player on the server the
+            // same instance id for that product, and the arena ships instance ids to
+            // the opponent's client in the op54 profile.
+            //
+            // `quest.rs` already mints per grant (`id: Uuid::new_v4()`); the shop
+            // path never did.
+            let reward = {
+                let mut r = reward;
+                for item in &mut r.items {
+                    item.id = uuid::Uuid::new_v4();
+                }
+                r
+            };
+
             let mut tracker = InventoryChangeTracker::default();
             apply_reward(
                 &reward,
@@ -1256,5 +1277,84 @@ mod offer_contents_fallback {
         );
         let r = grant_from_offer_contents(Some(&o)).expect("grantable");
         assert_eq!(r.currencies.get(&GOLD), Some(&125));
+    }
+}
+
+#[cfg(test)]
+mod purchase_item_id_tests {
+    use super::*;
+
+    /// THE SHIPPED GRANTS CARRY FROZEN INSTANCE IDS, so the purchase path must mint.
+    ///
+    /// Each grant was mined from one recorded retail purchase and kept that
+    /// purchase's item instance uuid. `apply_reward` inserts into
+    /// `backpack.items` keyed by that id, so granting the same product twice
+    /// overwrites the first copy — pay twice, own one — and every player on the
+    /// server ends up holding the same instance id for that product, which the
+    /// arena ships to the opponent's client in the op54 profile.
+    ///
+    /// This pins the premise: if the committed grants ever stop carrying ids, the
+    /// minting below is dead code and should be revisited rather than left as
+    /// cargo cult.
+    #[test]
+    fn the_committed_grants_really_do_carry_frozen_item_ids() {
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../deploy/static/global_shop_grants.json");
+        let raw = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{p:?}: {e}"));
+        let grants: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let obj = grants.as_object().expect("grants is an object");
+
+        let mut with_items = 0usize;
+        let mut ids = std::collections::HashSet::new();
+        for g in obj.values() {
+            for it in g["items"].as_array().into_iter().flatten() {
+                with_items += 1;
+                let id = it["id"].as_str().expect("a grant item carries an id");
+                ids.insert(id.to_string());
+            }
+        }
+        assert!(with_items > 0, "no grant awards an item — the premise is gone");
+        assert!(
+            ids.len() > 1,
+            "the ids must be real frozen uuids, not one repeated placeholder"
+        );
+    }
+
+    /// Minting must give a DIFFERENT id each time, and must not disturb the item.
+    ///
+    /// Driven off a REAL committed grant rather than a hand-built one, so the test
+    /// cannot pass against a fixture that does not resemble what ships.
+    #[test]
+    fn two_purchases_of_one_product_yield_two_distinct_items() {
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../deploy/static/global_shop_grants.json");
+        let raw = std::fs::read_to_string(&p).unwrap();
+        let grants: std::collections::HashMap<String, RewardGrant> =
+            serde_json::from_str(&raw).expect("grants parse as RewardGrant");
+
+        let (_, grant) = grants
+            .iter()
+            .find(|(_, g)| !g.items.is_empty())
+            .expect("some grant awards an item");
+        let frozen = grant.items[0].id;
+        let template = grant.items[0].item.item_template_id;
+
+        let mint = |g: &RewardGrant| {
+            let mut r = g.clone();
+            for item in &mut r.items {
+                item.id = uuid::Uuid::new_v4();
+            }
+            r
+        };
+        let a = mint(grant);
+        let b = mint(grant);
+
+        assert_ne!(a.items[0].id, b.items[0].id, "each purchase needs its own instance id");
+        assert_ne!(a.items[0].id, frozen, "the frozen id must not survive");
+        assert_eq!(
+            a.items[0].item.item_template_id, template,
+            "the item itself must be untouched — only its instance id changes"
+        );
+        assert_eq!(a.items.len(), grant.items.len(), "no item is added or lost");
     }
 }
