@@ -48,6 +48,7 @@ use actix_web::{
 };
 use blades_lib::{
     economy::{RewardGrant, apply_reward, consume_stackable},
+    features::abyss_rewards,
     server_state::{AbyssRun, AbyssSliceEntry},
     user_data::{CompleteCharacterWithIdWithoutData, CompleteInventory, CompleteInventoryUpdate,
                 CompleteWallet, DungeonGeneratedData, InventoryChangeTracker},
@@ -97,17 +98,18 @@ struct AbyssWire {
 }
 
 /// One future-reward threshold wire entry.
+///
+/// The reward is a plain `RewardGrant`, which already omits every empty
+/// collection — so a stackable rung serialises as `{"stackableItems":{…}}`, a
+/// chest rung as `{"chests":[{"level":N,"tier":T}]}` and a gear rung as
+/// `{"items":[…]}`, which is exactly the per-rung shape retail sent. The old
+/// dedicated struct could only express stackables, so the chest and gear rungs
+/// had no wire representation at all.
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct AbyssFutureRewardWire {
-    reward: AbyssFutureRewardInner,
+    reward: RewardGrant,
     score: u32,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(rename_all = "camelCase")]
-struct AbyssFutureRewardInner {
-    stackable_items: std::collections::HashMap<Uuid, u64>,
 }
 
 // ────────────────────────────────────────────────────────────────────────────
@@ -132,7 +134,7 @@ pub async fn get_abyss(
 
     let entry = load_economy(&mut conn, &session.session, character_id).await?;
     let run = entry.server_state.0.abyss.as_ref();
-    let wire = run.map(|r| run_to_wire(r, &app_state));
+    let wire = run.map(|r| run_to_wire(r, u64::from(entry.character.0.level)));
     Ok(Json(GetAbyssResponse { abyss: wire }))
 }
 
@@ -217,7 +219,7 @@ pub async fn start_abyss(
                 current_floor_index: 0,
             };
 
-            let wire = run_to_wire(&run, &app_state);
+            let wire = run_to_wire(&run, u64::from(player_level));
 
             // Generated data for the floor the run STARTS on — which is
             // `slices[0]`, not floor 1: a resumed run's first slice is the
@@ -460,7 +462,8 @@ pub async fn update_abyss(
                 apply_actions(&app_state.static_data.abyss, run, &body.actions);
 
                 let revive_count = run.revive_count;
-                let future_rewards = build_future_rewards(&app_state);
+                let future_rewards =
+                    build_future_rewards(run.score, u64::from(entry.character.0.level), run.seed);
                 apply_combat_durability(&body.actions, &mut entry.inventory.0, &mut tracker);
                 let consumed = apply_item_consumption(
                     &body.actions,
@@ -490,7 +493,8 @@ pub async fn update_abyss(
                 // No active run — lenient: return empty progress rather than 404.
                 let inv = entry.inventory.0.generate_client_update(&tracker);
                 Ok::<_, BladeApiError>(Json(UpdateAbyssResponse {
-                    abyss_future_rewards: build_future_rewards(&app_state),
+                    // No active run: nothing to advertise against.
+                    abyss_future_rewards: Vec::new(),
                     character: CompleteCharacterWithIdWithoutData {
                         id: character_id,
                         character: entry.character.0,
@@ -814,7 +818,7 @@ fn build_slices(
 }
 
 /// Convert a server-side `AbyssRun` to the wire shape.
-fn run_to_wire(run: &AbyssRun, app_state: &ServerGlobal) -> AbyssWire {
+fn run_to_wire(run: &AbyssRun, character_level: u64) -> AbyssWire {
     let slices = run.slices.iter().map(|s| AbyssSliceWire {
         dungeon_settings_id: s.dungeon_settings_id,
         difficulty_level: s.difficulty_level,
@@ -833,20 +837,26 @@ fn run_to_wire(run: &AbyssRun, app_state: &ServerGlobal) -> AbyssWire {
         score: run.score,
         algorithm_version: run.algorithm_version,
         version: run.version,
-        abyss_future_rewards: build_future_rewards(app_state),
+        abyss_future_rewards: build_future_rewards(run.score, character_level, run.seed),
     }
 }
 
-/// Build the future-rewards wire list from static data.
-fn build_future_rewards(app_state: &ServerGlobal) -> Vec<AbyssFutureRewardWire> {
-    app_state.static_data.abyss.future_rewards.iter().map(|fr| {
-        AbyssFutureRewardWire {
-            score: fr.score,
-            reward: AbyssFutureRewardInner {
-                stackable_items: fr.stackable_items.clone(),
-            },
-        }
-    }).collect()
+/// The future rewards to advertise: the NEXT rung this run has not reached.
+///
+/// This used to map the whole of `static_data.abyss.future_rewards` onto the
+/// wire, which was only ever correct by accident — that list holds ONE rung, so
+/// a run past score 35 was advertised the same reward for the rest of its life
+/// and the nine rungs above it did not exist (#172). Retail sends exactly one
+/// entry, the next unreached rung, in 707 of 707 captured responses.
+///
+/// The ladder and its contents now come from the mined corpus in
+/// `blades_lib::features::abyss_rewards`, which also knows that the two chest
+/// rungs are deterministic and cut to the player's own level.
+fn build_future_rewards(score: f64, character_level: u64, run_seed: i64) -> Vec<AbyssFutureRewardWire> {
+    abyss_rewards::next_future_reward(score, character_level, run_seed)
+        .map(|(score, reward)| AbyssFutureRewardWire { score, reward })
+        .into_iter()
+        .collect()
 }
 
 /// Generated dungeon data for ONE abyss floor, built from that floor's ACTUAL
