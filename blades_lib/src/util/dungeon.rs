@@ -165,6 +165,40 @@ fn roll_loot_table(dungeon_uuid: &Uuid, spawn_id: &Uuid, table_id: &Uuid) -> Loo
     out
 }
 
+/// Which dungeon owns this enemy spawn group, if exactly one does.
+///
+/// THE VARIANT MISMATCH (#174). Retail builds several versions of a dungeon —
+/// `EQ22_SQ102_DungeonSettings_A`, `_B`, `_C` — and 23 families in `parsed.json`
+/// have them. A quest names exactly one, always the `_A`, and every one of those
+/// 23 families gives its variants **completely different** enemy spawn groups: not
+/// one group is shared between any two variants.
+///
+/// The client does not always walk the one we named. When it walks `_B`, every
+/// kill it reports names a spawner we have no data for, so `dungeon_update` logs
+/// "not in generated data (stale)" and throws the kill away — no experience, no
+/// loot, for that whole stage. 15 of the 22 such warnings in eleven days are
+/// exactly this.
+///
+/// Because the variants share no groups, the reported spawner identifies the
+/// variant unambiguously, which is what makes the repair in `dungeon_update` safe:
+/// the client tells us which version it is in, and we can generate the right data
+/// instead of discarding its progress.
+///
+/// `None` when no dungeon owns the group, or when more than one does — in which
+/// case the answer is not unambiguous and the caller must not guess.
+pub fn dungeon_owning_spawn_group(game_data: &GameData, group_id: &Uuid) -> Option<Uuid> {
+    let mut found = None;
+    for (dungeon_id, dungeon) in &game_data.dungeons {
+        if dungeon.spawn_info.enemy_spawn_groups.contains_key(group_id) {
+            if found.is_some() {
+                return None; // ambiguous
+            }
+            found = Some(*dungeon_id);
+        }
+    }
+    found
+}
+
 pub fn generate_for_dungeon(
     game_data: &GameData,
     dungeon_uuid: &Uuid,
@@ -460,5 +494,92 @@ mod interactable_loot_tests {
         // Control: single-item results must still dominate, or we have swung too
         // far and made every barrel a jackpot.
         assert!(single > multi, "multi-item rolls ({multi}) outnumber single ({single})");
+    }
+}
+
+#[cfg(test)]
+mod variant_owner_tests {
+    use super::*;
+
+    /// A DUNGEON VARIANT IS IDENTIFIABLE FROM ONE SPAWN GROUP.
+    ///
+    /// That is what makes the `dungeon_update` repair safe. Retail builds several
+    /// versions of a dungeon (`_A`, `_B`, `_C`); 23 families in `parsed.json` have
+    /// them, and in all 23 the variants share NOT ONE enemy spawn group — so a
+    /// reported spawner names its variant unambiguously.
+    ///
+    /// Asserted against the shipped data rather than a fixture, because the whole
+    /// claim is about that data.
+    #[test]
+    fn variants_never_share_an_enemy_spawn_group() {
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../deploy/static/parsed.json");
+        let raw = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{p:?}: {e}"));
+        let parsed: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let dungeons = parsed["dungeons"].as_object().expect("dungeons");
+
+        // Group by handle stem: EQ22_SQ102_DungeonSettings_A -> EQ22_SQ102_DungeonSettings
+        let mut families: std::collections::HashMap<String, Vec<&str>> = Default::default();
+        for (id, d) in dungeons {
+            let h = d["handle"].as_str().unwrap_or("");
+            if let Some(stem) = h.strip_suffix("_A")
+                .or_else(|| h.strip_suffix("_B"))
+                .or_else(|| h.strip_suffix("_C"))
+                .or_else(|| h.strip_suffix("_D"))
+            {
+                families.entry(stem.to_string()).or_default().push(id);
+            }
+        }
+        let multi: Vec<_> = families.values().filter(|v| v.len() > 1).collect();
+        assert!(!multi.is_empty(), "no variant families found — the premise is gone");
+
+        let groups_of = |id: &str| -> std::collections::HashSet<String> {
+            dungeons[id]["spawn_info"]["enemy_spawn_groups"]
+                .as_object()
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default()
+        };
+        for fam in &multi {
+            for (i, a) in fam.iter().enumerate() {
+                for b in fam.iter().skip(i + 1) {
+                    let overlap: Vec<_> = groups_of(a).intersection(&groups_of(b)).cloned().collect();
+                    assert!(
+                        overlap.is_empty(),
+                        "variants {a} and {b} share spawn group(s) {overlap:?} — a reported \
+                         spawner would no longer identify one variant"
+                    );
+                }
+            }
+        }
+    }
+
+    /// THE CONTROL: the lookup must find a real group, and must refuse an unknown
+    /// one. A function that returned `Some` for everything would satisfy the repair
+    /// path while attributing the player to an arbitrary dungeon.
+    #[test]
+    fn the_owner_lookup_finds_real_groups_and_refuses_unknown_ones() {
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../deploy/static/parsed.json");
+        let raw = std::fs::read_to_string(&p).unwrap();
+        let gd: GameData = serde_json::from_str(&raw).expect("parsed.json loads as GameData");
+
+        // A group we know exists: take one from any dungeon.
+        let (want_dungeon, want_group) = gd
+            .dungeons
+            .iter()
+            .find_map(|(id, d)| d.spawn_info.enemy_spawn_groups.keys().next().map(|g| (*id, *g)))
+            .expect("some dungeon has an enemy spawn group");
+        assert_eq!(
+            dungeon_owning_spawn_group(&gd, &want_group),
+            Some(want_dungeon),
+            "a real spawn group must resolve to its own dungeon"
+        );
+
+        // And one that exists nowhere.
+        assert_eq!(
+            dungeon_owning_spawn_group(&gd, &Uuid::from_u128(0xDEADBEEF)),
+            None,
+            "an unknown group must not be attributed to any dungeon"
+        );
     }
 }
