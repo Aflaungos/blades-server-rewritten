@@ -60,6 +60,25 @@ static INTERACTABLE_LOOT_RAW: &str = include_str!("../interactable_loot.json");
 // a missing production bind-mount cannot silently restore the tier-1 stub.
 static CHEST_TIERS_RAW: &str = include_str!("../chest_tiers.json");
 
+// How many loot results retail put on each floor-item spawn point.
+//
+// `generate_for_dungeon` emitted exactly ONE per spawn. Retail emitted more on
+// 4,100 of 13,170 spawn OBSERVATIONS (31.1%), which is 97 of the 1,285 distinct
+// spawn points (7.6%). The two differ because the multi-result spawns sit in
+// dungeons players ran far more often: the seven-result spawn alone was seen
+// 1,895 times, and one spawn carries twenty-four. So a minority of floor piles
+// paid a fraction of what retail put there, on a majority of the runs (#173).
+//
+// This is not a corpus gap: all 20 loot tables reachable from a dungeon spawn
+// are already in `interactable_loot.json`, and all 1,976 parsed.json spawns
+// resolve to a known interactable. The contents were right; the COUNT was wrong.
+//
+// The count is a property of the SPAWN POINT, measured: of the 969 spawns
+// observed more than once, 967 always produced the same number and only two
+// varied. A spawn absent from this file keeps one result -- the size is never
+// invented.
+static FLOOR_PILE_SIZES_RAW: &str = include_str!("../floor_pile_sizes.json");
+
 #[derive(Deserialize)]
 struct ChestTierCorpus {
     chests: HashMap<Uuid, ChestSpawnDefinition>,
@@ -80,6 +99,26 @@ fn chest_tiers() -> &'static ChestTierCorpus {
     })
 }
 
+fn floor_pile_sizes() -> &'static serde_json::Value {
+    static TABLE: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        serde_json::from_str(FLOOR_PILE_SIZES_RAW)
+            .unwrap_or_else(|_| serde_json::json!({ "spawns": {} }))
+    })
+}
+
+/// How many results this floor spawn holds. One when never observed, which is
+/// exactly the behaviour that preceded this change.
+fn floor_pile_size(spawn_id: &Uuid) -> usize {
+    floor_pile_sizes()
+        .get("spawns")
+        .and_then(|s| s.get(spawn_id.to_string()))
+        .and_then(|e| e.get("results"))
+        .and_then(|n| n.as_u64())
+        .unwrap_or(1)
+        .max(1) as usize
+}
+
 fn interactable_loot() -> &'static serde_json::Value {
     static TABLE: std::sync::OnceLock<serde_json::Value> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
@@ -95,10 +134,13 @@ fn interactable_loot() -> &'static serde_json::Value {
 /// Deterministic per (dungeon, spawn, table) so a re-fetch of the same dungeon
 /// yields the same contents -- the client is told once what a barrel holds and
 /// must still find it there when it breaks it.
-fn loot_seed(dungeon_uuid: &Uuid, spawn_id: &Uuid, table_id: &Uuid) -> u64 {
+fn loot_seed(dungeon_uuid: &Uuid, spawn_id: &Uuid, table_id: &Uuid, result_index: usize) -> u64 {
     let mut x = dungeon_uuid.as_u128() as u64
         ^ (spawn_id.as_u128() as u64).rotate_left(21)
-        ^ (table_id.as_u128() as u64).rotate_left(42);
+        ^ (table_id.as_u128() as u64).rotate_left(42)
+        // Without this every result in a pile of seven would be the same draw,
+        // which turns "seven results" into "one stack, seven times".
+        ^ (result_index as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
     // splitmix64 finaliser
     x = x.wrapping_add(0x9E3779B97F4A7C15);
     let mut z = x;
@@ -118,7 +160,12 @@ fn loot_seed(dungeon_uuid: &Uuid, spawn_id: &Uuid, table_id: &Uuid) -> u64 {
 ///
 /// The empty result is one of the drawn outcomes (68,081 of them), so a barrel
 /// that gives nothing stays as common as retail made it.
-fn roll_loot_table(dungeon_uuid: &Uuid, spawn_id: &Uuid, table_id: &Uuid) -> LootTableResult {
+fn roll_loot_table(
+    dungeon_uuid: &Uuid,
+    spawn_id: &Uuid,
+    table_id: &Uuid,
+    result_index: usize,
+) -> LootTableResult {
     let mut out = LootTableResult::default();
     let Some(results) = interactable_loot()
         .get("tables")
@@ -138,7 +185,7 @@ fn roll_loot_table(dungeon_uuid: &Uuid, spawn_id: &Uuid, table_id: &Uuid) -> Loo
         return out;
     }
 
-    let mut pick = loot_seed(dungeon_uuid, spawn_id, table_id) % total;
+    let mut pick = loot_seed(dungeon_uuid, spawn_id, table_id, result_index) % total;
     for r in results {
         let n = r.get("n").and_then(|v| v.as_u64()).unwrap_or(0);
         if pick >= n {
@@ -477,18 +524,28 @@ pub fn generate_for_dungeon(
             .filter_map(|(item_spawn_id, spawn_info)| {
                 let picked = spawn_info.apparition_settings.first()?;
                 let interactable = game_data.interactables.get(&picked.interactable_uuid)?;
-                Some((
-                    *item_spawn_id,
-                    vec![DungeonItemResult {
+                // One result per thing retail put on this spawn, each rolled
+                // separately — a pile of seven is seven draws, not one repeated.
+                let pile = (0..floor_pile_size(item_spawn_id))
+                    .map(|result_index| DungeonItemResult {
                         loot_table_loot: interactable
                             .loot_table
                             .iter()
                             .map(|(k, _)| {
-                                (*k, roll_loot_table(dungeon_uuid, item_spawn_id, k))
+                                (
+                                    *k,
+                                    roll_loot_table(
+                                        dungeon_uuid,
+                                        item_spawn_id,
+                                        k,
+                                        result_index,
+                                    ),
+                                )
                             })
                             .collect(),
-                    }],
-                ))
+                    })
+                    .collect();
+                Some((*item_spawn_id, pile))
             })
             .collect(),
         algorithm_version: 1,
@@ -589,7 +646,7 @@ mod interactable_loot_tests {
             let table_id: Uuid = tid.parse().unwrap();
             // several spawns, because one spawn may legitimately roll empty
             for s in 0..40u128 {
-                let got = roll_loot_table(&dungeon, &Uuid::from_u128(s), &table_id);
+                let got = roll_loot_table(&dungeon, &Uuid::from_u128(s), &table_id, 0);
                 checked += 1;
                 if !got.stackable_items.is_empty() {
                     produced += 1;
@@ -615,7 +672,7 @@ mod interactable_loot_tests {
         for tid in tables.keys() {
             let table_id: Uuid = tid.parse().unwrap();
             for s in 0..40u128 {
-                let got = roll_loot_table(&dungeon, &Uuid::from_u128(s), &table_id);
+                let got = roll_loot_table(&dungeon, &Uuid::from_u128(s), &table_id, 0);
                 total += 1;
                 if got.stackable_items.is_empty() && got.currencies.is_empty() {
                     empty += 1;
@@ -636,15 +693,15 @@ mod interactable_loot_tests {
         let tid: Uuid = tables.keys().next().unwrap().parse().unwrap();
         let d = Uuid::from_u128(7);
         let s = Uuid::from_u128(9);
-        let a = roll_loot_table(&d, &s, &tid);
-        let b = roll_loot_table(&d, &s, &tid);
+        let a = roll_loot_table(&d, &s, &tid, 0);
+        let b = roll_loot_table(&d, &s, &tid, 0);
         assert_eq!(a.stackable_items, b.stackable_items, "same barrel, different loot");
 
         // control: a DIFFERENT spawn should not be forced to match, or the
         // stability check above would hold trivially for everything.
         let mut differs = false;
         for other in 0..60u128 {
-            let c = roll_loot_table(&d, &Uuid::from_u128(other), &tid);
+            let c = roll_loot_table(&d, &Uuid::from_u128(other), &tid, 0);
             if c.stackable_items != a.stackable_items {
                 differs = true;
                 break;
@@ -674,7 +731,7 @@ mod interactable_loot_tests {
                 })
                 .collect();
             for s in 0..25u128 {
-                let got = roll_loot_table(&dungeon, &Uuid::from_u128(s), &table_id);
+                let got = roll_loot_table(&dungeon, &Uuid::from_u128(s), &table_id, 0);
                 for item in got.stackable_items.keys() {
                     assert!(
                         allowed.contains(&item.to_string()),
@@ -705,7 +762,7 @@ mod interactable_loot_tests {
         for tid in tables.keys() {
             let table_id: Uuid = tid.parse().unwrap();
             for s in 0..200u128 {
-                let got = roll_loot_table(&dungeon, &Uuid::from_u128(s), &table_id);
+                let got = roll_loot_table(&dungeon, &Uuid::from_u128(s), &table_id, 0);
                 let n = got.stackable_items.len();
                 biggest = biggest.max(n);
                 if n > 1 {
@@ -1088,6 +1145,134 @@ mod enemy_loot_tests {
         assert!(
             with_loot * 2 > enemies,
             "only {with_loot} of {enemies} generated enemies carry currency"
+        );
+    }
+}
+
+#[cfg(test)]
+mod floor_pile_tests {
+    use super::*;
+
+    fn game_data() -> GameData {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../deploy/static/parsed.json");
+        serde_json::from_str(&std::fs::read_to_string(path).expect("read parsed.json"))
+            .expect("parse game data")
+    }
+
+    /// The sidecar must be compiled in and hold what was mined. Parsed
+    /// explicitly so a deserialization failure names itself rather than
+    /// silently degrading to "every pile is one".
+    #[test]
+    fn the_pile_size_sidecar_loads() {
+        let v: serde_json::Value = serde_json::from_str(FLOOR_PILE_SIZES_RAW)
+            .expect("floor_pile_sizes.json must parse");
+        let spawns = v["spawns"].as_object().expect("spawns object");
+        assert_eq!(spawns.len(), 1285, "the mined floor spawn points");
+        assert_eq!(v["_meta"]["dungeons"].as_u64(), Some(3033));
+    }
+
+    /// Every mined spawn must be a floor spawn parsed.json really has. An id
+    /// that matches nothing would mean every lookup falls through to one result
+    /// — which looks exactly like working code.
+    #[test]
+    fn every_mined_spawn_is_a_real_floor_spawn() {
+        let game_data = game_data();
+        let known: std::collections::HashSet<Uuid> = game_data
+            .dungeons
+            .values()
+            .flat_map(|d| d.spawn_info.item.keys().copied())
+            .collect();
+        let v: serde_json::Value = serde_json::from_str(FLOOR_PILE_SIZES_RAW).unwrap();
+        let mut unknown = Vec::new();
+        for id in v["spawns"].as_object().unwrap().keys() {
+            let spawn: Uuid = id.parse().expect("spawn id is a uuid");
+            if !known.contains(&spawn) {
+                unknown.push(spawn);
+            }
+        }
+        assert!(unknown.is_empty(), "mined spawns absent from parsed.json: {unknown:?}");
+    }
+
+    /// THE BUG: every floor pile held exactly one result, where retail put more
+    /// on 31% of them.
+    #[test]
+    fn floor_piles_can_hold_more_than_one_result() {
+        let game_data = game_data();
+        let mut piles = 0;
+        let mut multi = 0;
+        let mut biggest = 0;
+        for dungeon_id in game_data.dungeons.keys() {
+            let generated = generate_for_dungeon(&game_data, dungeon_id, 20, 5).unwrap();
+            for results in generated.item_generated_data.values() {
+                piles += 1;
+                biggest = biggest.max(results.len());
+                if results.len() > 1 {
+                    multi += 1;
+                }
+            }
+        }
+        assert!(piles > 1_900, "only {piles} floor piles generated");
+        // 97 of the 1,285 mined spawn POINTS hold more than one result. That is
+        // 7.6% of spawn points but 31.1% of spawn OBSERVATIONS, because the
+        // multi-result spawns sit in dungeons players ran far more often — the
+        // seven-result one alone was observed 1,895 times. Both numbers are
+        // true; this asserts the per-spawn one, which is what generation sees.
+        assert!(
+            multi >= 90,
+            "only {multi} of {piles} piles hold more than one result; 97 spawn points do"
+        );
+        assert!(biggest >= 7, "the biggest pile generated held {biggest}; retail's holds 24");
+    }
+
+    /// A pile of seven must be seven DRAWS, not one draw repeated — otherwise
+    /// the count is right and the loot is still a single stack.
+    #[test]
+    fn the_results_in_one_pile_are_rolled_separately() {
+        let game_data = game_data();
+        let mut checked = 0;
+        let mut differed = 0;
+        for dungeon_id in game_data.dungeons.keys() {
+            let generated = generate_for_dungeon(&game_data, dungeon_id, 20, 5).unwrap();
+            for results in generated.item_generated_data.values() {
+                if results.len() < 2 {
+                    continue;
+                }
+                checked += 1;
+                let first = serde_json::to_string(&results[0].loot_table_loot).unwrap();
+                if results
+                    .iter()
+                    .any(|r| serde_json::to_string(&r.loot_table_loot).unwrap() != first)
+                {
+                    differed += 1;
+                }
+            }
+        }
+        assert!(checked >= 90, "only {checked} multi-result piles to check");
+        assert!(
+            differed * 2 > checked,
+            "only {differed} of {checked} multi-result piles hold differing draws — \
+             the pile is one result repeated"
+        );
+    }
+
+    /// A spawn the corpus never saw keeps exactly one result. The size is never
+    /// invented for an unobserved spawn.
+    #[test]
+    fn an_unobserved_spawn_still_holds_one_result() {
+        assert_eq!(floor_pile_size(&Uuid::from_u128(0xDEAD_BEEF)), 1);
+    }
+
+    /// The same pile, described twice, must be identical — the client is told
+    /// once what is on the floor and must still find it there.
+    #[test]
+    fn a_pile_is_stable_between_descriptions() {
+        let game_data = game_data();
+        let dungeon_id = *game_data.dungeons.keys().next().unwrap();
+        let a = generate_for_dungeon(&game_data, &dungeon_id, 20, 5).unwrap();
+        let b = generate_for_dungeon(&game_data, &dungeon_id, 20, 5).unwrap();
+        assert_eq!(
+            serde_json::to_string(&a.item_generated_data).unwrap(),
+            serde_json::to_string(&b.item_generated_data).unwrap()
         );
     }
 }
