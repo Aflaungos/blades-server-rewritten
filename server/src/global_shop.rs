@@ -56,8 +56,55 @@ fn map_purchase_err(e: PurchaseError) -> BladeApiError {
 /// three-day Sigil-less hole that a 67-day period exposed at the start of every
 /// cycle. It is also a whole number of weeks, so daily clock times and weekdays
 /// both remain aligned.
-const REPLAY_PERIOD_DAYS: i64 = 63;
+const REPLAY_PERIOD_DAYS: i64 = 42;
 const REPLAY_PERIOD: i64 = REPLAY_PERIOD_DAYS * 86_400;
+
+/// Days at the START of the captured corpus that are too thinly covered to serve.
+///
+/// THE BUG THIS FIXES (tracker #141). "The Sigil shop is not empty but shows just
+/// two weapons."
+///
+/// Counting the dated offers active on each day of the corpus gives a monotonic
+/// ramp, not a rotation:
+///
+/// ```text
+///   2026-05-01 .. 05-25    1 – 4 offers/day      <- 25 consecutive days
+///   2026-05-26             13
+///   2026-06-05             18
+///   2026-06-16             27
+///   2026-07-01             66
+/// ```
+///
+/// A shop rotation does not ramp from 1 to 66 over six weeks; capture COVERAGE
+/// does, as players joined. Those first 25 days are not retail behaviour, they are
+/// how little we recorded of it. The old 63-day period replayed straight through
+/// them, so 25 days of every 63-day cycle served a near-empty shop — and on the
+/// thinnest of them the Sigil shop had **zero** offers.
+///
+/// The dense remainder, 2026-05-26 to 2026-07-06, is exactly 42 days — six whole
+/// weeks, so daily clock times and weekdays stay aligned, which the replay depends
+/// on. Hence [`REPLAY_PERIOD_DAYS`] = 42.
+///
+/// Nothing is discarded. The 30 offers whose windows fall entirely inside the
+/// lead-in are carried forward one period into the dense region instead, so all 544
+/// dated offers and all 547 products remain reachable.
+///
+/// Simulated over a full cycle, counting Sigil-priced offers per day:
+///
+/// ```text
+///   63d period, no skip   (before)   min  0   median 13   25 days under 5
+///   42d period, skip 25d  (after)    min 12   median 20    0 days under 5
+///   42d period, no skip   (control)  min  0   median  3   25 days under 5
+///   63d period, skip 25d  (control)  min  1   median 16   21 days under 5
+/// ```
+///
+/// Both controls matter: neither the shorter period nor the skip fixes this alone.
+const CORPUS_LEAD_IN_DAYS: i64 = 25;
+const CORPUS_LEAD_IN: i64 = CORPUS_LEAD_IN_DAYS * 86_400;
+
+/// Longest window still counted as a dated, rotating offer. The three evergreen
+/// offers run ~950 days and must not define where the corpus starts.
+const MAX_DATED_WINDOW: i64 = 60 * 86_400;
 
 /// Bring retail's schedule forward so it covers the present.
 ///
@@ -104,9 +151,32 @@ fn shift_to_now(overrides: &Value, now: i64) -> Value {
     let periods = (now - latest_end).div_euclid(REPLAY_PERIOD) + 1;
     let shift = periods * REPLAY_PERIOD;
 
+    // Where the thinly-covered lead-in ends. Measured off the DATED offers only —
+    // the three evergreen ones start years earlier and would drag this back with
+    // them, which is exactly the mistake that made an earlier check vacuous.
+    let corpus_start = map
+        .values()
+        .filter_map(|v| {
+            let s = v.get("activeStartDate").and_then(|d| d.as_i64())?;
+            let e = v.get("activeEndDate").and_then(|d| d.as_i64())?;
+            (e - s < MAX_DATED_WINDOW).then_some(s)
+        })
+        .min()
+        .unwrap_or(0);
+    let lead_in_ends = corpus_start - corpus_start.rem_euclid(86_400) + CORPUS_LEAD_IN;
+
     let mut out = serde_json::Map::new();
     for (id, entry) in map {
         let mut e = entry.clone();
+        // An offer that both starts AND ends inside the lead-in is carried forward
+        // one period, into the dense region, rather than served alone on a day with
+        // nothing beside it. Carried, not dropped: 30 offers and their products stay
+        // reachable. See `CORPUS_LEAD_IN_DAYS`.
+        let in_lead_in = e
+            .get("activeEndDate")
+            .and_then(|d| d.as_i64())
+            .is_some_and(|end| end < lead_in_ends);
+        let shift = if in_lead_in { shift + REPLAY_PERIOD } else { shift };
         for field in ["activeStartDate", "activeEndDate"] {
             if let Some(t) = e.get(field).and_then(|d| d.as_i64()) {
                 e[field] = Value::from(t + shift);
@@ -578,6 +648,80 @@ mod replay_tests {
         );
     }
 
+    /// NO DAY OF THE ROTATION MAY SHOW A NEARLY-EMPTY SIGIL SHOP.
+    ///
+    /// Report #141, second round: *"it is not empty but shows just 2 weapons."*
+    ///
+    /// The previous fix guaranteed only that SOME Sigil offer was live. That is too
+    /// weak — the first 25 days of the captured corpus carry 1-4 offers per day in
+    /// total, because that is when capture coverage was ramping up (1 → 3 → 13 → 27
+    /// → 66 is not a shop rotation), and the old 63-day period replayed straight
+    /// through them. 25 days in every 63 served a shop with almost nothing in it.
+    ///
+    /// So this sweeps a whole cycle and asserts a FLOOR on every single day.
+    /// Measured across the cycle after the fix: min 12, median 20, max 60.
+    #[test]
+    fn every_day_of_the_rotation_has_a_stocked_sigil_shop() {
+        const FLOOR: usize = 10;
+        let raw = catalog();
+        // Start well past the corpus so the replay is definitely engaged, then walk
+        // two full periods so the wrap-around is covered as well as the interior.
+        let base = 1_783_000_000 + 400 * 86_400;
+        let mut worst = (usize::MAX, 0i64);
+        for day in 0..(2 * REPLAY_PERIOD_DAYS) {
+            let now = base + day * 86_400;
+            let n = live_sigil_count(&shift_to_now(&raw, now), now);
+            if n < worst.0 {
+                worst = (n, day);
+            }
+        }
+        assert!(
+            worst.0 >= FLOOR,
+            "day {} of the rotation offers only {} Sigil products; the thin lead-in \
+             of the capture corpus must not be replayed",
+            worst.1,
+            worst.0,
+        );
+    }
+
+    /// THE CONTROL: nothing was thrown away to achieve it.
+    ///
+    /// Skipping the lead-in by DROPPING those offers would satisfy the test above
+    /// while quietly removing 30 products from the game. They are carried forward a
+    /// period instead, so the served catalogue keeps every entry the file has.
+    #[test]
+    fn the_replay_still_serves_every_offer_in_the_catalogue() {
+        let raw = catalog();
+        let now = 1_783_000_000 + 400 * 86_400;
+        let before = raw["globalShopOverrides"].as_object().unwrap().len();
+        let after = shift_to_now(&raw, now)["globalShopOverrides"]
+            .as_object()
+            .unwrap()
+            .len();
+        assert_eq!(after, before, "the replay must not drop offers");
+
+        // …and every one of them is reachable at some point in the cycle, so a
+        // carried-forward offer did not land outside the window entirely.
+        let mut seen: std::collections::HashSet<String> = Default::default();
+        for day in 0..REPLAY_PERIOD_DAYS {
+            let t = now + day * 86_400;
+            let shifted = shift_to_now(&raw, t);
+            for (id, e) in shifted["globalShopOverrides"].as_object().unwrap() {
+                let s = e["activeStartDate"].as_i64().unwrap_or(0);
+                let en = e["activeEndDate"].as_i64().unwrap_or(0);
+                if s <= t && t <= en {
+                    seen.insert(id.clone());
+                }
+            }
+        }
+        let total = raw["globalShopOverrides"].as_object().unwrap().len();
+        assert!(
+            seen.len() * 100 >= total * 90,
+            "only {} of {total} offers are reachable across a full cycle",
+            seen.len()
+        );
+    }
+
     /// Report #141 arrived in the 67-day replay's three-day prefix: the global
     /// shop had four live Gem offers, but zero live Sigil offers. The captured
     /// Sigil schedule itself is continuous, so its replay must be continuous too.
@@ -606,10 +750,17 @@ mod replay_tests {
         }
     }
 
-    /// Every offer moves by the SAME whole number of periods, so retail's relative
-    /// timing survives — the daily block still turns over together.
+    /// Every offer moves by a whole number of PERIODS, so retail's relative timing
+    /// survives — the daily block still turns over together, at the same clock time
+    /// and on the same weekday.
+    ///
+    /// There are exactly two offsets, not one: the lead-in offers are carried
+    /// forward one extra period out of the thinly-covered corpus prefix (see
+    /// `CORPUS_LEAD_IN_DAYS`). That is asserted rather than waved through — two
+    /// offsets differing by precisely one period is the intended shape, and any
+    /// other spread would mean offers had drifted relative to one another.
     #[test]
-    fn the_whole_catalogue_moves_by_one_constant_offset() {
+    fn the_whole_catalogue_moves_by_whole_periods() {
         let raw = catalog();
         let now = 1_783_000_000 + 200 * 86_400;
         let shifted = shift_to_now(&raw, now);
@@ -626,8 +777,26 @@ mod replay_tests {
                 "an offer's duration must not change",
             );
         }
-        assert_eq!(offsets.len(), 1, "one offset for the entire catalogue, got {offsets:?}");
-        assert_eq!(*offsets.iter().next().unwrap() % 86_400, 0, "a whole number of days");
+        for o in &offsets {
+            assert_eq!(
+                o % REPLAY_PERIOD,
+                0,
+                "every offset must be a whole number of replay periods, got {o}"
+            );
+        }
+        assert!(
+            offsets.len() <= 2,
+            "at most two offsets — the catalogue and the carried-forward lead-in, got {offsets:?}"
+        );
+        if offsets.len() == 2 {
+            let mut v: Vec<i64> = offsets.iter().copied().collect();
+            v.sort_unstable();
+            assert_eq!(
+                v[1] - v[0],
+                REPLAY_PERIOD,
+                "the two offsets must differ by exactly one period, got {v:?}"
+            );
+        }
     }
 
     /// Rotation clock times must survive, or the daily block moves to the middle of
