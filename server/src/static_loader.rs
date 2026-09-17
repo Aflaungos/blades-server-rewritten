@@ -75,7 +75,23 @@ fn read_uuid_map<T: DeserializeOwned>(path: &Path) -> HashMap<Uuid, T> {
 ///
 /// `chest_tiers.json` already took this precedent, and its comment says why in one
 /// line: so a missing production bind-mount cannot silently restore the stub.
-static CHEST_LOOTS_BUILTIN: &str = include_str!("../../deploy/static/chest_loots.json");
+/// Kept beside the source, NOT referenced out of `deploy/static/`.
+///
+/// `.dockerignore` excludes `deploy/static/` from the image build context — that
+/// directory is the 1.1 GB runtime mirror shipped by `arena.sh static`, and it has
+/// no business in a build. An `include_str!` reaching into it compiles locally,
+/// where the file is present, and then fails only in the image build:
+///
+///     error: couldn't read `server/src/../../deploy/static/chest_loots.json`:
+///            No such file or directory (os error 2)
+///
+/// which is after the PR is merged, because the image build runs on `main` and
+/// not on pull requests. `blades_lib/src/chest_tiers.json` and
+/// `interactable_loot.json` already live inside their crate for this reason.
+///
+/// `the_built_in_chest_loot_matches_the_shipped_file` pins the two copies
+/// together, so the duplication cannot drift.
+static CHEST_LOOTS_BUILTIN: &str = include_str!("chest_loots.json");
 
 /// Read a static file, falling back to a copy compiled into the binary.
 ///
@@ -504,6 +520,30 @@ mod tests {
             );
         }
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The built-in copy and the shipped file must stay identical.
+    ///
+    /// Two copies exist because the bind-mounted `deploy/static/` is excluded from
+    /// the image build context, so the compiled-in fallback has to live beside the
+    /// source. That duplication is only safe if drift is impossible, which is what
+    /// this asserts — byte for byte, not merely "both parse".
+    #[test]
+    fn the_built_in_chest_loot_matches_the_shipped_file() {
+        let shipped = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../deploy/static/chest_loots.json");
+        let shipped = std::fs::read_to_string(&shipped)
+            .unwrap_or_else(|e| panic!("cannot read {shipped:?}: {e}"));
+        assert_eq!(
+            shipped.len(),
+            CHEST_LOOTS_BUILTIN.len(),
+            "deploy/static/chest_loots.json and server/src/chest_loots.json differ in length"
+        );
+        assert!(
+            shipped == CHEST_LOOTS_BUILTIN,
+            "deploy/static/chest_loots.json and server/src/chest_loots.json have drifted; \
+             copy the shipped file over the built-in one"
+        );
     }
 
     /// THE SECOND CONTROL: a GOOD file on disk still wins. The fallback must not
