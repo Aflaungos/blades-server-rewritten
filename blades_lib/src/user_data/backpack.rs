@@ -91,7 +91,7 @@ pub struct ItemPropertiesAll {
 
 // `PartialEq` so a buyback slot (which stores the sold item verbatim) can be
 // compared in tests and round-tripped; `f64` durability means PartialEq, not Eq.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Item {
     pub item_template_id: Uuid,
@@ -127,6 +127,61 @@ pub struct Item {
     /// change the ENet wire for every item that has no arcane tier.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub arcane_tier: Option<u64>,
+}
+
+/// Hand-written so that a graded item never also carries `temperingLevel` and
+/// `durability`.
+///
+/// Retail NEVER sends both. Measured over 272,240 instanced items in captured
+/// retail bodies: 82,349 carry a grade and neither tempering nor durability,
+/// 187,787 carry tempering/durability and no grade, 2,104 carry neither, and
+/// **zero** carry both. The struct's own doc has said as much since it was
+/// written, but only `grade` and `arcaneTier` were given
+/// `skip_serializing_if` — `temperingLevel` and `durability` are plain
+/// non-optional fields, so they went out on every item including jewelry.
+///
+/// The result on production was 2,568 items across 49 characters carrying a
+/// shape the client has never seen. It is not fatal — 16 of those characters
+/// have played arena matches since — but it is wrong, and "the client tolerates
+/// it" is not the standard here.
+///
+/// `serialize_map` rather than `serialize_struct` because `Items` flattens this
+/// into an entry that also carries the instance `id`, and serde's `flatten`
+/// requires the inner value to serialize as a map.
+///
+/// Field order follows the captures: `itemTemplateId, grade, temperingLevel,
+/// durability, properties, arcaneTier`.
+impl Serialize for Item {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+
+        // A graded item is jewelry: retail gives it a grade and no wear.
+        let graded = self.grade.is_some();
+
+        let mut len = 2; // itemTemplateId + properties
+        if graded {
+            len += 1; // grade
+        } else {
+            len += 2; // temperingLevel + durability
+        }
+        if self.arcane_tier.is_some() {
+            len += 1;
+        }
+
+        let mut map = serializer.serialize_map(Some(len))?;
+        map.serialize_entry("itemTemplateId", &self.item_template_id)?;
+        if let Some(grade) = &self.grade {
+            map.serialize_entry("grade", grade)?;
+        } else {
+            map.serialize_entry("temperingLevel", &self.tempering_level)?;
+            map.serialize_entry("durability", &self.durability)?;
+        }
+        map.serialize_entry("properties", &self.properties)?;
+        if let Some(arcane) = &self.arcane_tier {
+            map.serialize_entry("arcaneTier", arcane)?;
+        }
+        map.end()
+    }
 }
 
 generate_map_to_vec_serialization!(items_serde, Item, id);
@@ -606,5 +661,86 @@ mod item_grade_arcane_tier_tests {
         assert_eq!(legacy.grade, None);
         assert_eq!(legacy.arcane_tier, None);
         assert_eq!(legacy.tempering_level, 2);
+    }
+}
+
+#[cfg(test)]
+mod item_wire_shape_tests {
+    use super::*;
+
+    fn graded() -> Item {
+        Item {
+            item_template_id: Uuid::from_u128(1),
+            grade: Some(4),
+            tempering_level: 7,     // set, and must NOT reach the wire
+            durability: 123.5,      // likewise
+            properties: ItemPropertiesAll::default(),
+            arcane_tier: Some(2),
+        }
+    }
+
+    fn gear() -> Item {
+        Item {
+            item_template_id: Uuid::from_u128(2),
+            grade: None,
+            tempering_level: 10,
+            durability: 675.0,
+            properties: ItemPropertiesAll::default(),
+            arcane_tier: None,
+        }
+    }
+
+    /// THE BUG. Retail never sends both: 0 of 272,240 captured instanced items
+    /// carry a grade alongside tempering/durability. Production had 2,568 that
+    /// did, across 49 characters.
+    #[test]
+    fn a_graded_item_never_carries_tempering_or_durability() {
+        let v = serde_json::to_value(graded()).unwrap();
+        assert_eq!(v["grade"], 4);
+        assert!(v.get("temperingLevel").is_none(), "graded item leaked temperingLevel: {v}");
+        assert!(v.get("durability").is_none(), "graded item leaked durability: {v}");
+    }
+
+    /// The other half of the same rule, and the control: ordinary gear must
+    /// still carry its wear, or this "fix" would simply delete the fields.
+    #[test]
+    fn ordinary_gear_still_carries_tempering_and_durability() {
+        let v = serde_json::to_value(gear()).unwrap();
+        assert_eq!(v["temperingLevel"], 10);
+        assert_eq!(v["durability"], 675.0);
+        assert!(v.get("grade").is_none(), "ungraded gear invented a grade: {v}");
+    }
+
+    /// `arcaneTier` is omitted when absent and kept when present — it rides on
+    /// both item kinds and is orthogonal to the split above.
+    #[test]
+    fn arcane_tier_is_omitted_only_when_absent() {
+        assert_eq!(serde_json::to_value(graded()).unwrap()["arcaneTier"], 2);
+        assert!(serde_json::to_value(gear()).unwrap().get("arcaneTier").is_none());
+    }
+
+    /// A round trip must not lose anything the wire still carries. The dropped
+    /// fields come back as their defaults, which is what `#[serde(default)]`
+    /// has always done for an item retail sent without them.
+    #[test]
+    fn gear_round_trips_unchanged() {
+        let before = gear();
+        let after: Item = serde_json::from_value(serde_json::to_value(&before).unwrap()).unwrap();
+        assert_eq!(before, after);
+    }
+
+    /// The instance id is injected by `Items`, and `flatten` needs this to
+    /// serialize as a MAP — a `serialize_struct` impl would break the wrapper.
+    #[test]
+    fn items_still_serialize_as_a_list_with_the_instance_id() {
+        let mut map = HashMap::new();
+        let id = Uuid::from_u128(0xABC);
+        map.insert(id, graded());
+        let v = serde_json::to_value(Items(map)).unwrap();
+        let arr = v.as_array().expect("Items serializes as a list");
+        assert_eq!(arr.len(), 1);
+        assert_eq!(arr[0]["id"], serde_json::json!(id));
+        assert_eq!(arr[0]["grade"], 4);
+        assert!(arr[0].get("durability").is_none(), "flattened graded item leaked durability");
     }
 }
