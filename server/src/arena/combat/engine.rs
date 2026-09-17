@@ -506,8 +506,12 @@ impl MatchInstance {
     /// change an actor state — is what makes it impossible to add a state change that
     /// silently fails to animate. [`resolve::drain_state_changes`]
     pub fn on_c2s(&mut self, sender: usize, user_data: &[u8], now: Instant) -> Vec<(usize, Vec<u8>)> {
+        // Both directions at the one seam — see `trace`. Off unless
+        // ARENA_TRACE_DIR is set, and it can never fail a match.
+        super::trace::record(&self.combat.game_session_id, "c2s", sender, user_data);
         let mut out = self.on_c2s_resolved(sender, user_data, now);
         out.extend(resolve::drain_state_changes(&mut self.combat, now));
+        super::trace::record_outbound(&self.combat.game_session_id, &out);
         out
     }
 
@@ -829,6 +833,7 @@ impl MatchInstance {
     pub fn on_tick(&mut self, connected: usize, now: Instant) -> Vec<(usize, Vec<u8>)> {
         let mut out = self.on_tick_resolved(connected, now);
         out.extend(resolve::drain_state_changes(&mut self.combat, now));
+        super::trace::record_outbound(&self.combat.game_session_id, &out);
         out
     }
 
