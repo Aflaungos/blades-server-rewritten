@@ -1,0 +1,576 @@
+{
+ "_meta": {
+  "description": "The Abyss future-reward ladder: ten score rungs and what each grants, observed on retail.",
+  "authoritative": "every result appeared verbatim in a retail /abysses response; nothing is interpolated",
+  "wireShape": "retail sends exactly ONE entry, the next unreached rung (707/707 observations are length 1). The consumer must SELECT by the run's current score, not emit the ladder.",
+  "chestRungs": "rungs 50 and 360 are deterministic: a fixed tier, and the chest's level is the character's own level (72/72 observations). They need no table.",
+  "otherRungs": "a stackable item, or gear at rung 260, drawn from a pool. Stored as whole observed results with counts, like enemy_loot.json.",
+  "thinness": "this corpus is THIN -- 71 distinct observations across ten rungs, and rungs [190, 260, 490, 650] rest on fewer than five. Each rung carries its own count so a reader can see how thin. It is still better than advertising rung 1 of 10 forever.",
+  "instanceIdsStripped": "items[].id is a per-drop uuid4 and is removed; the consumer mints one",
+  "determinismRequirement": "the client re-reads /abysses/current during a run and must be advertised the SAME reward each time, so the draw has to be seeded from the run, not random per request.",
+  "deduplication": "on (rung, contents, character level)",
+  "bodies": 707,
+  "observations": 71,
+  "ladder": [
+   35,
+   50,
+   70,
+   95,
+   135,
+   190,
+   260,
+   360,
+   490,
+   650
+  ],
+  "control": {
+   "ladderMatchesPreviousMeasurement": true,
+   "chestLevelEqualsCharacterLevel": [
+    72,
+    72
+   ],
+   "chestTierPerRung": {
+    "50": {
+     "1": 22
+    },
+    "360": {
+     "3": 50
+    }
+   },
+   "initialPlayerLevelPresent": false
+  },
+  "generator": "tools/apk-extract/mine-abyss-future-rewards.py"
+ },
+ "rungs": [
+  {
+   "score": 35,
+   "kind": "stackableItems",
+   "observations": 21,
+   "distinctResults": 17,
+   "results": [
+    {
+     "reward": {
+      "stackableItems": {
+       "e7193116-d761-479b-8a20-5633737977f5": 12
+      }
+     },
+     "n": 3
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "e7193116-d761-479b-8a20-5633737977f5": 13
+      }
+     },
+     "n": 2
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "f1c5c03c-5297-48fb-a9d2-5f32bffb467c": 5
+      }
+     },
+     "n": 2
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "f1c5c03c-5297-48fb-a9d2-5f32bffb467c": 1
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "e7193116-d761-479b-8a20-5633737977f5": 4
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "07f380dd-f123-4ef7-9b12-8b9fdb03c3e1": 5
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "9687d83c-aa7b-4cf3-a69f-0bba8204fa61": 6
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "7116a2a8-ac2d-4cd9-8b7c-b80c397d3f50": 6
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "fd67bbc6-20f4-44a3-9614-28265ebb8c67": 12
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "fd67bbc6-20f4-44a3-9614-28265ebb8c67": 3
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "e7193116-d761-479b-8a20-5633737977f5": 9
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "7116a2a8-ac2d-4cd9-8b7c-b80c397d3f50": 5
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "10c54e43-a2a1-4833-9491-4c19149f43b5": 4
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "fd67bbc6-20f4-44a3-9614-28265ebb8c67": 10
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "e7193116-d761-479b-8a20-5633737977f5": 11
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "10c54e43-a2a1-4833-9491-4c19149f43b5": 5
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "9687d83c-aa7b-4cf3-a69f-0bba8204fa61": 4
+      }
+     },
+     "n": 1
+    }
+   ]
+  },
+  {
+   "score": 50,
+   "kind": "chest",
+   "tier": 1,
+   "levelRule": "character",
+   "observations": 4
+  },
+  {
+   "score": 70,
+   "kind": "stackableItems",
+   "observations": 13,
+   "distinctResults": 12,
+   "results": [
+    {
+     "reward": {
+      "stackableItems": {
+       "4d7420db-8042-4946-a43f-e0b3bd9bec81": 32
+      }
+     },
+     "n": 2
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "fbf96b07-e9aa-4157-8761-10179fa05138": 6
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "8ef9f10c-3c46-492c-9a00-29fd1626d85e": 27
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "4d7420db-8042-4946-a43f-e0b3bd9bec81": 31
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "92b77b2f-bd33-469f-8aad-8a228b9537eb": 4
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "8ef9f10c-3c46-492c-9a00-29fd1626d85e": 18
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "e80bee76-f92c-4005-9eff-20d1e8c64d24": 19
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "4d7420db-8042-4946-a43f-e0b3bd9bec81": 21
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "a4d5e792-5a27-4bb3-851f-e0917c0962db": 31
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "85ed5500-3581-4699-8095-4b5ff6514355": 20
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "85ed5500-3581-4699-8095-4b5ff6514355": 28
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "4d7420db-8042-4946-a43f-e0b3bd9bec81": 35
+      }
+     },
+     "n": 1
+    }
+   ]
+  },
+  {
+   "score": 95,
+   "kind": "stackableItems",
+   "observations": 9,
+   "distinctResults": 8,
+   "results": [
+    {
+     "reward": {
+      "stackableItems": {
+       "42d91529-c88b-4c5b-815b-b55508b4e7ef": 8
+      }
+     },
+     "n": 2
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "fd67bbc6-20f4-44a3-9614-28265ebb8c67": 4
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "e7193116-d761-479b-8a20-5633737977f5": 14
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "42d91529-c88b-4c5b-815b-b55508b4e7ef": 1
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "e7193116-d761-479b-8a20-5633737977f5": 10
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "8b7d0044-3a38-4ee0-af45-d2892b0f508d": 4
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "9687d83c-aa7b-4cf3-a69f-0bba8204fa61": 4
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "07f380dd-f123-4ef7-9b12-8b9fdb03c3e1": 6
+      }
+     },
+     "n": 1
+    }
+   ]
+  },
+  {
+   "score": 135,
+   "kind": "stackableItems",
+   "observations": 6,
+   "distinctResults": 6,
+   "results": [
+    {
+     "reward": {
+      "stackableItems": {
+       "10c54e43-a2a1-4833-9491-4c19149f43b5": 2
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "8b7d0044-3a38-4ee0-af45-d2892b0f508d": 6
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "790a188b-3fa0-4f38-99d9-bc8d3675bc46": 1
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "07f380dd-f123-4ef7-9b12-8b9fdb03c3e1": 6
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "9687d83c-aa7b-4cf3-a69f-0bba8204fa61": 7
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "8b7d0044-3a38-4ee0-af45-d2892b0f508d": 7
+      }
+     },
+     "n": 1
+    }
+   ]
+  },
+  {
+   "score": 190,
+   "kind": "stackableItems",
+   "observations": 4,
+   "distinctResults": 4,
+   "results": [
+    {
+     "reward": {
+      "stackableItems": {
+       "b81952e0-c3c8-4a5c-92c0-8215d3eb71af": 7
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "4d1231be-d3fa-4282-81b2-0f7bed4aabff": 1
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "89ece62c-9ff6-470a-a152-d45ef4e0c222": 1
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "85ed5500-3581-4699-8095-4b5ff6514355": 30
+      }
+     },
+     "n": 1
+    }
+   ]
+  },
+  {
+   "score": 260,
+   "kind": "items",
+   "observations": 4,
+   "distinctResults": 3,
+   "results": [
+    {
+     "reward": {
+      "items": [
+       {
+        "durability": 100.0,
+        "itemTemplateId": "4a9fd901-aaf8-40bd-941e-971febf4daf8",
+        "temperingLevel": 0
+       }
+      ]
+     },
+     "n": 2
+    },
+    {
+     "reward": {
+      "items": [
+       {
+        "durability": 250.0,
+        "itemTemplateId": "7278524f-02b2-4f10-a277-a6378e1909c7",
+        "temperingLevel": 0
+       }
+      ]
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "items": [
+       {
+        "durability": 250.0,
+        "itemTemplateId": "7a1bb403-519e-4974-8ff3-7172f2b38ee9",
+        "temperingLevel": 0
+       }
+      ]
+     },
+     "n": 1
+    }
+   ]
+  },
+  {
+   "score": 360,
+   "kind": "chest",
+   "tier": 3,
+   "levelRule": "character",
+   "observations": 4
+  },
+  {
+   "score": 490,
+   "kind": "stackableItems",
+   "observations": 4,
+   "distinctResults": 4,
+   "results": [
+    {
+     "reward": {
+      "stackableItems": {
+       "19ce1a65-057f-4f34-a0ed-27de7c085662": 1
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "a3351353-f613-4368-bac7-05783f857b07": 1
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "89ece62c-9ff6-470a-a152-d45ef4e0c222": 1
+      }
+     },
+     "n": 1
+    },
+    {
+     "reward": {
+      "stackableItems": {
+       "4d1231be-d3fa-4282-81b2-0f7bed4aabff": 1
+      }
+     },
+     "n": 1
+    }
+   ]
+  },
+  {
+   "score": 650,
+   "kind": "stackableItems",
+   "observations": 2,
+   "distinctResults": 1,
+   "results": [
+    {
+     "reward": {
+      "stackableItems": {
+       "42d91529-c88b-4c5b-815b-b55508b4e7ef": 2
+      }
+     },
+     "n": 2
+    }
+   ]
+  }
+ ]
+}
