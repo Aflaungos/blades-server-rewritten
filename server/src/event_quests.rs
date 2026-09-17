@@ -271,6 +271,55 @@ impl EventCompletion {
         }
     }
 
+    /// Zero the counter when it belongs to a PREVIOUS window of this event.
+    ///
+    /// `event_completions` is keyed `UNIQUE(character_id, event_id)` with no window
+    /// column, and nothing in the tree ever resets it — grep finds no delete and no
+    /// zeroing site. So the count is a LIFETIME total, while an event's tiers are
+    /// per-window: an event runs, you finish its five tiers, and the counter stays
+    /// at five for ever.
+    ///
+    /// `enter_event_dungeon` refuses at `completion_count >= max_completions`.
+    /// The consequence is permanent: **a player who finishes an event can never
+    /// enter it again, in any future window.** One character is already in that
+    /// state on production (`HauDrauf`, event `e5b3c53d`, count 5 since
+    /// 2026-09-15), and every player who completes an event joins them.
+    ///
+    /// Retail's counter is per instance — measured over 333 captured exits, a
+    /// `gameEventQuestFinished` carries exactly 5 (56/56) and a live
+    /// `gameEventQuest` carries 1-4, and each new window starts again at 1.
+    ///
+    /// Rather than migrate the table, the stored row is treated as stale when it
+    /// was last touched BEFORE the current window opened. That is the same fact a
+    /// window column would record, read from `last_completed_at` instead, so it
+    /// needs no schema change and no backfill.
+    pub async fn reset_if_before(
+        &mut self,
+        conn: &mut AsyncPgConnection,
+        window_start: chrono::NaiveDateTime,
+    ) -> Result<(), BladeApiError> {
+        use crate::schema::event_completions::dsl::*;
+
+        if self.completion_count == 0 || self.last_completed_at >= window_start {
+            return Ok(());
+        }
+        log::info!(
+            "event {}: character {} had {} completion(s) from a window that closed at \
+             {} — resetting for the window that opened {}",
+            self.event_id,
+            self.character_id,
+            self.completion_count,
+            self.last_completed_at,
+            window_start,
+        );
+        self.completion_count = 0;
+        diesel::update(event_completions.filter(id.eq(self.id)))
+            .set(completion_count.eq(0))
+            .execute(conn)
+            .await?;
+        Ok(())
+    }
+
     pub async fn increment_completion(
         &mut self,
         conn: &mut AsyncPgConnection,
@@ -529,5 +578,62 @@ mod tier_progression {
                 "template {id} pays nothing on a first completion"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod window_reset_tests {
+    use chrono::{Duration, NaiveDateTime, Utc};
+
+    /// The rule `reset_if_before` applies, isolated from the database so it can be
+    /// asserted directly.
+    fn should_reset(count: i32, last_completed_at: NaiveDateTime, window_start: NaiveDateTime) -> bool {
+        count != 0 && last_completed_at < window_start
+    }
+
+    /// A COUNT FROM A CLOSED WINDOW MUST NOT BLOCK THE NEXT ONE.
+    ///
+    /// `event_completions` is keyed `UNIQUE(character_id, event_id)` with no window
+    /// column, and nothing in the tree resets it — so the count is a lifetime total
+    /// while the tiers it gates are per-window. `enter_event_dungeon` refuses at
+    /// `completion_count >= max_completions`, which makes the block permanent: finish
+    /// an event once and you can never enter it again, in any future window.
+    ///
+    /// Already real on production: `HauDrauf` has sat at 5 on event `e5b3c53d` since
+    /// 2026-09-15, and every player who completes an event joins them.
+    #[test]
+    fn a_count_from_a_previous_window_is_dropped() {
+        let window_start = Utc::now().naive_utc();
+        let finished_last_window = window_start - Duration::days(3);
+        assert!(
+            should_reset(5, finished_last_window, window_start),
+            "five completions from a closed window must not block the new one"
+        );
+    }
+
+    /// THE CONTROL, and it is the one that matters: progress inside the CURRENT
+    /// window must survive. A reset that fired unconditionally would satisfy the
+    /// test above while making every event infinitely repeatable — a worse bug than
+    /// the one being fixed.
+    #[test]
+    fn progress_within_the_current_window_is_kept() {
+        let window_start = Utc::now().naive_utc() - Duration::days(1);
+        let finished_today = window_start + Duration::hours(2);
+        assert!(
+            !should_reset(3, finished_today, window_start),
+            "completions inside the live window must still count"
+        );
+        assert!(
+            !should_reset(5, window_start, window_start),
+            "a completion exactly at the window boundary is inside it"
+        );
+    }
+
+    /// A zero count is left alone whatever its timestamp — nothing to reset, and no
+    /// reason to write to the database on every event entry.
+    #[test]
+    fn a_zero_count_is_never_rewritten() {
+        let window_start = Utc::now().naive_utc();
+        assert!(!should_reset(0, window_start - Duration::days(9), window_start));
     }
 }

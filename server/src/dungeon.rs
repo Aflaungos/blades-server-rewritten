@@ -377,6 +377,24 @@ pub(crate) fn event_dungeon_data(
 /// player's own row id from the URL. They are never equal on an event quest — 1271
 /// of 1271 captured event rows have `questId != gldQuestId` — and they key
 /// different things, which is the whole of report #166.
+/// When the CURRENT window of the event behind `quest_id` opened.
+///
+/// `event_completions` has no window column, so this is what tells a stale
+/// lifetime count from a live one — see `EventCompletion::reset_if_before`.
+/// `None` when the event has no active instance right now, in which case the
+/// stored count is left alone rather than guessed at.
+fn current_event_window_start(
+    app_state: &ServerGlobal,
+    quest_id: Uuid,
+) -> Option<chrono::NaiveDateTime> {
+    let now = chrono::Utc::now().timestamp();
+    blades_lib::features::game_events::active_events(&app_state.static_data.game_events, now)
+        .into_iter()
+        .find(|e| e.quest_id == quest_id)
+        .and_then(|e| chrono::DateTime::from_timestamp(e.start_time_secs, 0))
+        .map(|dt| dt.naive_utc())
+}
+
 async fn handle_event_dungeon_exit(
     conn: &mut AsyncPgConnection,
     char_id: Uuid,
@@ -1038,8 +1056,14 @@ async fn handle_event_dungeon_entry(
 
     log::info!("[event_dungeon] Processing event quest {} with event_id {}", quest_id, actual_event_id);
 
-    // Get or create completion record
-    let completion = EventCompletion::get_or_create(conn, character_id, quest_id).await?;
+    // Get or create completion record, then drop any count left over from a
+    // PREVIOUS window of this event. Without this the counter is a lifetime total
+    // against per-window tiers, so finishing an event locks the player out of it
+    // for ever. See `EventCompletion::reset_if_before`.
+    let mut completion = EventCompletion::get_or_create(conn, character_id, quest_id).await?;
+    if let Some(window_start) = current_event_window_start(app_state, quest_id) {
+        completion.reset_if_before(conn, window_start).await?;
+    }
     let completion_count = completion.completion_count as usize;
 
     // Check if character has already completed all tiers
