@@ -1244,29 +1244,68 @@ pub const ARENA_GOLD_CURRENCY_UUID: &str = "f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2
 /// ENet fragment-frame header; the real carrier is `0x36` with GMID 49 at propId 3,
 /// capture-proven in 6 sessions by reassembling the fragmented frame). [s506 #3523709]
 ///
-/// Layout (byte-exact, s506 #3523709): `{0:Int matchObj · 1:Byte 54 Match · 2:Byte 1
-/// Authority · 3:Byte 49 · 4:Int result_code · 5/7/11:String winner · 6/8/12:String
-/// loser · 9/10:String "" · 13:String ResultsJSON · 14:Bool false · 15:Byte 0 · 16:Int}`.
+/// Layout: `{0:Int matchObj · 1:Byte 54 Match · 2:Byte 1 Authority · 3:Byte 49 ·
+/// 4:Int RoundInfos length (3) · 5..10:String RoundInfos[3] × (winner, loser) ·
+/// 11:String WinnerPlayerId · 12:String LoserPlayerId · 13:String ResultsJSON ·
+/// 14:Bool MatchConceded · 15:Byte DisconnectReason · 16:Int OpponentTrophyCount}`.
+///
+/// ## propIds 5..10 are the ROUND-BY-ROUND results, not the match winner repeated
+///
+/// This was read off s506 — a 2-0 match — as "5/7/11 winner, 6/8/12 loser, 9/10
+/// empty", and hardcoded to that shape. s506 is simply the case where the two
+/// readings coincide: in a 2-0, the match winner did win both rounds.
+///
+/// Measured over all 99 captured op49 cards in 11 sessions, tagging each uuid as
+/// the match Winner (W) or Loser (L):
+///
+/// ```text
+///   W,L | W,L | -,-     n=72    2-0 — the only shape the old code could emit
+///   L,W | W,L | W,L     n=14    the match winner LOST round 1
+///   W,L | L,W | W,L     n=11    the match winner lost round 2
+///   W,X | W,X | -,-     n=1     (a third uuid; not modelled here)
+///   W,X | -,- | -,-     n=1
+/// ```
+///
+/// So 25 of 99 retail cards — every 2-1 match — carry a per-round winner that
+/// alternates, and we announced the match winner as having won rounds 1 and 2 and
+/// round 3 as never played. propId 4 is the ARRAY LENGTH (3 in all 99 samples),
+/// not the number of rounds played.
+///
+/// op48 already had this right (`match_post_round_info`, capture-pinned across 375
+/// frames) and this message's header mirrors op48, so it takes the same array.
 #[allow(clippy::too_many_arguments)]
 pub fn match_end_match(
     match_net_object_id: i32,
+    // Cumulative per-round results, round 1 first: (winner_uuid, loser_uuid) —
+    // the same array op48 carries. See the RoundInfos note above.
+    round_results: &[(String, String)],
     winner_char_uuid: &str,
     loser_char_uuid: &str,
     result_code: i32,
     results_json: &str,
 ) -> Vec<u8> {
+    // propIds 5..10 are `RoundInfos[3]` — the per-round (winner, loser) pairs, in
+    // order, with unused slots empty. Exactly op48's layout, which this message's
+    // header mirrors.
+    let slot = |i: usize| -> (&str, &str) {
+        round_results.get(i).map(|(w, l)| (w.as_str(), l.as_str())).unwrap_or(("", ""))
+    };
+    let (w1, l1) = slot(0);
+    let (w2, l2) = slot(1);
+    let (w3, l3) = slot(2);
+
     let mut w = NetDataWriter::new();
     w.int(0, match_net_object_id)
         .byte(1, NetObjectType::Match as u8)
         .byte(2, NetRole::Authority as u8)
         .byte(3, GameMessageId::MatchEndMatchMsg as u8) // 49
         .int(4, result_code)
-        .string(5, winner_char_uuid)
-        .string(6, loser_char_uuid)
-        .string(7, winner_char_uuid)
-        .string(8, loser_char_uuid)
-        .string(9, "")
-        .string(10, "")
+        .string(5, w1)
+        .string(6, l1)
+        .string(7, w2)
+        .string(8, l2)
+        .string(9, w3)
+        .string(10, l3)
         .string(11, winner_char_uuid)
         .string(12, loser_char_uuid)
         .string(13, results_json)
@@ -2564,16 +2603,25 @@ mod tests {
     }
 
     /// op49 `MatchEndMatchMsg` header byte-shape vs s506 #3523709 (`docs/arena-match-end-spec.md`
-    /// §2): carrier 0x36 on the Match obj, GMID 49 at propId 3, the winner/loser UUID
-    /// quartet (p5/p7/p11 winner, p6/p8/p12 loser), result_code at p4, the ResultsJSON at
-    /// p13, and the p14/p15/p16 trailer. The JSON body itself is per-recipient (not
-    /// asserted byte-for-byte). This is the op49-IS-SENT correction (the stub was wrong).
+    /// §2): carrier 0x36 on the Match obj, GMID 49 at propId 3, result_code at p4, the
+    /// ResultsJSON at p13, and the p14/p15/p16 trailer. The JSON body itself is
+    /// per-recipient (not asserted byte-for-byte).
+    ///
+    /// **s506 is a 2-0 match**, so its RoundInfos are (winner, loser) twice with the
+    /// third slot empty — which is why the old hardcoded shape matched it. Feeding the
+    /// real round array must still reproduce s506 byte-for-byte, so the array is passed
+    /// explicitly here rather than assumed.
     #[test]
     fn match_end_match_matches_s506() {
         let winner = "1131a037-716c-49cc-b165-32d8ddc14f49";
         let loser = "38c987fd-c42b-4ea6-b869-c8d4c03055f9";
         let rj = r#"{"characterId":"38c987fd-c42b-4ea6-b869-c8d4c03055f9","reward":{"currencies":{"f8d27767-a85e-4fd6-a5bb-bf8a13d0daa2":4047},"characterXp":280}}"#;
-        let got = match_end_match(123, winner, loser, 3, rj);
+        // s506: the winner took rounds 1 and 2.
+        let rounds = [
+            (winner.to_string(), loser.to_string()),
+            (winner.to_string(), loser.to_string()),
+        ];
+        let got = match_end_match(123, &rounds, winner, loser, 3, rj);
 
         assert_eq!(&got[0..2], &[0xBE, 0x36], "carrier 0x36 (NOT 0xc2/0xc6 — that was a fragment-header misread)");
         let nd = arena_proto::parse_netdata(&got[2..]);
@@ -2597,6 +2645,67 @@ mod tests {
 
         // It routes on ENet ch4 (the big fragmented channel) like the op54 profile.
         assert_eq!(retail_channel(&got), 4, "op49 → ch4 (fragmented, like op54)");
+    }
+
+    /// A 2-1 MATCH MUST REPORT WHO ACTUALLY WON EACH ROUND.
+    ///
+    /// The old builder hardcoded s506's 2-0 shape — (winner, loser), (winner, loser),
+    /// ("", "") — for every match. Measured over all 99 captured op49 cards, 25 carry
+    /// a per-round winner that alternates:
+    ///
+    /// ```text
+    ///   W,L | W,L | -,-   n=72   2-0
+    ///   L,W | W,L | W,L   n=14   the match winner LOST round 1
+    ///   W,L | L,W | W,L   n=11   the match winner lost round 2
+    /// ```
+    ///
+    /// So a quarter of real cards announced the wrong round-1 or round-2 winner and
+    /// claimed round 3 never happened.
+    #[test]
+    fn a_two_one_match_reports_the_real_per_round_winners() {
+        let a = "1131a037-716c-49cc-b165-32d8ddc14f49"; // the match winner
+        let b = "38c987fd-c42b-4ea6-b869-c8d4c03055f9";
+        // The `L,W | W,L | W,L` shape: A lost round 1, then took rounds 2 and 3.
+        let rounds = [
+            (b.to_string(), a.to_string()),
+            (a.to_string(), b.to_string()),
+            (a.to_string(), b.to_string()),
+        ];
+        let got = match_end_match(123, &rounds, a, b, 3, "{}");
+        let nd = arena_proto::parse_netdata(&got[2..]);
+
+        assert_eq!(nd.string(5), Some(b), "round 1 was won by B");
+        assert_eq!(nd.string(6), Some(a), "…and lost by A");
+        assert_eq!(nd.string(7), Some(a), "round 2 was won by A");
+        assert_eq!(nd.string(8), Some(b));
+        assert_eq!(nd.string(9), Some(a), "round 3 was played and won by A");
+        assert_eq!(nd.string(10), Some(b));
+
+        // The OVERALL winner/loser still ride at 11/12, independent of the array.
+        assert_eq!(nd.string(11), Some(a), "p11 = the match winner");
+        assert_eq!(nd.string(12), Some(b), "p12 = the match loser");
+        // p4 is the array LENGTH — 3 in all 99 captured cards, whatever the score.
+        assert_eq!(nd.int(4), Some(3));
+    }
+
+    /// THE CONTROL. A builder that simply echoed its round array back would pass the
+    /// test above while breaking the 2-0 case that s506 pins. A one-round match must
+    /// fill ONLY slot 1 and leave slots 2 and 3 empty — unused slots are empty
+    /// strings, never the match winner repeated.
+    #[test]
+    fn unused_round_slots_stay_empty() {
+        let a = "1131a037-716c-49cc-b165-32d8ddc14f49";
+        let b = "38c987fd-c42b-4ea6-b869-c8d4c03055f9";
+        let rounds = [(a.to_string(), b.to_string())];
+        let got = match_end_match(123, &rounds, a, b, 3, "{}");
+        let nd = arena_proto::parse_netdata(&got[2..]);
+
+        assert_eq!(nd.string(5), Some(a));
+        assert_eq!(nd.string(6), Some(b));
+        for p in [7, 8, 9, 10] {
+            assert_eq!(nd.string(p), Some(""), "p{p} must be empty — round never played");
+        }
+        assert_eq!(nd.string(11), Some(a), "the match winner is still named at p11");
     }
 
     /// The op49 `ResultsJSON` (propId 13) carries the victory-card fields the client
