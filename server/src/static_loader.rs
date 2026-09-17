@@ -55,6 +55,47 @@ fn read_uuid_map<T: DeserializeOwned>(path: &Path) -> HashMap<Uuid, T> {
 
 /// Read a JSON file into `T`, falling back to `T::default()` (with a warning) if the
 /// file is missing or invalid.
+/// The chest loot corpus, COMPILED INTO the binary.
+///
+/// WHY THIS IS NOT JUST READ FROM DISK (tracker #141, #152)
+///
+/// `/data/static` is a bind mount shipped by `deploy/arena.sh static`, a different
+/// and manual path from merging code. On 2026-09-16 the static sync ran at 19:31
+/// UTC and the new tables were committed at 19:56 — twenty-five minutes later. The
+/// box therefore kept the pre-fix file, whose schema is a bare list where the
+/// current one is an object, so it did not merely go stale, it stopped PARSING:
+///
+///     [static] invalid "/data/static/chest_loots.json": invalid value:
+///             expected key to be a number in quotes at line 3 column 6; using default
+///
+/// `using default` is an empty table, and `chests.rs` turns an empty table into
+/// `RewardGrant::default()`. Every chest in every quest, job and event opened
+/// EMPTY, on the live server, while CI stayed green — because the tests read the
+/// repo's copy, not the box's.
+///
+/// `chest_tiers.json` already took this precedent, and its comment says why in one
+/// line: so a missing production bind-mount cannot silently restore the stub.
+static CHEST_LOOTS_BUILTIN: &str = include_str!("../../deploy/static/chest_loots.json");
+
+/// Read a static file, falling back to a copy compiled into the binary.
+///
+/// The difference from [`read_json`] is the whole point: a missing or corrupt file
+/// yields the SHIPPED data, not an empty default. Use it for anything whose empty
+/// value is silently wrong rather than obviously broken.
+fn read_json_or_builtin<T: DeserializeOwned>(path: &Path, builtin: &'static str) -> T {
+    let from_disk = File::open(path)
+        .map_err(|e| format!("{e}"))
+        .and_then(|f| serde_json::from_reader(BufReader::new(f)).map_err(|e| format!("{e}")));
+    match from_disk {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("[static] {path:?} unusable ({e}); falling back to the built-in copy");
+            serde_json::from_str(builtin)
+                .expect("the built-in copy is committed alongside this code and must parse")
+        }
+    }
+}
+
 fn read_json<T: DeserializeOwned + Default>(path: &Path) -> T {
     match File::open(path) {
         Ok(f) => serde_json::from_reader(BufReader::new(f)).unwrap_or_else(|e| {
@@ -127,7 +168,8 @@ pub fn load(dir: &Path) -> StaticData {
     };
     let challenge_templates: Vec<ChallengeTemplate> = read_json(&dir.join("challenges.json"));
     let daily_rewards: Vec<DailyRewardDef> = read_json(&dir.join("daily_rewards.json"));
-    let chest_loots: ChestLootTables = read_json(&dir.join("chest_loots.json"));
+    let chest_loots: ChestLootTables =
+        read_json_or_builtin(&dir.join("chest_loots.json"), CHEST_LOOTS_BUILTIN);
     let game_events: Vec<EventDef> = read_json(&dir.join("game_events.json"));
     let salvage_recipes: HashMap<Uuid, HashMap<Uuid, u64>> =
         read_json(&dir.join("salvage_recipes.json"));
@@ -280,6 +322,7 @@ mod tests {
         days.sort_unstable();
         assert_eq!(days, (0u8..7).collect::<Vec<_>>(), "daily_rewards.json weekdays");
         assert!(!sd.chest_loots.is_empty(), "chest_loots.json (Item.properties default)");
+
         // Tiers 1-3 are the ones retail capture covers well enough to publish; a
         // silently tier-less file is exactly the regression that made every chest
         // pay the same bundle (#141).
@@ -417,5 +460,69 @@ mod tests {
         assert_eq!(item.item.arcane_tier, Some(2), "grant 79995d29 item arcaneTier");
         // Retail's graded items carry GRADING affixes and no tempering/durability.
         assert!(!item.item.properties.grading.is_empty(), "graded item keeps its GRADING affixes");
+    }
+
+    /// A CORRUPT OR MISSING `chest_loots.json` MUST NOT EMPTY EVERY CHEST.
+    ///
+    /// This is not hypothetical. On 2026-09-16 the live server logged
+    ///
+    ///     [static] invalid "/data/static/chest_loots.json": invalid value:
+    ///             expected key to be a number in quotes at line 3 column 6; using default
+    ///
+    /// because the box's bind-mounted copy predated the schema change — the static
+    /// sync ran 25 minutes before the commit that changed it. `using default` is an
+    /// empty table, and `chests.rs` turns that into an empty reward, so every chest
+    /// in every quest, job and event opened with nothing in it. CI never saw it: the
+    /// other tests read the repo's file, not the box's.
+    #[test]
+    fn a_broken_chest_loot_file_falls_back_to_the_built_in_corpus() {
+        let dir = std::env::temp_dir().join(format!("nb-chest-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Exactly the shape that failed in production: the OLD schema, a bare list.
+        let path = dir.join("chest_loots.json");
+        std::fs::write(&path, "[\n  {\n   \"id\": 1\n  }\n]").unwrap();
+        let from_corrupt: ChestLootTables = read_json_or_builtin(&path, CHEST_LOOTS_BUILTIN);
+        assert!(
+            !from_corrupt.is_empty(),
+            "a corrupt file must fall back to the shipped corpus, not to an empty table"
+        );
+
+        // …and so must an absent one.
+        std::fs::remove_file(&path).unwrap();
+        let from_missing: ChestLootTables = read_json_or_builtin(&path, CHEST_LOOTS_BUILTIN);
+        assert!(!from_missing.is_empty(), "a missing file must fall back too");
+
+        // THE CONTROL: the fallback is not masking a broken built-in. The corpus
+        // compiled in must carry the same per-tier depth the on-disk assertions
+        // demand, or "not empty" would be satisfied by a one-entry stub.
+        for tier in 1..=3u64 {
+            let pool = from_missing.tiers.get(&tier);
+            assert!(
+                pool.is_some_and(|p| p.len() >= 100),
+                "built-in corpus tier {tier} is thin or absent"
+            );
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// THE SECOND CONTROL: a GOOD file on disk still wins. The fallback must not
+    /// have quietly replaced the bind mount — that would make shipping new loot
+    /// tables via `arena.sh static` impossible.
+    #[test]
+    fn a_valid_chest_loot_file_on_disk_is_preferred() {
+        let dir = std::env::temp_dir().join(format!("nb-chest-ok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("chest_loots.json");
+        // A minimal but VALID document, distinguishable from the built-in by size.
+        std::fs::write(&path, r#"{"tiers":{},"provisionalTiers":{}}"#).unwrap();
+
+        let loaded: ChestLootTables = read_json_or_builtin(&path, CHEST_LOOTS_BUILTIN);
+        assert!(
+            loaded.tiers.is_empty(),
+            "a parseable file on disk must be used verbatim, even when it is thinner \
+             than the built-in copy — otherwise arena.sh static could never ship an update"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
