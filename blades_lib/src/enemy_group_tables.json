@@ -3,14 +3,22 @@
   "description": "enemy spawn group id -> how often its enemies rolled each SET of loot tables, observed on retail",
   "authoritative": "every set here is the lootTableLoot key set of one retail enemy result; nothing is interpolated",
   "derivation": "dungeonGeneratedDataList -> enemyGeneratedData keyed BY spawn group id -> lootTableLoot keys",
-  "whyASetDistribution": "the table set is a property of the enemy, not always of the group. 1062 of 1066 groups always produced the same set, but the 4 that vary hold more than half of all enemy results -- they are the groups that spawn a mix of enemy types. Keying a group to one fixed set would give every enemy in those groups the commonest type's loot.",
+  "whyASetDistribution": "the table set is a property of the enemy, not always of the group. 1062 of 1066 groups always produced the same set, but the 4 that vary hold more than half of all enemy results -- they spawn a mix of enemy types. Keying a group to one fixed set would give every enemy in those groups the commonest type's loot.",
   "howToDraw": "look the spawn group up, draw one SET weighted by n, then roll each table in it against enemy_loot.json at the enemy's level. A group absent from this file was never observed: the consumer decides the fallback, and must say which it used.",
   "emptySetIsReal": "an enemy that rolled no loot table at all is an observed outcome and is kept",
   "deduplication": "on (questId, sha1 of the dungeon entry), same as enemy_loot.json",
   "enemyResults": 32592,
+  "dungeonEntries": 3033,
   "groups": 1066,
+  "groupsWithOneSet": 1062,
   "resultsWhoseSetContainsGold": 29556,
-  "goldTable": "871c2e9b-7e7a-4564-a022-e435dfb8a436"
+  "goldTable": "871c2e9b-7e7a-4564-a022-e435dfb8a436",
+  "parsedJsonGroups": 1956,
+  "control": {
+   "groupsNotInParsedJson": 0,
+   "validatedAgainstParsedJson": true
+  },
+  "generator": "tools/apk-extract/mine-enemy-group-tables.py"
  },
  "groups": {
   "000becd6-0393-49c1-b749-68b2c9015953": {
