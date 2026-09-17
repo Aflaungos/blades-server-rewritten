@@ -610,6 +610,111 @@ struct SellResponse {
     buybacks: Vec<Buyback>,
 }
 
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BuybackResponse {
+    shop: ShopTxnState,
+    inventory: CompleteInventoryUpdate,
+    /// Echoed only when gold actually moved, mirroring `SellResponse`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    wallet: Option<CompleteWallet>,
+    /// The slots still open after this one was consumed.
+    buybacks: Vec<merchant::Buyback>,
+}
+
+/// `POST /shops/{id}/buybacks/{id}` — take back something you just sold.
+///
+/// THIS ROUTE DID NOT EXIST. `sell_to_shop` creates buyback slots and the client
+/// renders them, but the endpoint it posts to was never written, so every attempt
+/// answered **404**. Selling by accident was irreversible.
+///
+/// That is report #163: the player sold six items, tried to buy them back, got
+/// nothing, and the five-minute window closed while the slots sat there unusable.
+/// The edge log has his three 404s on this exact path.
+///
+/// The transaction is the inverse of the sale: the player pays back precisely what
+/// the merchant paid them (`price`, often 0 once the merchant's budget is spent),
+/// the merchant's revenue is restored, and the item returns to the backpack.
+#[post(
+    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/shops/{shop_id}/buybacks/{buyback_id}"
+)]
+pub async fn buy_back_from_shop(
+    session: SessionLookedUpMaybe,
+    app_state: web::Data<Arc<ServerGlobal>>,
+    path: web::Path<(Uuid, Uuid, Uuid)>,
+) -> Result<Json<BuybackResponse>, BladeApiError> {
+    let session = session.get_session_or_error()?;
+    let user_id = session.session.user_id;
+    let (character_id, shop_id, buyback_id) = path.into_inner();
+    let globals = app_state.get_ref().clone();
+    let now = now_ms();
+    let mut conn = app_state.db_pool.get().await.unwrap();
+
+    conn.transaction(move |mut conn| {
+        async move {
+            let mut entry = load_owned(&mut conn, character_id, user_id).await?;
+            let building = entry
+                .town
+                .as_ref()
+                .and_then(|t| find_building_type_level(&t.0, shop_id));
+            // `false`: never reroll the catalogue on a buyback. Rerolling would
+            // discard the very slot being claimed.
+            let mut window = window_for(
+                &globals,
+                shop_id,
+                building,
+                entry.server_state.0.shops.get(&shop_id),
+                now,
+                false,
+            );
+
+            let mut tracker = InventoryChangeTracker::default();
+            let outcome = merchant::apply_buyback(
+                &mut window,
+                buyback_id,
+                &mut entry.inventory.0,
+                &mut entry.wallet.0,
+                &mut tracker,
+                now,
+            )
+            .map_err(|e| match e {
+                merchant::BuybackError::NoSuchSlot => {
+                    BladeApiError::new(StatusCode::NOT_FOUND, 20000, 2)
+                }
+                merchant::BuybackError::Expired => {
+                    BladeApiError::new(StatusCode::BAD_REQUEST, 20000, 3)
+                }
+                merchant::BuybackError::InsufficientGold => {
+                    BladeApiError::new(StatusCode::BAD_REQUEST, 20000, 4)
+                }
+            })?;
+
+            entry.inventory.0.backpack_version += 1;
+            log::info!(
+                "[shop] character {character_id} bought back {} from shop {shop_id} for {} gold",
+                outcome.slot.id,
+                outcome.gold_spent,
+            );
+
+            let inventory = entry.inventory.0.generate_client_update(&tracker);
+            let wallet = (outcome.gold_spent > 0).then(|| entry.wallet.0.clone());
+            let shop = txn_state(shop_id, &window);
+            let buybacks = window.buybacks.clone();
+            entry.server_state.0.shops.insert(shop_id, window);
+            write_back(&mut conn, entry).await?;
+
+            Ok::<_, BladeApiError>(Json(BuybackResponse {
+                shop,
+                inventory,
+                wallet,
+                buybacks,
+            }))
+        }
+        .scope_boxed()
+    })
+    .await
+}
+
 /// `POST /shops/{id}/sell` — sell gear/materials to a merchant for its own gold.
 ///
 /// Price is the item's APK `sellValue` scaled by its temper multiplier plus its
