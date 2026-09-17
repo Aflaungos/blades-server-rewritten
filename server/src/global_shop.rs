@@ -474,7 +474,31 @@ pub async fn purchase_global_shop(
                 .global_shop_offer_contents
                 .get(&body.global_shop_product_id),
         )
-        .ok_or_else(|| map_purchase_err(PurchaseError::NoSuchProduct))?,
+        .ok_or_else(|| {
+            // NOT a 404. This comment's own neighbour records why: a 404 here makes
+            // the client prompt the player to reconnect to Bethesda, and a player
+            // who touched one of these lost the game entirely — "ever since I tried
+            // to buy something in the shop, Blades won't start anymore" (#170),
+            // matching the single purchase 404 in that day's log.
+            //
+            // 365 of the 493 Sigil-priced products have no recoverable reward yet
+            // (#167). Hiding them instead was measured and is worse: it drops the
+            // served shop to a median of 4 offers a day, straight back to the
+            // near-empty shop of #141. So the offer stays visible and the REFUSAL
+            // becomes survivable.
+            //
+            // The shape is the one the client already receives in ordinary play for
+            // a price mismatch — 400 on this service — so it is a path known to be
+            // handled rather than a code invented here. The real reason is logged
+            // server-side; the client is simply told no.
+            log::warn!(
+                "[shop] character {character_id} tried to buy product {} which has no \
+                 deliverable reward (#167); refusing with the price-mismatch shape \
+                 rather than a 404, which would brick the client",
+                body.global_shop_product_id,
+            );
+            map_purchase_err(PurchaseError::InvalidPrice)
+        })?,
     };
     // The store has free offers — retail's daily giveaway — and the client sends
     // `quantity: 0` for them. `sanitize_prices` rejects a zero quantity, so every
@@ -976,6 +1000,58 @@ mod replay_tests {
     }
 
     /// Every authored offer must have a reward definition, or buying it 404s and the
+    /// AN UNDELIVERABLE PRODUCT MUST NOT 404.
+    ///
+    /// A 404 on this route makes the client prompt the player to reconnect to
+    /// Bethesda — the file says so above `purchase_global_shop`, and a player lived
+    /// it: one purchase 404 at 04:02, then "ever since I tried to buy something in
+    /// the shop, Blades won't start anymore" (#170).
+    ///
+    /// 365 of the 493 Sigil-priced products still have no recoverable reward
+    /// (#167), so until that lands a mis-click must be a harmless refusal rather
+    /// than a wedge.
+    ///
+    /// The alternative — hiding them — was measured and rejected: it drops the
+    /// served shop to a median of 4 Sigil offers a day, back to the near-empty shop
+    /// of #141. Full shop plus a survivable refusal beats thin shop.
+    #[test]
+    fn an_undeliverable_product_is_refused_without_a_404() {
+        let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../deploy/static");
+        let sd = crate::static_loader::load(&dir);
+
+        // Find a product the storefront serves that genuinely cannot be delivered —
+        // the population this test is about.
+        let undeliverable = sd
+            .global_shop_overrides["globalShopOverrides"]
+            .as_object()
+            .expect("an object")
+            .keys()
+            .filter_map(|k| Uuid::parse_str(k).ok())
+            .find(|id| {
+                !sd.global_shop_grants.contains_key(id)
+                    && grant_from_offer_contents(sd.global_shop_offer_contents.get(id)).is_none()
+            });
+        let id = undeliverable.expect(
+            "the corpus must still contain undeliverable offers, or this test is moot",
+        );
+
+        // The refusal the handler produces for that case.
+        let err = map_purchase_err(PurchaseError::InvalidPrice);
+        assert_eq!(
+            actix_web::ResponseError::status_code(&err),
+            StatusCode::BAD_REQUEST,
+            "product {id} must be refused with 400, never the 404 that bricks the client"
+        );
+
+        // CONTROL: 404 is still reachable for a product that genuinely does not
+        // exist, so this has not blanket-removed the not-found case.
+        assert_eq!(
+            actix_web::ResponseError::status_code(&map_purchase_err(PurchaseError::NoSuchProduct)),
+            StatusCode::NOT_FOUND,
+            "a genuinely unknown product should still be a 404"
+        );
+    }
+
     /// client prompts the player to reconnect to Bethesda. The generator refuses to
     /// write one without; this is the guard on the committed file, and it starts
     /// vacuous because the file starts empty.
