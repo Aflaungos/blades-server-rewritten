@@ -662,6 +662,20 @@ fn process_dungeon_actions(
     wallet: &mut CompleteWallet,
     inventory_modification_tracker: &mut InventoryChangeTracker,
 ) -> bool {
+    // Was this dungeon generated before the server started rolling enemy loot?
+    //
+    // Asked of the whole dungeon, once, rather than of the corpse being looted:
+    // an enemy that legitimately rolled nothing is an ordinary outcome, and
+    // reading emptiness per corpse would hand that case back to the client to
+    // decide. A pre-loot dungeon has no loot on ANY enemy, so the two are
+    // distinguishable. Self-retiring: every such run ends.
+    let dungeon_predates_generated_loot = !generated_data
+        .enemy_generated_data
+        .values()
+        .flatten()
+        .flatten()
+        .any(|enemy| !enemy.loot_table_loot.is_empty() || !enemy.spawn_group_loot.is_empty());
+
     let mut currency_moved = false;
     for action in actions {
         match action {
@@ -728,21 +742,30 @@ fn process_dungeon_actions(
                 // Looting the same corpse twice must not pay twice; taking the stored
                 // loot empties it.
                 let loot = std::mem::take(&mut status.loot);
-                let stored_is_empty = loot.currencies.is_empty() && loot.stackable_items.is_empty();
 
-                // We do not generate enemy loot yet: generate_for_dungeon sets
-                // spawn_group_loot and loot_table_loot to HashMap::default() and nothing
-                // fills them, so merged_loot_table() is always empty. Reading only the
-                // stored value therefore reduces every corpse to nothing (#138, fixed in
-                // #145). Stored wins when it HAS contents -- the moment we generate real
-                // loot the client stops being trusted, with no further change here -- and
-                // until then the request is the only source there is.
-                let grant = if stored_is_empty {
+                // The server now rolls enemy loot at generation time
+                // (`roll_enemy_loot`), so the stored value is the answer and the
+                // client's `loot` body is not read at all -- naming your own payout
+                // off any corpse you had killed is exactly what it would allow.
+                //
+                // Dungeons generated BEFORE that shipped carry no loot on any enemy,
+                // and their runs are still in progress. For those the request stays
+                // the only source there is (#138/#145), gated on the whole dungeon
+                // being loot-less rather than on this one corpse: an enemy that
+                // legitimately rolled nothing must credit nothing, not hand the
+                // decision back to the client.
+                let grant = if dungeon_predates_generated_loot {
                     enemy_loot.loot.clone()
                 } else {
                     RewardGrant {
                         currencies: loot.currencies,
                         stackable_items: loot.stackable_items,
+                        items: loot
+                            .item
+                            .0
+                            .into_iter()
+                            .map(|(id, item)| RewardItem { id, item })
+                            .collect(),
                         ..Default::default()
                     }
                 };
