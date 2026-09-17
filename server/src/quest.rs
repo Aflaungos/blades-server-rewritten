@@ -1713,6 +1713,46 @@ pub(crate) mod jobs_gen {
     pub(super) const JOB_GATHER_ITEM_SPAWN_GROUP: Uuid =
         Uuid::from_u128(0xb7c5dbab_14b9_4157_a3f3_b1d34e676864_u128);
 
+    // The rarity-ranked floor-item groups, verbatim from `job_pools.json` →
+    // `globals.interactableItemSpawnGroups` and `…InSecrets`.
+    //
+    // RULE 4, and it is authored data rather than a statistical fit. The first pass
+    // of this fix pruned the ENEMY groups and left the item groups alone, so every
+    // ordinary job still carried all of them. Measured over the same 1395 captured
+    // non-duel jobs:
+    //
+    //   both rarity-1 groups present                     1395/1395
+    //   EXACTLY one of the secrets r2/r3                  1395/1395
+    //       (27f1e408 x932, d00e3919 x463 — never both, never neither)
+    //   AT MOST one of the main r2/r3                     1395/1395
+    //       (f1753fab x688, f85079bc x346, neither x361 — never both)
+    //   a Duel carries none at all                         137/137
+    //
+    // Retail therefore ships 3-5 item groups; we shipped 6 or 7, over-sending on
+    // 1395 of 1395 jobs. The control on that measurement is that the same
+    // calculation over the ENEMY groups returns zero over-send after the first
+    // pass, so the item result is not an artefact of the probe.
+    //
+    // Which of r2/r3 a job gets does not correlate with jobType, secretRoom,
+    // secretBossEnemyFamilyId, gatherItemId or rescueNpcCount — every ratio sits at
+    // the base rate — so it reads as a per-job rarity roll. It is reproduced here
+    // deterministically from the job's own `seed` at the measured frequencies. The
+    // exact group retail picked for a given job is not recoverable; what matters for
+    // the client is that the SHAPE is right and nothing is sent for scenery the
+    // scene does not contain.
+    pub(super) const JOB_ITEM_R1: Uuid =
+        Uuid::from_u128(0x49adb60a_f5b2_4668_b96d_d69602a326cc_u128);
+    pub(super) const JOB_ITEM_R2: Uuid =
+        Uuid::from_u128(0xf1753fab_bd87_48a7_a2b4_79752b059c1c_u128);
+    pub(super) const JOB_ITEM_R3: Uuid =
+        Uuid::from_u128(0xf85079bc_4873_4773_b8fd_d78bf1a837c1_u128);
+    pub(super) const JOB_SECRET_ITEM_R1: Uuid =
+        Uuid::from_u128(0xda153b3a_8a61_460c_9384_9e12ba8f50e3_u128);
+    pub(super) const JOB_SECRET_ITEM_R2: Uuid =
+        Uuid::from_u128(0x27f1e408_8cfd_4ded_b177_05edc3ae296c_u128);
+    pub(super) const JOB_SECRET_ITEM_R3: Uuid =
+        Uuid::from_u128(0xd00e3919_826d_4476_9f36_4cf5a581ab37_u128);
+
     /// Stored JOB `quests` rows are tagged with this sentinel `gldQuestId` so the
     /// /quests handler can (a) keep them out of the `quests[]` array and (b)
     /// recognise a prior-window job row when pruning. It is a fixed, otherwise
@@ -2198,6 +2238,27 @@ pub(crate) mod jobs_gen {
             // 3. The Gather pickup only exists on a Gather job.
             if setup.get("gatherItemId").is_none_or(Value::is_null) {
                 data.item_generated_data.remove(&JOB_GATHER_ITEM_SPAWN_GROUP);
+            }
+
+            // 4. The floor-item groups are a RARITY PICK, not the whole list. See
+            //    the constants above for the four measured rules.
+            let mut rng = Rng::new(get_i64(job, "seed", 0) as u64);
+            // Exactly one of the two secret-room rarity groups (932:463 measured).
+            let drop_secret = if rng.below(1395) < 932 {
+                JOB_SECRET_ITEM_R3
+            } else {
+                JOB_SECRET_ITEM_R2
+            };
+            data.item_generated_data.remove(&drop_secret);
+            // At most one of the two main rarity groups (688 : 346 : 361 none).
+            let roll = rng.below(1395);
+            if roll < 688 {
+                data.item_generated_data.remove(&JOB_ITEM_R3);
+            } else if roll < 688 + 346 {
+                data.item_generated_data.remove(&JOB_ITEM_R2);
+            } else {
+                data.item_generated_data.remove(&JOB_ITEM_R2);
+                data.item_generated_data.remove(&JOB_ITEM_R3);
             }
 
             // 4. And the boss is levelled, as it already is for a Duel. Every enemy
@@ -3296,6 +3357,128 @@ mod report85_job_generated_data_tests {
             jobs_gen::generated_data_for_job(&gd, ordinary).expect("ordinary job generates");
         assert!(ordinary_data.enemy_generated_data.len() > 3);
         assert!(!ordinary_data.item_generated_data.is_empty());
+    }
+
+    /// EVERY HARDCODED SPAWN-GROUP UUID MUST MATCH THE SHIPPED DATA.
+    ///
+    /// These ids are transcribed by hand from `job_pools.json`, and one of them was
+    /// got wrong exactly that way: `d00e3919-…`'s last nine hex digits were filled
+    /// in from a truncated terminal dump rather than read from the file. Five of six
+    /// happened to be right. A wrong id here is silent — the `remove` simply matches
+    /// nothing, the group is still over-sent, and every test about SHAPE still
+    /// passes because the count is only checked against the rules, never the source.
+    ///
+    /// So the file is the authority, and this asserts against it directly.
+    #[test]
+    fn the_hardcoded_spawn_group_ids_match_job_pools_json() {
+        let p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../deploy/static/job_pools.json");
+        let raw = std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("{p:?}: {e}"));
+        let pools: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let g = &pools["globals"];
+
+        let by_rarity = |key: &str, rarity: i64| -> Uuid {
+            g[key]
+                .as_array()
+                .unwrap_or_else(|| panic!("{key} is a list"))
+                .iter()
+                .find(|e| e["rarity"].as_i64() == Some(rarity))
+                .and_then(|e| e["spawnGroupId"].as_str())
+                .and_then(|s| Uuid::parse_str(s).ok())
+                .unwrap_or_else(|| panic!("{key} rarity {rarity} missing"))
+        };
+
+        assert_eq!(jobs_gen::JOB_ITEM_R1, by_rarity("interactableItemSpawnGroups", 1));
+        assert_eq!(jobs_gen::JOB_ITEM_R2, by_rarity("interactableItemSpawnGroups", 2));
+        assert_eq!(jobs_gen::JOB_ITEM_R3, by_rarity("interactableItemSpawnGroups", 3));
+        assert_eq!(
+            jobs_gen::JOB_SECRET_ITEM_R1,
+            by_rarity("interactableItemSpawnGroupsInSecrets", 1)
+        );
+        assert_eq!(
+            jobs_gen::JOB_SECRET_ITEM_R2,
+            by_rarity("interactableItemSpawnGroupsInSecrets", 2)
+        );
+        assert_eq!(
+            jobs_gen::JOB_SECRET_ITEM_R3,
+            by_rarity("interactableItemSpawnGroupsInSecrets", 3)
+        );
+
+        // The enemy groups come from the same file and are pinned the same way.
+        let enemy = |k: &str| -> Uuid {
+            Uuid::parse_str(g["enemySpawnGroups"][k].as_str().unwrap()).unwrap()
+        };
+        assert_eq!(jobs_gen::JOB_PRIMARY_SPAWN_GROUP, enemy("primary"));
+        assert_eq!(jobs_gen::JOB_SECONDARY_SPAWN_GROUP, enemy("secondary"));
+        assert_eq!(jobs_gen::JOB_BOSS_SPAWN_GROUP, enemy("boss"));
+        assert_eq!(jobs_gen::JOB_SECRET_BOSS_SPAWN_GROUP, enemy("secretBoss"));
+    }
+
+    /// AN ORDINARY JOB IS SENT 3-5 FLOOR-ITEM GROUPS, NOT ALL SEVEN.
+    ///
+    /// Rule 4, measured over the same 1395 captured non-duel jobs and authored in
+    /// `job_pools.json` rather than fitted:
+    ///
+    /// ```text
+    ///   both rarity-1 groups present            1395/1395
+    ///   EXACTLY one of the secrets r2/r3        1395/1395
+    ///   AT MOST one of the main r2/r3           1395/1395
+    /// ```
+    ///
+    /// The first pass of this fix pruned the ENEMY groups only, so every ordinary
+    /// job still over-sent 2-3 item groups — 1395 of 1395 of them.
+    #[test]
+    fn an_ordinary_job_gets_a_rarity_pick_of_floor_item_groups() {
+        let gd = game_data();
+        let jobs = board();
+        let mut seen_sizes = std::collections::HashSet::new();
+        let mut checked = 0usize;
+
+        for job in jobs.iter().filter(|j| j["jobSetup"]["jobType"] != 5) {
+            let data = jobs_gen::generated_data_for_job(&gd, job).expect("job generates");
+            let has = |u: Uuid| data.item_generated_data.contains_key(&u);
+
+            assert!(has(jobs_gen::JOB_ITEM_R1), "the main rarity-1 group is always present");
+            assert!(has(jobs_gen::JOB_SECRET_ITEM_R1), "the secret rarity-1 group is always present");
+
+            let secrets = [jobs_gen::JOB_SECRET_ITEM_R2, jobs_gen::JOB_SECRET_ITEM_R3]
+                .into_iter().filter(|u| has(*u)).count();
+            assert_eq!(secrets, 1, "exactly one secret-room rarity group, never both or neither");
+
+            let main = [jobs_gen::JOB_ITEM_R2, jobs_gen::JOB_ITEM_R3]
+                .into_iter().filter(|u| has(*u)).count();
+            assert!(main <= 1, "at most one main rarity group, never both");
+
+            seen_sizes.insert(data.item_generated_data.len());
+            checked += 1;
+        }
+
+        assert!(checked > 0, "the fixture board must contain ordinary jobs");
+        // Retail ships 3-5 (3 when a Gather group is absent, up to 5 with it).
+        for n in &seen_sizes {
+            assert!((3..=5).contains(n), "an ordinary job shipped {n} item groups, retail ships 3-5");
+        }
+    }
+
+    /// THE CONTROL: the pick is DETERMINISTIC per job. A roll reseeded on every
+    /// request would change the scene under a client mid-dungeon, which is the
+    /// class of fault this whole report is about.
+    #[test]
+    fn the_floor_item_pick_is_stable_across_regenerations() {
+        let gd = game_data();
+        let jobs = board();
+        let job = jobs
+            .iter()
+            .find(|j| j["jobSetup"]["jobType"] != 5)
+            .expect("an ordinary job");
+
+        let first = jobs_gen::generated_data_for_job(&gd, job).expect("generates");
+        for _ in 0..5 {
+            let again = jobs_gen::generated_data_for_job(&gd, job).expect("generates");
+            let a: std::collections::BTreeSet<_> = first.item_generated_data.keys().collect();
+            let b: std::collections::BTreeSet<_> = again.item_generated_data.keys().collect();
+            assert_eq!(a, b, "the same job must always generate the same item groups");
+        }
     }
 
     /// AN ORDINARY JOB MUST NOT BE SENT THE SECRET-ROOM BOSS IT DOES NOT HAVE.
