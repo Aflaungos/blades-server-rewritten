@@ -452,6 +452,94 @@ pub struct SellOutcome {
 /// `min(price, remaining_budget)` and **takes the item either way** — an
 /// exhausted merchant does not refuse the sale, it pays 0. Each line pushes a
 /// buyback slot that lives for 5 minutes.
+/// Why a buyback failed. Each maps to a distinct client-visible outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BuybackError {
+    /// No slot with that id in this shop's window.
+    NoSuchSlot,
+    /// The five-minute window closed before the player asked.
+    Expired,
+    /// The player cannot afford what the merchant paid them.
+    InsufficientGold,
+}
+
+/// What a successful buyback returned.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BuybackOutcome {
+    pub slot: Buyback,
+    /// Gold actually taken back off the player.
+    pub gold_spent: u64,
+}
+
+/// Buy back an item the player sold. **This is the half that was never written.**
+///
+/// `sell_to_shop` creates buyback slots, the client shows them, and the client then
+/// calls `POST …/shops/{shop_id}/buybacks/{buyback_id}` — a route that did not
+/// exist, so every attempt answered 404. Selling something by accident was
+/// therefore irreversible, which is exactly how report #163 lost six items: the
+/// player sold them, tried to buy them back, got nothing, and the five-minute
+/// window closed while the slots sat there unusable.
+///
+/// The transaction is the exact inverse of the sale in `apply_sell`: the player
+/// pays back precisely what the merchant paid them (`slot.price`, often 0 once the
+/// merchant's budget is spent), the merchant's `revenue_gold` is restored, and the
+/// item or stack goes back into the backpack. The slot is consumed either way.
+pub fn apply_buyback(
+    window: &mut MerchantWindow,
+    buyback_id: Uuid,
+    inventory: &mut CompleteInventory,
+    wallet: &mut crate::user_data::CompleteWallet,
+    tracker: &mut InventoryChangeTracker,
+    now_ms: i64,
+) -> Result<BuybackOutcome, BuybackError> {
+    // Expiry is checked on the slot itself BEFORE pruning, so an expired slot
+    // reports `Expired` rather than vanishing into `NoSuchSlot` — the player asked
+    // for something that existed and has just run out, and the two cases deserve
+    // different answers.
+    let idx = window
+        .buybacks
+        .iter()
+        .position(|b| b.id == buyback_id)
+        .ok_or(BuybackError::NoSuchSlot)?;
+    if window.buybacks[idx].expiration <= now_ms {
+        window.buybacks.remove(idx);
+        return Err(BuybackError::Expired);
+    }
+
+    let price = window.buybacks[idx].price;
+    if price > 0 && wallet.balance(GOLD) < price {
+        return Err(BuybackError::InsufficientGold);
+    }
+
+    let slot = window.buybacks.remove(idx);
+    if price > 0 {
+        // `try_pay` is the same debit the shop's own purchase path uses, so an
+        // overdraft is impossible even if the balance check above ever drifts.
+        wallet
+            .try_pay(&[crate::economy::Price { currency_id: GOLD, quantity: price }])
+            .map_err(|_| BuybackError::InsufficientGold)?;
+    }
+    // The merchant gets its money back, mirroring the `-= paid` in `apply_sell`.
+    window.revenue_gold += price as i64;
+
+    if let Some(bi) = slot.item.clone() {
+        tracker.modified_backpack.items.insert(bi.id);
+        inventory.backpack.items.0.insert(bi.id, bi.item);
+    }
+    if let Some(bs) = slot.stackable_item.clone() {
+        inventory
+            .backpack
+            .stackable_items
+            .add(bs.item_template_id, bs.count);
+        tracker
+            .modified_backpack
+            .stackable_items
+            .insert(bs.item_template_id);
+    }
+
+    Ok(BuybackOutcome { slot, gold_spent: price })
+}
+
 pub fn apply_sell(
     prices: &SellPrices,
     window: &mut MerchantWindow,
@@ -989,4 +1077,123 @@ mod tests {
             );
         }
     }
+
+
+    /// SELLING MUST BE REVERSIBLE. The whole of report #163.
+    ///
+    /// `apply_sell` created buyback slots and the client rendered them, but the
+    /// route they post to was never written, so every attempt answered 404. A
+    /// player sold six items by accident, could not take them back, and lost them
+    /// when the five-minute window closed.
+    ///
+    /// Round trip: sell an item, buy it straight back, and the character must be
+    /// where it started — same item in the pack, same gold, slot consumed.
+    #[test]
+    fn a_sold_item_can_be_bought_straight_back() {
+        let now = 2_000_000i64;
+        let mut w = window(100_000);
+        let mut inv = inventory();
+        let mut wallet = CompleteWallet::default();
+        let mut tracker = InventoryChangeTracker::default();
+        let id = Uuid::from_u128(0xABCD);
+        inv.backpack.items.0.insert(id, item(3, &[]));
+
+        let gold_before = wallet.balance(GOLD);
+        let out = apply_sell(&prices(), &mut w, SHOP, &[id], &Default::default(),
+                             &mut inv, &mut wallet, &mut tracker, now);
+        assert_eq!(out.buybacks.len(), 1, "selling opens a buyback slot");
+        assert!(!inv.backpack.items.0.contains_key(&id), "the item left the pack");
+        let paid = out.buybacks[0].price;
+        let slot_id = out.buybacks[0].id;
+
+        let back = apply_buyback(&mut w, slot_id, &mut inv, &mut wallet, &mut tracker, now + 1)
+            .expect("the slot must be claimable");
+
+        assert_eq!(back.gold_spent, paid, "you pay back exactly what you were paid");
+        assert!(inv.backpack.items.0.contains_key(&id), "the item came back");
+        assert_eq!(wallet.balance(GOLD), gold_before, "and the gold nets out");
+        assert!(w.buybacks.is_empty(), "the slot is consumed");
+    }
+
+    /// The item returns INTACT — same tempering and enchantments, not a fresh one.
+    #[test]
+    fn the_returned_item_is_the_same_item() {
+        let now = 2_000_000i64;
+        let mut w = window(100_000);
+        let mut inv = inventory();
+        let mut wallet = CompleteWallet::default();
+        let mut tr = InventoryChangeTracker::default();
+        let id = Uuid::from_u128(0xBEEF);
+        let original = item(7, &[(ENCH, 9)]);
+        inv.backpack.items.0.insert(id, original.clone());
+
+        let out = apply_sell(&prices(), &mut w, SHOP, &[id], &Default::default(),
+                             &mut inv, &mut wallet, &mut tr, now);
+        apply_buyback(&mut w, out.buybacks[0].id, &mut inv, &mut wallet, &mut tr, now + 1)
+            .expect("claimable");
+
+        assert_eq!(
+            inv.backpack.items.0.get(&id),
+            Some(&original),
+            "tempering and enchantments must survive the round trip"
+        );
+    }
+
+    /// A stackable round-trips too, by count.
+    #[test]
+    fn a_sold_stack_comes_back_in_full() {
+        let now = 2_000_000i64;
+        let mut w = window(100_000);
+        let mut inv = inventory();
+        let mut wallet = CompleteWallet::default();
+        let mut tr = InventoryChangeTracker::default();
+        inv.backpack.stackable_items.add(TPL_STACK, 25);
+
+        let mut want = std::collections::HashMap::new();
+        want.insert(TPL_STACK, 10u64);
+        let out = apply_sell(&prices(), &mut w, SHOP, &[], &want,
+                             &mut inv, &mut wallet, &mut tr, now);
+        assert_eq!(inv.backpack.stackable_items.count(TPL_STACK), 15);
+
+        apply_buyback(&mut w, out.buybacks[0].id, &mut inv, &mut wallet, &mut tr, now + 1)
+            .expect("claimable");
+        assert_eq!(inv.backpack.stackable_items.count(TPL_STACK), 25, "the stack is whole again");
+    }
+
+    /// THE CONTROL: the five-minute window is still enforced, and an expired slot
+    /// says so rather than silently succeeding or pretending it never existed.
+    /// Without this the fix would hand players a permanent undo button, which is
+    /// not what retail did — buybacks last 5 minutes, 1466/1466.
+    #[test]
+    fn an_expired_slot_is_refused_and_named_as_expired() {
+        let now = 2_000_000i64;
+        let mut w = window(100_000);
+        let mut inv = inventory();
+        let mut wallet = CompleteWallet::default();
+        let mut tr = InventoryChangeTracker::default();
+        let id = Uuid::from_u128(0xFEED);
+        inv.backpack.items.0.insert(id, item(1, &[]));
+        let out = apply_sell(&prices(), &mut w, SHOP, &[id], &Default::default(),
+                             &mut inv, &mut wallet, &mut tr, now);
+
+        let err = apply_buyback(&mut w, out.buybacks[0].id, &mut inv, &mut wallet, &mut tr,
+                                now + BUYBACK_MS + 1)
+            .expect_err("an expired slot must be refused");
+        assert_eq!(err, BuybackError::Expired);
+        assert!(!inv.backpack.items.0.contains_key(&id), "and the item stays sold");
+    }
+
+    /// An unknown slot id is `NoSuchSlot`, distinct from `Expired` — the two are
+    /// different answers to the player and must not be conflated.
+    #[test]
+    fn an_unknown_slot_is_not_reported_as_expired() {
+        let mut w = window(100_000);
+        let mut inv = inventory();
+        let mut wallet = CompleteWallet::default();
+        let mut tr = InventoryChangeTracker::default();
+        let err = apply_buyback(&mut w, Uuid::from_u128(0x1234), &mut inv, &mut wallet, &mut tr, 1)
+            .expect_err("no such slot");
+        assert_eq!(err, BuybackError::NoSuchSlot);
+    }
+
 }

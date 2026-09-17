@@ -605,6 +605,7 @@ async fn main() -> Result<()> {
                     // Vendor shops: specific verbs before the bare `/shops/{id}` open.
                     .service(shop::buy_from_shop)
                     .service(shop::sell_to_shop)
+                    .service(shop::buy_back_from_shop)
                     .service(shop::refresh_loot)
                     .service(shop::open_shop)
                     .service(challenge::get_challenges)
