@@ -296,6 +296,7 @@ pub async fn dungeon_update(
 
     handle_quest_dungeon_update(
         &mut conn,
+        &app_state,
         character_id,
         quest_id,
         body.0,
@@ -303,8 +304,48 @@ pub async fn dungeon_update(
     ).await
 }
 
+/// Regenerate this dungeon's data for the variant the client is actually walking.
+///
+/// Returns `None` when nothing needs repairing — every reported spawner is already
+/// known, or the unknown one cannot be attributed to exactly one dungeon.
+///
+/// The enemy level and XP are carried over from the data being replaced, so a
+/// repair cannot quietly re-roll the run at a different difficulty.
+fn repair_variant_mismatch(
+    game_data: &crate::GameData,
+    current: &DungeonGeneratedData,
+    actions: &[DungeonUpdateAction],
+) -> Option<DungeonGeneratedData> {
+    let unknown = actions.iter().find_map(|a| match a {
+        DungeonUpdateAction::EnemyKilled(k) => {
+            let idx = EnemyIndex::new(k.spawn_group_id, k.spawner_index, k.enemy_index);
+            (current.get_enemy(&idx).is_none()).then_some(k.spawn_group_id)
+        }
+        _ => None,
+    })?;
+    // Already ours? Then the miss is an index inside a known group, not a variant
+    // mismatch, and regenerating would be wrong.
+    if current.enemy_generated_data.contains_key(&unknown) {
+        return None;
+    }
+    let owner = blades_lib::util::dungeon::dungeon_owning_spawn_group(game_data, &unknown)?;
+
+    // Keep the difficulty the run was generated at.
+    let (level, xp) = current
+        .enemy_generated_data
+        .values()
+        .flatten()
+        .flatten()
+        .next()
+        .map(|e| (e.enemy_level, e.given_xp))
+        .unwrap_or((1, 100));
+
+    blades_lib::util::dungeon::generate_for_dungeon(game_data, &owner, level, xp)
+}
+
 async fn handle_quest_dungeon_update(
     conn: &mut AsyncPgConnection,
+    app_state: &ServerGlobal,
     character_id: Uuid,
     quest_id: Uuid,
     body: DungeonUpdateRequest,
@@ -332,10 +373,38 @@ async fn handle_quest_dungeon_update(
                     .next()
                     .ok_or_else(|| BladeApiError::new(StatusCode::NOT_FOUND, 20000, 2))?
             };
-            let generated_data = quest_data
+            let mut generated_data = quest_data
                 .generated_data
                 .0
                 .ok_or_else(|| BladeApiError::new(StatusCode::BAD_REQUEST, 20001, 2))?;
+
+            // THE CLIENT IS IN A DIFFERENT VERSION OF THIS DUNGEON THAN WE GENERATED.
+            //
+            // Retail builds several variants of a dungeon (`..._A`, `_B`, `_C`); 23
+            // families in parsed.json have them, a quest names only the `_A`, and in
+            // all 23 the variants share NOT ONE enemy spawn group. When the client
+            // walks `_B` every kill it reports names a spawner we have no data for,
+            // so it was logged "stale" and thrown away — no XP, no loot, for that
+            // whole stage (#174).
+            //
+            // Because the variants share no groups, the spawner the client reports
+            // identifies its variant unambiguously. So rather than discard the
+            // player's progress, generate the data for the variant they are actually
+            // in and carry on. The regenerated data is persisted below with the rest
+            // of the row, so the rest of the run agrees too.
+            //
+            // Only fires when the group is unknown AND resolves to exactly one
+            // dungeon; an ambiguous or unowned group is still discarded, because
+            // guessing there would invent a dungeon the player is not in.
+            if let Some(repaired) =
+                repair_variant_mismatch(&app_state.game_data, &generated_data, &body.actions)
+            {
+                log::info!(
+                    "dungeon_update: character {character_id} is in a different dungeon \
+                     variant than we generated; regenerated from the spawner it reported (#174)"
+                );
+                generated_data = repaired;
+            }
             let mut dungeon_state = quest_data
                 .dungeon_state
                 .ok_or_else(|| BladeApiError::new(StatusCode::BAD_REQUEST, 20001, 2))?
