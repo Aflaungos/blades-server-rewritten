@@ -756,6 +756,34 @@ pub async fn purchase_global_shop(
                 r
             };
 
+            // FOUR products are randomised bundles, and for them the recorded grant
+            // above is the wrong answer entirely: it is one retail purchase, cloned
+            // for every player and every buy, so the store hands out the same gold
+            // and the same two items for ever (#170). Retail re-rolled — 4,697 buys
+            // of the biggest bundle produced 4,697 distinct rewards — and the payout
+            // scales with the buyer's level, from a median 9,735 gold at levels 1-5
+            // to 60,315 at 54-89.
+            //
+            // Rolled HERE rather than beside the recorded grant because only inside
+            // the transaction do we know who is buying and how many times they have
+            // bought before. The purchase count is the nonce, so buying the same
+            // bundle twice in a row cannot return the same thing.
+            let reward = {
+                let bought_before = entry
+                    .server_state
+                    .0
+                    .global_shop_purchases
+                    .get(&product_id)
+                    .copied()
+                    .unwrap_or(0);
+                blades_lib::features::store_bundles::roll_bundle(
+                    &product_id,
+                    u64::from(entry.character.0.level),
+                    bought_before,
+                )
+                .unwrap_or(reward)
+            };
+
             let mut tracker = InventoryChangeTracker::default();
             apply_reward(
                 &reward,
