@@ -802,7 +802,7 @@ pub struct RankingConfigResponse {
     pub defaults: ranking::RankingConfig,
 }
 
-#[get("/blades.bgs.services/api/dev/v1/arena-ranking/config")]
+#[get("/api/dev/v1/arena-ranking/config")]
 pub async fn get_arena_ranking_config(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -833,7 +833,7 @@ pub struct RankingValidationErrorResponse {
     pub errors: ranking::ValidationErrors,
 }
 
-#[put("/blades.bgs.services/api/dev/v1/arena-ranking/config")]
+#[put("/api/dev/v1/arena-ranking/config")]
 pub async fn put_arena_ranking_config(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -929,7 +929,7 @@ pub struct H2hTopQuery {
     pub season: Option<String>,
 }
 
-#[get("/blades.bgs.services/api/dev/v1/arena-ranking/config/history")]
+#[get("/api/dev/v1/arena-ranking/config/history")]
 pub async fn get_arena_ranking_config_history(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -1004,7 +1004,7 @@ pub struct H2hTopResponse {
     pub rows: Vec<H2hTopEntry>,
 }
 
-#[get("/blades.bgs.services/api/dev/v1/arena-ranking/h2h-top")]
+#[get("/api/dev/v1/arena-ranking/h2h-top")]
 pub async fn get_arena_h2h_top(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -1088,7 +1088,7 @@ async fn h2h_top_for_season(
     Ok(rows)
 }
 
-#[get("/blades.bgs.services/api/dev/v1/arena-ranking/h2h-seasons")]
+#[get("/api/dev/v1/arena-ranking/h2h-seasons")]
 pub async fn list_arena_h2h_seasons(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -1120,7 +1120,7 @@ pub struct H2hRebuildResponse {
     pub matches: usize,
 }
 
-#[post("/blades.bgs.services/api/dev/v1/arena-ranking/h2h-rebuild")]
+#[post("/api/dev/v1/arena-ranking/h2h-rebuild")]
 pub async fn rebuild_arena_h2h_ratings(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -1234,7 +1234,7 @@ pub async fn get_current_character(
 
 /// `POST /…/api/dev/v1/characters/{character_id}/name` — rename the current live
 /// arena character for a user from the web support/account surface.
-#[post("/blades.bgs.services/api/dev/v1/characters/{character_id}/name")]
+#[post("/api/dev/v1/characters/{character_id}/name")]
 pub async fn set_current_character_name(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,

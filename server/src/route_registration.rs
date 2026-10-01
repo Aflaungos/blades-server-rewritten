@@ -163,7 +163,7 @@ mod tests {
     fn host_prefixed_routes_start_with_a_slash() {
         let bad: Vec<_> = attributed_route_literals()
             .into_iter()
-            .filter(|(_, route)| route.starts_with("blades.bgs.services/"))
+            .filter(|(_, route)| route.starts_with("/"))
             .collect();
         assert!(
             bad.is_empty(),
