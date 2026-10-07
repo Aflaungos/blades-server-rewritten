@@ -84,6 +84,22 @@ diesel::table! {
 }
 
 diesel::table! {
+    arena_promotion_gem_backfill_audit (id) {
+        id -> Uuid,
+        character_id -> Uuid,
+        arena -> Int4,
+        threshold -> Int8,
+        gems -> Int8,
+        character_name -> Text,
+        old_gems -> Int8,
+        new_gems -> Int8,
+        live_grant_start_secs -> Int8,
+        reason -> Text,
+        granted_at -> Int8,
+    }
+}
+
+diesel::table! {
     arena_ranking_config (id) {
         id -> Uuid,
         version -> Int4,
@@ -148,8 +164,16 @@ diesel::table! {
 }
 
 diesel::table! {
-    /// Snapshots of a character row taken before something overwrote it (#—,
-    /// RonnieRaider's four lost days). See the migration for why.
+    character_creation_allowance (character_id) {
+        character_id -> Uuid,
+        currency_id -> Uuid,
+        amount -> Int8,
+        reason -> Text,
+        granted_at -> Int8,
+    }
+}
+
+diesel::table! {
     character_versions (id) {
         id -> Uuid,
         character_id -> Uuid,
@@ -178,8 +202,6 @@ diesel::table! {
         wallet -> Jsonb,
         town -> Nullable<Jsonb>,
         server_state -> Jsonb,
-        /// Which alt this row is a copy of. NULL for rows imported before
-        /// alt tracking existed — treated as "unknown", never as a value.
         source_alt_uuid -> Nullable<Uuid>,
     }
 }
@@ -192,8 +214,6 @@ diesel::table! {
         last_seen -> Timestamptz,
         bound_at -> Nullable<Timestamptz>,
         source_wg_ip -> Nullable<Text>,
-        /// The alt this device last chose to play. Per-device because the
-        /// binding row is per-device: two phones can each remember their own.
         active_alt_uuid -> Nullable<Uuid>,
     }
 }
@@ -245,18 +265,6 @@ diesel::table! {
         opened_by -> Nullable<Text>,
         note -> Nullable<Text>,
         created_at -> Int8,
-    }
-}
-
-diesel::table! {
-    /// One row per character that has had its character-creation allowance
-    /// (#193). The primary key IS the idempotency guard — see the migration.
-    character_creation_allowance (character_id) {
-        character_id -> Uuid,
-        currency_id -> Uuid,
-        amount -> Int8,
-        reason -> Text,
-        granted_at -> Int8,
     }
 }
 
@@ -349,6 +357,15 @@ diesel::table! {
 }
 
 diesel::table! {
+    matchmaking (id) {
+        id -> Uuid,
+        other_id -> Nullable<Uuid>,
+        match_info -> Nullable<Jsonb>,
+        ack_info -> Nullable<Jsonb>,
+    }
+}
+
+diesel::table! {
     quests (id, character_id) {
         id -> Uuid,
         character_id -> Uuid,
@@ -384,6 +401,7 @@ diesel::joinable!(arena_h2h_season_ratings -> arena_seasons (season_id));
 diesel::joinable!(arena_h2h_season_ratings -> characters (character_id));
 diesel::joinable!(arena_match_results -> characters (character_id));
 diesel::joinable!(arena_matches -> users (user_id));
+diesel::joinable!(arena_promotion_gem_backfill_audit -> characters (character_id));
 diesel::joinable!(arena_season_awards -> arena_seasons (season_id));
 diesel::joinable!(arena_season_guild_standings -> arena_seasons (season_id));
 diesel::joinable!(arena_season_standings -> arena_seasons (season_id));
@@ -402,6 +420,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     arena_h2h_season_ratings,
     arena_match_results,
     arena_matches,
+    arena_promotion_gem_backfill_audit,
     arena_ranking_config,
     arena_season_awards,
     arena_season_guild_standings,
@@ -422,6 +441,7 @@ diesel::allow_tables_to_appear_in_same_query!(
     guild_messages,
     guild_removals,
     guilds,
+    matchmaking,
     quests,
     sessions,
     users,
