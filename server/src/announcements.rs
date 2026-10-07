@@ -10,7 +10,7 @@ use actix_web::{
     get,
     web::{self, Json},
 };
-use blades_lib::static_data::Announcement;
+use blades_lib::static_data::{Announcement, GiftDef};
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 use serde::Serialize;
@@ -84,6 +84,18 @@ pub async fn get_announcements(
         announcements.push(authored_gift_announcement(&gift, now));
     }
 
+    // The static gift catalogue. `/globalgifts/{id}` serves these, but nothing
+    // advertised them: a static gift the client cannot see is one nobody
+    // collects — the same failure the authored-gift source above exists to fix,
+    // reached by the other route. Same /gift/ namespace and same id-in-path
+    // rule, so the edge arms Claim identically. In-window only: an out-of-window
+    // banner would render a Claim button that answers "not active".
+    for gift in app_state.static_data.gifts.values() {
+        if gifts_in_window(gift, now) {
+            announcements.push(static_gift_announcement(gift));
+        }
+    }
+
     // Last, and for every source at once: put the asset on a host the client can
     // actually resolve. Done here rather than at each `push` so a new kind of
     // announcement cannot be added on an unreachable host by omission.
@@ -98,7 +110,7 @@ pub async fn get_announcements(
 const RETAIL_ASSET_ORIGIN: &str = "https://announcements.blades.bgs.services";
 
 /// Where those assets actually live for us.
-const DEFAULT_ASSET_ORIGIN: &str = "https://announcements-feed.nb.dethele.com";
+const DEFAULT_ASSET_ORIGIN: &str = "https://100.103.14.5";
 
 /// Put an announcement's asset on a host the client can reach.
 ///
@@ -206,6 +218,45 @@ fn authored_gift_announcement(
     }
 }
 
+/// Is this static gift live right now?
+///
+/// Zero on either end is "unbounded", matching the file's convention: a gift
+/// with `startTime: 0` has always been live, one with `endTime: 0` never
+/// expires. The `claim_count_limit > 0` guard keeps a deliberately-disabled
+/// entry (limit 0) off the feed — it would answer "limit reached" on tap.
+fn gifts_in_window(gift: &GiftDef, now: i64) -> bool {
+    let started = gift.start_time == 0 || gift.start_time <= now;
+    let unexpired = gift.end_time == 0 || now < gift.end_time;
+    started && unexpired && gift.claim_count_limit > 0
+}
+
+/// The banner for one gift from the static catalogue.
+///
+/// GIFT-BEARING, exactly like [`authored_gift_announcement`]: the edge turns the
+/// uuid in this path into the manifest's `GlobalGiftId`, which is the only thing
+/// that arms Claim. `ttl` is the gift's own close time so the banner cannot
+/// outlive it; `0` (never expires) gets a rolling month, the same rule the
+/// authored path uses.
+fn static_gift_announcement(gift: &GiftDef) -> Announcement {
+    let now = now_secs();
+    let start = if gift.start_time > 0 { gift.start_time } else { now };
+    let ttl = if gift.end_time > 0 {
+        gift.end_time
+    } else {
+        now + REWARD_ANNOUNCEMENT_LIFETIME
+    };
+    Announcement {
+        id: gift.global_gift_id.to_string(),
+        r#type: "BASIC".into(),
+        start_time: start,
+        ttl,
+        asset_url: format!(
+            "https://announcements.blades.bgs.services/gift/{}",
+            gift.global_gift_id
+        ),
+    }
+}
+
 fn season_reward_announcement(season: &season_store::SeasonRow) -> Announcement {
     let start = season.ended_at.unwrap_or(season.ends_at);
     Announcement {
@@ -278,6 +329,45 @@ mod tests {
         assert_eq!(a.start_time, now, "0 start means now, not 1970");
         assert_eq!(a.ttl, now + REWARD_ANNOUNCEMENT_LIFETIME);
         assert!(a.ttl > now, "a dateless gift must still be live");
+    }
+
+    fn a_static_gift(start: i64, end: i64, limit: u64) -> GiftDef {
+        GiftDef {
+            global_gift_id: uuid::uuid!("69a7ff4e-3a8e-4859-821b-8f500955ece8"),
+            start_time: start,
+            end_time: end,
+            claim_count_limit: limit,
+            description: Some("test".into()),
+            items: Vec::new(),
+        }
+    }
+
+    /// The banner must carry the GIFT's own id in its path — the edge copies it
+    /// into the manifest's GlobalGiftId, and a fresh id would render a banner
+    /// that grants nothing.
+    #[test]
+    fn a_static_gift_banner_points_at_the_gift_itself() {
+        let g = a_static_gift(100, 200, 1);
+        let a = static_gift_announcement(&g);
+        assert_eq!(a.id, g.global_gift_id.to_string());
+        assert!(a.asset_url.ends_with(&g.global_gift_id.to_string()));
+        assert!(a.asset_url.contains("/gift/"), "gift-bearing namespace");
+        assert_eq!(a.start_time, 100);
+        assert_eq!(a.ttl, 200, "ttl is the gift's close time");
+    }
+
+    /// Only in-window, enabled gifts are advertised. An out-of-window banner is
+    /// a Claim button that answers "not active"; a limit-0 banner one that
+    /// answers "limit reached".
+    #[test]
+    fn only_live_enabled_static_gifts_are_advertised() {
+        let now = 150;
+        assert!(gifts_in_window(&a_static_gift(100, 200, 1), now));
+        assert!(!gifts_in_window(&a_static_gift(160, 200, 1), now), "not yet open");
+        assert!(!gifts_in_window(&a_static_gift(100, 120, 1), now), "already closed");
+        assert!(!gifts_in_window(&a_static_gift(100, 200, 0), now), "disabled");
+        // Zero means unbounded, the file's convention.
+        assert!(gifts_in_window(&a_static_gift(0, 0, 1), now));
     }
 
     /// CONTROL: the Free for All banner is deliberately NOT gift-bearing, and
@@ -354,7 +444,7 @@ mod tests {
 mod asset_host_tests {
     use super::*;
 
-    const OURS: &str = "https://announcements-feed.nb.dethele.com";
+    const OURS: &str = "https://announcements.blades.bgs.services";
 
     /// THE BUG: every url we serve pointed at a host that does not resolve, so
     /// no no-VPN client could fetch a manifest, so no announcement was ever
@@ -366,7 +456,7 @@ mod asset_host_tests {
                 "https://announcements.blades.bgs.services/gift/6f7c99c5-e403-4928-bc68-a82f6be18ded",
                 OURS,
             ),
-            "https://announcements-feed.nb.dethele.com/gift/6f7c99c5-e403-4928-bc68-a82f6be18ded",
+            "https://announcements.blades.bgs.services/gift/6f7c99c5-e403-4928-bc68-a82f6be18ded",
         );
     }
 
@@ -392,7 +482,7 @@ mod asset_host_tests {
     #[test]
     fn every_other_host_is_left_alone() {
         for url in [
-            "https://announcements-feed.nb.dethele.com/gift/6f7c99c5-e403-4928-bc68-a82f6be18ded",
+            "https://announcements.blades.bgs.services/gift/6f7c99c5-e403-4928-bc68-a82f6be18ded",
             "https://example.invalid/gift/6f7c99c5-e403-4928-bc68-a82f6be18ded",
             "http://announcements.blades.bgs.services/gift/x", // http, not https
             "",
@@ -409,9 +499,9 @@ mod asset_host_tests {
         assert_eq!(
             reachable_asset_url(
                 "https://announcements.blades.bgs.services/gift/6f7c99c5-e403-4928-bc68-a82f6be18ded",
-                "https://announcements-feed.nb.dethele.com/",
+                "https://announcements.blades.bgs.services/",
             ),
-            "https://announcements-feed.nb.dethele.com/gift/6f7c99c5-e403-4928-bc68-a82f6be18ded",
+            "https://announcements.blades.bgs.services/gift/6f7c99c5-e403-4928-bc68-a82f6be18ded",
         );
     }
 
@@ -446,7 +536,7 @@ mod asset_host_tests {
     /// name that does not resolve.
     #[test]
     fn the_default_origin_is_the_edge_that_serves_these() {
-        assert_eq!(DEFAULT_ASSET_ORIGIN, "https://announcements-feed.nb.dethele.com");
+        assert_eq!(DEFAULT_ASSET_ORIGIN, "https://announcements.blades.bgs.services");
         assert_ne!(DEFAULT_ASSET_ORIGIN, RETAIL_ASSET_ORIGIN);
     }
 }
