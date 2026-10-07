@@ -10,7 +10,7 @@ use actix_web::{
     get,
     web::{self, Json},
 };
-use blades_lib::static_data::Announcement;
+use blades_lib::static_data::{Announcement, GiftDef};
 use diesel::{ExpressionMethods, QueryDsl, SelectableHelper};
 use diesel_async::RunQueryDsl;
 use serde::Serialize;
@@ -117,7 +117,7 @@ pub async fn get_announcements(
 const RETAIL_ASSET_ORIGIN: &str = "https://announcements.blades.bgs.services";
 
 /// Where those assets actually live for us.
-const DEFAULT_ASSET_ORIGIN: &str = "https://announcements-feed.nb.dethele.com";
+const DEFAULT_ASSET_ORIGIN: &str = "https://100.103.14.5";
 
 /// Put an announcement's asset on a host the client can reach.
 ///
@@ -425,7 +425,7 @@ mod tests {
 mod asset_host_tests {
     use super::*;
 
-    const OURS: &str = "https://announcements-feed.nb.dethele.com";
+    const OURS: &str = "https://announcements.blades.bgs.services";
 
     /// THE BUG: every url we serve pointed at a host that does not resolve, so
     /// no no-VPN client could fetch a manifest, so no announcement was ever
@@ -437,7 +437,7 @@ mod asset_host_tests {
                 "https://announcements.blades.bgs.services/gift/6f7c99c5-e403-4928-bc68-a82f6be18ded",
                 OURS,
             ),
-            "https://announcements-feed.nb.dethele.com/gift/6f7c99c5-e403-4928-bc68-a82f6be18ded",
+            "https://announcements.blades.bgs.services/gift/6f7c99c5-e403-4928-bc68-a82f6be18ded",
         );
     }
 
@@ -463,7 +463,7 @@ mod asset_host_tests {
     #[test]
     fn every_other_host_is_left_alone() {
         for url in [
-            "https://announcements-feed.nb.dethele.com/gift/6f7c99c5-e403-4928-bc68-a82f6be18ded",
+            "https://announcements.blades.bgs.services/gift/6f7c99c5-e403-4928-bc68-a82f6be18ded",
             "https://example.invalid/gift/6f7c99c5-e403-4928-bc68-a82f6be18ded",
             "http://announcements.blades.bgs.services/gift/x", // http, not https
             "",
@@ -480,9 +480,9 @@ mod asset_host_tests {
         assert_eq!(
             reachable_asset_url(
                 "https://announcements.blades.bgs.services/gift/6f7c99c5-e403-4928-bc68-a82f6be18ded",
-                "https://announcements-feed.nb.dethele.com/",
+                "https://announcements.blades.bgs.services/",
             ),
-            "https://announcements-feed.nb.dethele.com/gift/6f7c99c5-e403-4928-bc68-a82f6be18ded",
+            "https://announcements.blades.bgs.services/gift/6f7c99c5-e403-4928-bc68-a82f6be18ded",
         );
     }
 
