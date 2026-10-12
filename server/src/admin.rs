@@ -8379,7 +8379,7 @@ pub struct NewAltResponse {
 
 /// `POST /…/dev/v1/characters/new-alt` — start a fresh level-1 alt and make it
 /// the live character.
-#[post("/blades.bgs.services/api/dev/v1/characters/new-alt")]
+#[post("/api/dev/v1/characters/new-alt")]
 pub async fn new_alt(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
