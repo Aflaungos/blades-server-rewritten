@@ -135,7 +135,7 @@ pub struct GameTopResponse {
 
 /// `GET /api/dev/v1/arena-ranking/game-top?limit=N` — the first N rows of the
 /// in-game arena leaderboard (current season, bot and human matches alike).
-#[get("/blades.bgs.services/api/dev/v1/arena-ranking/game-top")]
+#[get("/api/dev/v1/arena-ranking/game-top")]
 pub async fn get_arena_game_top(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -180,7 +180,7 @@ pub struct GameGuildsResponse {
 
 /// `GET /api/dev/v1/arena-ranking/game-guilds?limit=N` — the first N rows of the
 /// in-game guild leaderboard.
-#[get("/blades.bgs.services/api/dev/v1/arena-ranking/game-guilds")]
+#[get("/api/dev/v1/arena-ranking/game-guilds")]
 pub async fn get_arena_game_guilds(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -391,7 +391,7 @@ async fn h2h_board_entries(
 }
 
 /// `GET /api/dev/v1/arena-ranking/h2h-guilds?season=current|all|<uuid>&limit=N`.
-#[get("/blades.bgs.services/api/dev/v1/arena-ranking/h2h-guilds")]
+#[get("/api/dev/v1/arena-ranking/h2h-guilds")]
 pub async fn get_arena_h2h_guilds(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
