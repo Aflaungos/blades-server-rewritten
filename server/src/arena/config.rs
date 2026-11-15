@@ -184,6 +184,13 @@ pub struct ArenaConfig {
     /// Rolling rather than "this season" so a season rollover does not turn every
     /// regular casual for its first days.
     pub active_window_days: u64,
+    /// Tracker #506 (decision d45): keep a dropped human's match slot for a grace
+    /// period and resume a reconnect from a NEW IP when it carries the slot's ENet
+    /// CONNECT data and the slot's account has been seen at that IP. Env
+    /// `ARENA_RECONNECT_NEW_IP` (default on; `0` = pre-#506 behaviour) and
+    /// `ARENA_RECONNECT_GRACE_SECS` (default 20). See
+    /// [`ReconnectPolicy`](crate::arena::match_registry::ReconnectPolicy).
+    pub reconnect: crate::arena::match_registry::ReconnectPolicy,
 }
 
 impl ArenaConfig {
@@ -251,6 +258,10 @@ impl ArenaConfig {
             ),
             active_min_h2h: parse("ARENA_ACTIVE_MIN_H2H", 10),
             active_window_days: parse("ARENA_ACTIVE_WINDOW_DAYS", 28),
+            reconnect: crate::arena::match_registry::ReconnectPolicy::from_env_values(
+                env::var("ARENA_RECONNECT_NEW_IP").ok().as_deref(),
+                env::var("ARENA_RECONNECT_GRACE_SECS").ok().as_deref(),
+            ),
         }
     }
 }

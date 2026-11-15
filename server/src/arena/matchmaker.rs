@@ -258,6 +258,21 @@ pub fn advertise_host_for(config: &crate::arena::config::ArenaConfig, via_vpn: b
         .unwrap_or_else(|| config.advertise_host.clone())
 }
 
+/// The client's source IP as trusted ingress reports it: the VPN path's
+/// `X-Newblades-Device-Ip` (edge nginx erases it on the public path), else the
+/// public path's `X-Real-IP` (edge nginx overwrites it), else the socket peer.
+pub fn trusted_client_ip(req: &actix_web::HttpRequest) -> Option<IpAddr> {
+    ["X-Newblades-Device-Ip", "X-Real-IP"]
+        .into_iter()
+        .find_map(|name| {
+            req.headers()
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.trim().parse::<IpAddr>().ok())
+        })
+        .or_else(|| req.peer_addr().map(|addr| addr.ip()))
+}
+
 pub struct TicketRequest {
     pub ticket_id: Uuid,
     pub user_id: Uuid,
@@ -1823,6 +1838,7 @@ mod human_priority_tests {
             humans_first_active_max_wait_secs: 0,
             active_min_h2h: 0,
             active_window_days: 28,
+            reconnect: crate::arena::match_registry::ReconnectPolicy::OFF,
         }
     }
 
@@ -2687,6 +2703,7 @@ mod bot_pick_tests {
             humans_first_active_max_wait_secs: 0,
             active_min_h2h: 0,
             active_window_days: 28,
+            reconnect: crate::arena::match_registry::ReconnectPolicy::OFF,
         };
         // No DB pool → the function's first early return. `block_on` because the
         // path never awaits anything real once `db` is None.
@@ -3988,8 +4005,15 @@ impl ArenaGlobal {
         // handle — `start` runs under the actix/tokio runtime). `None` when
         // submission is disabled / unconfigured, in which case admit is a no-op.
         let key_submitter = KeySubmitter::from_config(KeySubmitConfig::from_env()).map(Arc::new);
-        let registry =
-            MatchRegistry::new_with_submitter(config.max_concurrent_matches, key_submitter);
+        info!(
+            "arena: mid-match reconnect policy {:?} (#506)",
+            config.reconnect
+        );
+        let registry = MatchRegistry::new_with_submitter(
+            config.max_concurrent_matches,
+            key_submitter,
+            config.reconnect,
+        );
 
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         let active_tickets = Arc::new(ActiveTickets::default());
@@ -5134,6 +5158,10 @@ async fn resolve(
         }
         return None;
     }
+    // #506: which account holds each ticket slot, so a reconnect from a new IP can
+    // be checked against that account's authenticated requests.
+    let slot_accounts: Vec<Option<Uuid>> = tickets.iter().map(|t| Some(t.user_id)).collect();
+    registry.set_slot_accounts(game_session_id, &slot_accounts);
     info!(
         "matchmaker: resolved {} ({} player(s), gsid {game_session_id}) — clients dial {}:{}",
         if paired { "PAIR" } else { "solo/bot" },
@@ -5411,15 +5439,7 @@ pub async fn create_match(
         crate::arena::fight_ai::fights_ai(&app_state.db_pool, session.session.user_id).await;
 
     let via_vpn = req.headers().get("X-Newblades-Device-Ip").is_some();
-    let expected_udp_ip = ["X-Newblades-Device-Ip", "X-Real-IP"]
-        .into_iter()
-        .find_map(|name| {
-            req.headers()
-                .get(name)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.trim().parse::<IpAddr>().ok())
-        })
-        .or_else(|| req.peer_addr().map(|addr| addr.ip()));
+    let expected_udp_ip = trusted_client_ip(&req);
 
     app_state
         .arena
@@ -5541,6 +5561,7 @@ mod tests {
             humans_first_active_max_wait_secs: 0,
             active_min_h2h: 0,
             active_window_days: 28,
+            reconnect: crate::arena::match_registry::ReconnectPolicy::OFF,
         }
     }
 
@@ -5660,6 +5681,7 @@ mod tests {
             humans_first_active_max_wait_secs: 0,
             active_min_h2h: 0,
             active_window_days: 28,
+            reconnect: crate::arena::match_registry::ReconnectPolicy::OFF,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         tokio::spawn(matchmaker_loop(
@@ -5763,6 +5785,7 @@ mod tests {
             humans_first_active_max_wait_secs: 0,
             active_min_h2h: 0,
             active_window_days: 28,
+            reconnect: crate::arena::match_registry::ReconnectPolicy::OFF,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         tokio::spawn(matchmaker_loop(
@@ -5879,6 +5902,7 @@ mod tests {
             humans_first_active_max_wait_secs: 0,
             active_min_h2h: 0,
             active_window_days: 28,
+            reconnect: crate::arena::match_registry::ReconnectPolicy::OFF,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         tokio::spawn(matchmaker_loop(
@@ -5965,6 +5989,7 @@ mod tests {
             humans_first_active_max_wait_secs: 0,
             active_min_h2h: 0,
             active_window_days: 28,
+            reconnect: crate::arena::match_registry::ReconnectPolicy::OFF,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         tokio::spawn(matchmaker_loop(
@@ -6042,6 +6067,7 @@ mod tests {
             humans_first_active_max_wait_secs: 0,
             active_min_h2h: 0,
             active_window_days: 28,
+            reconnect: crate::arena::match_registry::ReconnectPolicy::OFF,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         tokio::spawn(matchmaker_loop(
@@ -6149,6 +6175,7 @@ mod tests {
             humans_first_active_max_wait_secs: 0,
             active_min_h2h: 0,
             active_window_days: 28,
+            reconnect: crate::arena::match_registry::ReconnectPolicy::OFF,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         tokio::spawn(matchmaker_loop(
@@ -6244,6 +6271,7 @@ mod tests {
             humans_first_active_max_wait_secs: 0,
             active_min_h2h: 0,
             active_window_days: 28,
+            reconnect: crate::arena::match_registry::ReconnectPolicy::OFF,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         tokio::spawn(matchmaker_loop(
@@ -6320,6 +6348,7 @@ mod tests {
             humans_first_active_max_wait_secs: 0,
             active_min_h2h: 0,
             active_window_days: 28,
+            reconnect: crate::arena::match_registry::ReconnectPolicy::OFF,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         tokio::spawn(matchmaker_loop(
@@ -6388,6 +6417,7 @@ mod tests {
             humans_first_active_max_wait_secs: 0,
             active_min_h2h: 0,
             active_window_days: 28,
+            reconnect: crate::arena::match_registry::ReconnectPolicy::OFF,
         };
         let active_tickets = Arc::new(ActiveTickets::default());
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
@@ -6496,6 +6526,7 @@ mod tests {
             humans_first_active_max_wait_secs: 0,
             active_min_h2h: 0,
             active_window_days: 28,
+            reconnect: crate::arena::match_registry::ReconnectPolicy::OFF,
         };
         let active_tickets = Arc::new(ActiveTickets::default());
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
@@ -6688,6 +6719,7 @@ mod tests {
             humans_first_active_max_wait_secs: 0,
             active_min_h2h: 0,
             active_window_days: 28,
+            reconnect: crate::arena::match_registry::ReconnectPolicy::OFF,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         tokio::spawn(matchmaker_loop(
@@ -6772,6 +6804,7 @@ mod tests {
             humans_first_active_max_wait_secs: 0,
             active_min_h2h: 0,
             active_window_days: 28,
+            reconnect: crate::arena::match_registry::ReconnectPolicy::OFF,
         };
         let ticket_id = Uuid::new_v4();
         let (rms, mut recv) = unbounded_channel();
@@ -7372,6 +7405,7 @@ mod no_show_375 {
             humans_first_active_max_wait_secs: 0,
             active_min_h2h: 0,
             active_window_days: 28,
+            reconnect: crate::arena::match_registry::ReconnectPolicy::OFF,
         };
         let (tx, rx) = unbounded_channel::<MatchmakerCommand>();
         tokio::spawn(matchmaker_loop(
@@ -7731,6 +7765,7 @@ mod pre_fight_quits_496 {
             humans_first_active_max_wait_secs: 0,
             active_min_h2h: 0,
             active_window_days: 28,
+            reconnect: crate::arena::match_registry::ReconnectPolicy::OFF,
         }
     }
 
@@ -7997,6 +8032,7 @@ mod humans_first_tests {
             humans_first_active_max_wait_secs: max_wait,
             active_min_h2h: 10,
             active_window_days: 28,
+            reconnect: crate::arena::match_registry::ReconnectPolicy::OFF,
         }
     }
 
