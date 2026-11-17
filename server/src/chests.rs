@@ -228,7 +228,7 @@ fn resolve_overflow(
 /// `ResolveOverflowFromTreasuryExpansion`); DISCARD drops it. The response type is
 /// the bare `Response`, so only the inventory diff is returned.
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/treasuries/current/resolve"
+    "/api/game/v1/public/characters/{character_id}/treasuries/current/resolve"
 )]
 pub async fn resolve_overflow_chest(
     session: SessionLookedUpMaybe,

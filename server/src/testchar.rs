@@ -202,7 +202,7 @@ pub struct MarkTestCharacterResponse {
     pub newly_marked: bool,
 }
 
-#[post("/blades.bgs.services/api/dev/v1/test-characters/mark")]
+#[post("/api/dev/v1/test-characters/mark")]
 pub async fn mark_test_character(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -381,7 +381,7 @@ pub struct SetTestCharacterLevelResponse {
     pub abilities_reset: bool,
 }
 
-#[post("/blades.bgs.services/api/dev/v1/test-characters/{alt_uuid}/level")]
+#[post("/api/dev/v1/test-characters/{alt_uuid}/level")]
 pub async fn set_test_character_level(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -544,7 +544,7 @@ pub struct TestCharactersResponse {
     pub audit: Vec<TestCharacterAuditRow>,
 }
 
-#[get("/blades.bgs.services/api/dev/v1/test-characters")]
+#[get("/api/dev/v1/test-characters")]
 pub async fn list_test_characters(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,

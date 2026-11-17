@@ -1156,7 +1156,7 @@ pub async fn get_global_shop_for_character(
 /// offer — 65 refusals, the only caller on the box). Retail's corpus holds no
 /// sample of this call, so the body shape is the response class: empty.
 #[post(
-    "/blades.bgs.services/api/game/v1/public/characters/{character_id}/globalshops/current/lastchance"
+    "/api/game/v1/public/characters/{character_id}/globalshops/current/lastchance"
 )]
 pub async fn update_last_chance(
     session: SessionLookedUpMaybe,

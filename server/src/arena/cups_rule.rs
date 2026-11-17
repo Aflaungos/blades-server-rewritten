@@ -438,7 +438,7 @@ fn default_true() -> bool {
 /// Body `{"dry_run": bool, "expect_rule": "classic"|"haudrauf_2500"}`. Reads the
 /// ACTIVE ranking config fresh (not the 30 s cache) and recalculates the active
 /// season under its `cups_rule`.
-#[post("/blades.bgs.services/api/dev/v1/arena-ranking/cups-rule/recalculate")]
+#[post("/api/dev/v1/arena-ranking/cups-rule/recalculate")]
 pub async fn post_cups_rule_recalculate(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,

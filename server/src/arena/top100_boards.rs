@@ -553,7 +553,7 @@ const GUILD_ROSTER_SQL: &str = "\
 ///   `guild::recompute_guild_trophies` writes into `guilds.trophies`.
 /// - `board=h2h`: the "Humans" guild board. Members are the guild's rows of the
 ///   human player board, exactly the input [`get_arena_h2h_guilds`] scores.
-#[get("/blades.bgs.services/api/dev/v1/arena-ranking/guild-members")]
+#[get("/api/dev/v1/arena-ranking/guild-members")]
 pub async fn get_arena_guild_members(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -805,7 +805,7 @@ pub fn h2h_matches_payload(
 /// `GET /api/dev/v1/arena-ranking/h2h-matches?season=current|all|<uuid>` — every
 /// human-vs-human match of the season with the ratings it moved, replayed exactly
 /// as the reconcile that writes the board replays it.
-#[get("/blades.bgs.services/api/dev/v1/arena-ranking/h2h-matches")]
+#[get("/api/dev/v1/arena-ranking/h2h-matches")]
 pub async fn get_arena_h2h_matches(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,

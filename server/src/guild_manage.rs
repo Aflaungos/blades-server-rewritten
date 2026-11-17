@@ -312,7 +312,7 @@ pub struct SeatView {
 /// `GET /…/api/dev/v1/guild-seats?userId=<public arena user id>` — the seats
 /// held by that account's live alt and its parked alts. The profile reads it
 /// to decide whether to show "Manage guild" at all.
-#[get("/blades.bgs.services/api/dev/v1/guild-seats")]
+#[get("/api/dev/v1/guild-seats")]
 pub async fn guild_seats(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -540,7 +540,7 @@ fn season_stats_for(
 }
 
 /// `GET /…/api/dev/v1/guilds/{guild_id}/roster`.
-#[get("/blades.bgs.services/api/dev/v1/guilds/{guild_id}/roster")]
+#[get("/api/dev/v1/guilds/{guild_id}/roster")]
 pub async fn guild_roster(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -893,7 +893,7 @@ fn refusal_error(r: KickRefusal) -> BladeApiError {
 }
 
 /// `POST /…/api/dev/v1/guilds/{guild_id}/kick`.
-#[post("/blades.bgs.services/api/dev/v1/guilds/{guild_id}/kick")]
+#[post("/api/dev/v1/guilds/{guild_id}/kick")]
 pub async fn kick_guild_member(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,

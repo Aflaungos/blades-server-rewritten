@@ -150,7 +150,7 @@ async fn read_all(
 }
 
 /// `GET /…/dev/v1/characters/fight-ai?userId=` — this account's per-alt settings.
-#[get("/blades.bgs.services/api/dev/v1/characters/fight-ai")]
+#[get("/api/dev/v1/characters/fight-ai")]
 pub async fn get_fight_ai(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -187,7 +187,7 @@ pub struct SetFightAiRequest {
 /// given yet: a captured alt can be set before its first transfer, and the row is
 /// found when it arrives (`source_alt_uuid` = the captured uuid). The write is
 /// scoped to `userId`, so it can never touch another account.
-#[post("/blades.bgs.services/api/dev/v1/characters/fight-ai")]
+#[post("/api/dev/v1/characters/fight-ai")]
 pub async fn set_fight_ai_route(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,

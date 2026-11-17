@@ -174,7 +174,7 @@ pub async fn load_monthly_rows(
 }
 
 /// `GET /api/dev/v1/arena-ranking/monthly-matches?month=current|YYYY-MM`.
-#[get("/blades.bgs.services/api/dev/v1/arena-ranking/monthly-matches")]
+#[get("/api/dev/v1/arena-ranking/monthly-matches")]
 pub async fn get_arena_monthly_matches(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -343,7 +343,7 @@ pub struct SeasonQuery {
 /// `GET /api/dev/v1/arena-ranking/season-matches?season=current|<uuid>` — every
 /// arena match (humans and AI) of one season, for the website's "Cups — proposed
 /// rule" view (#515 msg 3347). No active season: `season` null, no rows.
-#[get("/blades.bgs.services/api/dev/v1/arena-ranking/season-matches")]
+#[get("/api/dev/v1/arena-ranking/season-matches")]
 pub async fn get_arena_season_matches(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,

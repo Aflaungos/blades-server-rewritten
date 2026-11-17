@@ -2224,7 +2224,7 @@ pub struct SetTownNameResponse {
 /// `POST …/towns/current/name` needs a game session; this is the same write
 /// (`town::name_town`, which also sets the validated bit the client checks before
 /// it opens the Arena and Guilds menus) behind the import token.
-#[post("/blades.bgs.services/api/dev/v1/characters/{character_id}/town/name")]
+#[post("/api/dev/v1/characters/{character_id}/town/name")]
 pub async fn set_current_town_name(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,

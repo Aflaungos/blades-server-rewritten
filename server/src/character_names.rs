@@ -1186,7 +1186,7 @@ pub struct AiFixRequest {
 
 /// `POST /…/dev/v1/character-names/ai-fix {dryRun, aiCopyUserIds}` — see
 /// [`run_ai_fix`]. Dry run by default; undo with `…/backfill/undo {runId}`.
-#[post("/blades.bgs.services/api/dev/v1/character-names/ai-fix")]
+#[post("/api/dev/v1/character-names/ai-fix")]
 pub async fn fix_ai_names(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -1263,7 +1263,7 @@ fn backfill_failed(e: diesel::result::Error) -> BladeApiError {
 /// `POST /…/dev/v1/character-names/backfill {dryRun}` — number existing
 /// duplicates (oldest keeps the bare name) and replace every "Adventurer" with
 /// a generated name. Dry run by default.
-#[post("/blades.bgs.services/api/dev/v1/character-names/backfill")]
+#[post("/api/dev/v1/character-names/backfill")]
 pub async fn backfill_character_names(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
@@ -1291,7 +1291,7 @@ pub async fn backfill_character_names(
 }
 
 /// `POST /…/dev/v1/character-names/backfill/undo {runId}`.
-#[post("/blades.bgs.services/api/dev/v1/character-names/backfill/undo")]
+#[post("/api/dev/v1/character-names/backfill/undo")]
 pub async fn undo_character_name_backfill(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,

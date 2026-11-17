@@ -329,7 +329,7 @@ pub struct ProgressQuery {
 /// `X-Import-Token` gated like every dev route. Totals per location type, per
 /// player (when `userId` is given) and community-wide, plus the top contributors
 /// by character name. Counts only: no user ids leave in `top`.
-#[get("/blades.bgs.services/api/dev/v1/community-hunt/progress")]
+#[get("/api/dev/v1/community-hunt/progress")]
 pub async fn get_community_hunt_progress(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,

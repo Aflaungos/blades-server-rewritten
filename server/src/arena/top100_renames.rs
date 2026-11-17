@@ -199,7 +199,7 @@ SELECT c.id, u.old_name, u.new_name, u.renamed_at, u.id \
 
 /// `GET /api/dev/v1/arena-ranking/recent-renames` — names renamed to in the last
 /// [`PREVIOUS_NAME_DAYS`] days with the previous name worth showing beside them.
-#[get("/blades.bgs.services/api/dev/v1/arena-ranking/recent-renames")]
+#[get("/api/dev/v1/arena-ranking/recent-renames")]
 pub async fn get_arena_recent_renames(
     req: HttpRequest,
     app_state: web::Data<Arc<ServerGlobal>>,
