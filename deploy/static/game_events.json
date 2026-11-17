@@ -904,17 +904,17 @@
   "eventId": "fc1b07f7-7bbf-5912-a6aa-2a278f6b2fd9",
   "questId": "1a38ac88-2b00-47a4-a626-cb2e8af2ab1f",
   "important": true,
-  "instanceDurationSecs": 1209600,
+  "instanceDurationSecs": 3801600,
   "recurrence": {
    "recurrenceType": "daily",
    "startTimeSecs": 1661817600,
-   "durationSecs": 1209600,
+   "durationSecs": 3801600,
    "recurrenceInterval": 44
   },
   "_meta": {
    "name": "EQ18 Clear off the undead",
    "authored": true,
-   "note": "Newblades content nb-draugr-kill (#197, #198, #355). EQ18 is a placeholder quest retail never released, so this calendar entry is ours. It sits on day-slot 7 of the 44-day rotation (a slot that already holds a retail event) with a 14-day window, longer than retail's 2 days, so Beta testers have time to play it; shorten durationSecs and instanceDurationSecs to 172800 to match the rotation."
+   "note": "Newblades content nb-draugr-kill (#197, #198, #355). EQ18 is a placeholder quest retail never released, so this calendar entry is ours. It is always open: durationSecs equals the 44-day recurrenceInterval, so each window starts the moment the previous one ends. A new instance (fresh completion counter) begins every 44 days. To limit it to a Beta window, set both durations back to 1209600 (14 days) or 172800 (2 days, retail's rotation)."
   }
  }
 ]
