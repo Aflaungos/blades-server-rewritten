@@ -14,6 +14,26 @@
         "EQ15_Title": "Newblades: {retail}"
       },
       "extraSpawnGroups": {}
+    },
+    {
+      "id": "nb-draugr-kill",
+      "status": "beta",
+      "requests": ["#197", "#198", "#355"],
+      "summary": "Draugr dungeon on the unreleased EQ18 slot: six draugr (4 patrol, 2 stationary) in section 0, kill-3-draugr objective, quest title prefixed 'Newblades:'. Client side: newcontent/nb-draugr-kill.json.",
+      "questIds": ["1a38ac88-2b00-47a4-a626-cb2e8af2ab1f"],
+      "dungeonIds": ["57da57d2-4ca4-43a1-ac87-26801fe602d0"],
+      "enemyDataIds": ["67d9e5a6-191c-4c8f-863e-4c608d7cf3d3"],
+      "loc": {
+        "EQ18_Title": "Newblades: Clear off the undead",
+        "EQ18_Description": "The Ayleid sorcerer-king has casted dark magic on the land and now the Draugur are wandering again on Cyrodiil. It's time to clear them once and for all again!",
+        "EQ_Objective_Generic_EQ18_01": "Defeat 3 Draugrs"
+      },
+      "extraSpawnGroups": {
+        "57da57d2-4ca4-43a1-ac87-26801fe602d0": {
+          "9c18e610-0f8d-46a8-a358-a43f2365b210": 4,
+          "06c74751-c998-4e41-af34-76d6c02e232f": 2
+        }
+      }
     }
   ]
 }

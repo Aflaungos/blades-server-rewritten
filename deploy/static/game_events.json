@@ -899,5 +899,22 @@
    "authored": true,
    "note": "Retired before our capture corpus begins, so this calendar entry is ours. recurrenceType stays \"daily\" because that is the only string retail ever sent the client (it means \"this recurs\"; the 39-day rotation uses it too), and recurrenceInterval 365 is what the client is told. The server repeats it on the anchor's calendar DATE \u2014 see EventDef.annual \u2014 because 365 days is not a year. Report #189."
   }
+ },
+ {
+  "eventId": "fc1b07f7-7bbf-5912-a6aa-2a278f6b2fd9",
+  "questId": "1a38ac88-2b00-47a4-a626-cb2e8af2ab1f",
+  "important": true,
+  "instanceDurationSecs": 1209600,
+  "recurrence": {
+   "recurrenceType": "daily",
+   "startTimeSecs": 1661817600,
+   "durationSecs": 1209600,
+   "recurrenceInterval": 44
+  },
+  "_meta": {
+   "name": "EQ18 Clear off the undead",
+   "authored": true,
+   "note": "Newblades content nb-draugr-kill (#197, #198, #355). EQ18 is a placeholder quest retail never released, so this calendar entry is ours. It sits on day-slot 7 of the 44-day rotation (a slot that already holds a retail event) with a 14-day window, longer than retail's 2 days, so Beta testers have time to play it; shorten durationSecs and instanceDurationSecs to 172800 to match the rotation."
+  }
  }
 ]
