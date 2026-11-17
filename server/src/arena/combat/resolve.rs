@@ -1293,6 +1293,9 @@ fn land_due_hits(combat: &mut MatchCombat, now: Instant) -> Vec<(usize, Vec<u8>)
             continue;
         }
         let mut attacker_loadout = combat.fighters[h.sender].loadout.clone();
+        // Adrenaline reads the swinger's health as the hit lands (#530).
+        attacker_loadout.attacker_at_critical_health =
+            super::perks::fighter_health_is_critical(&combat.fighters[h.sender]);
         // Reckless Fury adds its weapon-class bonus to every swing for its window
         // (`_bonusDamages`: Light 11.24 / Versatile 14.17 / Heavy 17.86 at rank 1).
         // Ride the maneuver channel — same "flat additive on the physical base"
@@ -1661,6 +1664,8 @@ pub(super) fn resolve_ability_cast(
         f.charge_press_at = None;
         f.pending_manual_attack = None;
         f.bot_swing_at = None;
+        // A guard still held when this maneuver ends goes back up then (#530).
+        f.guard_resume_pending = true;
         if f.actor_state() == ActorStateType::Blocking {
             f.blocking_until = None;
             f.reconcile_block(now);
@@ -2265,6 +2270,9 @@ fn apply_ability_impact(
         }
         AbilityTag::Maneuver => {
             let mut attacker_loadout = combat.fighters[sender].loadout.clone();
+            // Adrenaline reads the caster's health as the maneuver lands (#530).
+            attacker_loadout.attacker_at_critical_health =
+                super::perks::fighter_health_is_critical(&combat.fighters[sender]);
             // METTLE applies to MANEUVERS — and only to the maneuver's own flat bonus.
             // The client folds `1 + Σ EnhanceAbility` into
             // `ManeuverParameters._effectivenessMultiplier` at `ExecuteAbility`, and
@@ -3835,7 +3843,18 @@ fn emit_damage_with_outcome(
         .filter(|(t, _)| super::damage::is_health_type(*t))
         .map(|(_, v)| *v)
         .sum();
-    neg.negated = total <= 0.0;
+    // A hit that never carried health damage but does carry pool damage — Shield
+    // Stamina / Magicka Damage returned as Revenge on an optimal block (#530/#533) —
+    // is not a negation: retail calls a hit fully negated only when every stat is 0
+    // (01 E1). Without this it went out as op66 and the drain never happened.
+    let pool_only = before_pools <= 0.0
+        && components.iter().any(|(t, v)| {
+            matches!(
+                t,
+                super::state::DamageType::Stamina | super::state::DamageType::Magicka
+            ) && *v > 0.0
+        });
+    neg.negated = total <= 0.0 && !pool_only;
     let poison_damage: f32 = if neg.negated {
         0.0
     } else {
@@ -4205,9 +4224,21 @@ fn apply_shield_enchant_retaliation(
     if entries.is_empty() {
         return Vec::new();
     }
+    // Any positive entry counts, pool types included: Shield Stamina / Magicka
+    // Damage ("of Exhaustion" / "of Nullifying") return `Damage(8|9, X)` and retail
+    // sends every returned Damage with v > 0 back as Revenge
+    // (`ShieldElementalDamageBonusInstance$$BlockedDamage@0x1d525e0`,
+    // `<ResolveDamageEvents>b__2@0x1fd05b8`). Summing health types only made the
+    // two pool families do nothing on an optimal block (report #530/#533).
     let total: f32 = entries
         .iter()
-        .filter(|(ty, _)| super::damage::is_health_type(*ty))
+        .filter(|(ty, _)| {
+            super::damage::is_health_type(*ty)
+                || matches!(
+                    ty,
+                    super::state::DamageType::Stamina | super::state::DamageType::Magicka
+                )
+        })
         .map(|(_, v)| *v)
         .sum();
     if total <= 0.0 {
@@ -4600,9 +4631,13 @@ fn reconcile_paralysis(f: &mut super::state::Fighter, now: Instant) {
         && now.duration_since(f.state_entered) >= Duration::from_secs_f32(f.paralyze_secs.max(0.1))
     {
         f.set_actor_state(ActorStateType::Idle, now);
+        // A guard held through the paralysis goes back up now (#530, as #357).
+        f.guard_resume_pending = true;
     }
     // Phase 3.13: a lapsed stagger also returns the actor to Idle.
     f.reconcile_stagger(now);
+    // Report #530: a guard held through a maneuver goes up at its end.
+    f.reconcile_held_guard_resume(now);
 }
 
 /// Deliver the due ticks of every in-flight channelled spell.
@@ -8027,6 +8062,201 @@ mod tests {
             combat.fighters[1].is_staggered(impact),
             "an unblocking target is staggered only at the strike phase",
         );
+    }
+
+    /// Report #530: "After using shield bash skills (all skills), the high block isn't
+    /// activated afterwards." The player holds block, bashes, and keeps holding. The
+    /// bash ends the guard and the maneuver lock drops any press made during it, so
+    /// the client never re-sends the press it is still holding. The held guard must go
+    /// back up when the maneuver ends, as #357 does for a stagger.
+    #[test]
+    fn report_530_a_guard_held_through_a_shield_bash_goes_up_when_it_ends() {
+        use super::phase4_tests::make_act_frame;
+        for held_from_before in [true, false] {
+            let now = Instant::now();
+            let mut combat = make_live_combat(now);
+            if held_from_before {
+                on_c2s_input(&mut combat, 0, &make_act_frame(true, 0.0, true), now);
+                assert_eq!(combat.fighters[0].actor_state(), ActorStateType::Blocking);
+            }
+            let cast_at = now + Duration::from_millis(100);
+            let _ = cast(&mut combat, STAGGERING_BASH, AbilityTag::Maneuver, cast_at);
+            assert!(combat.fighters[0].maneuver_active(cast_at), "precondition");
+            if !held_from_before {
+                // Pressed mid-maneuver: the lock drops it, but the button stays down.
+                let press = cast_at + Duration::from_millis(600);
+                on_c2s_input(&mut combat, 0, &make_act_frame(true, 0.0, true), press);
+            }
+            assert!(combat.fighters[0].guard_held, "precondition: block held");
+
+            // Tick through the maneuver with no further input from the client.
+            let mut t = cast_at;
+            let mut up_while_maneuvering_after_bash_guard = false;
+            while combat.fighters[0].maneuver_active(t) {
+                t += Duration::from_millis(20);
+                let _ = on_tick(&mut combat, t, false);
+                if combat.fighters[0].maneuver_active(t)
+                    && t > cast_at + Duration::from_millis(700)
+                    && combat.fighters[0].actor_state() == ActorStateType::Blocking
+                {
+                    up_while_maneuvering_after_bash_guard = true;
+                }
+            }
+            assert!(
+                !up_while_maneuvering_after_bash_guard,
+                "the guard must not come up while the maneuver still runs"
+            );
+            let end = t + Duration::from_millis(20);
+            let _ = on_tick(&mut combat, end, false);
+            assert_eq!(
+                combat.fighters[0].actor_state(),
+                ActorStateType::Blocking,
+                "held_from_before={held_from_before}: the held guard goes up at OnManeuverEnded"
+            );
+            assert!(combat.fighters[0].block_phase(end).is_some());
+        }
+    }
+
+    fn ability_uuid_530(editor: &str) -> &'static str {
+        super::super::gamedata::ABILITIES
+            .iter()
+            .find(|a| a.editor_name == editor)
+            .map(|a| a.uuid)
+            .unwrap_or_else(|| panic!("{editor} missing from the shipped table"))
+    }
+
+    /// Hold block, cast `editor`, keep holding with no further input, tick until the
+    /// lock is over; return the end instant.
+    fn hold_block_through_cast(
+        combat: &mut MatchCombat,
+        editor: &str,
+        press_at: Instant,
+        cast_at: Instant,
+    ) -> Instant {
+        use super::phase4_tests::make_act_frame;
+        on_c2s_input(combat, 0, &make_act_frame(true, 0.0, true), press_at);
+        assert_eq!(combat.fighters[0].actor_state(), ActorStateType::Blocking);
+        let uuid = ability_uuid_530(editor);
+        let tag = super::super::loadout::ability_tag_for_template(uuid);
+        let _ = cast(combat, uuid, tag, cast_at);
+        let mut t = cast_at;
+        let deadline = cast_at + Duration::from_secs(6);
+        while t < deadline
+            && (combat.fighters[0].maneuver_active(t) || combat.fighters[0].in_channel_pose(t))
+        {
+            t += Duration::from_millis(20);
+            let _ = on_tick(combat, t, false);
+        }
+        let end = t + Duration::from_millis(40);
+        let _ = on_tick(combat, end, false);
+        let _ = on_tick(combat, end + Duration::from_millis(20), false);
+        end + Duration::from_millis(20)
+    }
+
+    /// Report #530 follow-up: "high block should also be placed after other
+    /// abilities". One case per family that locks the guard out: weapon maneuvers,
+    /// every shield bash, and a dodge. Each held guard comes back up as a fresh HIGH
+    /// block when the lock ends.
+    #[test]
+    fn report_530_a_held_guard_returns_high_after_every_maneuver_family() {
+        for editor in [
+            "PowerAttack",
+            "Guardbreaker",
+            "ShieldBash",
+            "HarryingBash",
+            "ReflectingBash",
+            "StaggeringBash",
+            "DodgingStrike",
+        ] {
+            let now = Instant::now();
+            let mut combat = make_live_combat(now);
+            let end =
+                hold_block_through_cast(&mut combat, editor, now, now + Duration::from_millis(100));
+            assert_eq!(
+                combat.fighters[0].actor_state(),
+                ActorStateType::Blocking,
+                "{editor}: the held guard goes back up"
+            );
+            assert_eq!(
+                combat.fighters[0].block_phase(end),
+                Some(BlockPhase::Optimal),
+                "{editor}: as a HIGH block"
+            );
+        }
+    }
+
+    /// Spells are NOT a family that needs the guard restored: a spell cannot be cast
+    /// from a raised guard at all (`Actor$$CanCast@0x1c58f54` admits Idle, Recovery
+    /// and Channeling only), so a player holding block never casts one. Pinned, so a
+    /// later change that lets spells through a guard has to deal with the guard.
+    #[test]
+    fn report_530_a_spell_cannot_be_cast_from_a_raised_guard() {
+        use super::phase4_tests::make_act_frame;
+        for editor in ["Fireball", "IceSpike", "Frostbite"] {
+            let now = Instant::now();
+            let mut combat = make_live_combat(now);
+            let uuid = ability_uuid_530(editor);
+            // Control: from Idle the cast goes through.
+            assert!(
+                !cast(&mut combat, uuid, AbilityTag::Damage, now).is_empty(),
+                "{editor}: control"
+            );
+            let mut combat = make_live_combat(now);
+            on_c2s_input(&mut combat, 0, &make_act_frame(true, 0.0, true), now);
+            let out = cast(
+                &mut combat,
+                uuid,
+                AbilityTag::Damage,
+                now + Duration::from_millis(100),
+            );
+            assert!(out.is_empty(), "{editor}: refused while the guard is up");
+            assert_eq!(combat.fighters[0].actor_state(), ActorStateType::Blocking);
+        }
+    }
+
+    /// Paralysis drops the guard like a stagger does; a guard held through it goes
+    /// back up when it ends (the #357 shape).
+    #[test]
+    fn report_530_a_held_guard_returns_after_a_paralysis() {
+        use super::phase4_tests::make_act_frame;
+        let now = Instant::now();
+        let mut combat = make_live_combat(now);
+        on_c2s_input(&mut combat, 0, &make_act_frame(true, 0.0, true), now);
+        let f = &mut combat.fighters[0];
+        f.paralyze_secs = 2.0;
+        f.set_actor_state(ActorStateType::Paralyzed, now);
+        f.clear_scheduled_states();
+        f.blocking_until = None;
+        assert!(f.guard_held, "precondition");
+        let mut t = now;
+        while t < now + Duration::from_millis(2_200) {
+            t += Duration::from_millis(20);
+            let _ = on_tick(&mut combat, t, false);
+        }
+        let _ = on_tick(&mut combat, t + Duration::from_millis(20), false);
+        assert_eq!(combat.fighters[0].actor_state(), ActorStateType::Blocking);
+    }
+
+    /// The control: a guard released during the bash stays down afterwards.
+    #[test]
+    fn report_530_a_guard_released_during_the_bash_stays_down() {
+        use super::phase4_tests::make_act_frame;
+        let now = Instant::now();
+        let mut combat = make_live_combat(now);
+        on_c2s_input(&mut combat, 0, &make_act_frame(true, 0.0, true), now);
+        let cast_at = now + Duration::from_millis(100);
+        let _ = cast(&mut combat, STAGGERING_BASH, AbilityTag::Maneuver, cast_at);
+        let release = cast_at + Duration::from_millis(600);
+        on_c2s_input(&mut combat, 0, &make_act_frame(false, 0.0, true), release);
+        let mut t = cast_at;
+        while combat.fighters[0].maneuver_active(t) || t < release {
+            t += Duration::from_millis(20);
+            let _ = on_tick(&mut combat, t, false);
+        }
+        let end = t + Duration::from_millis(100);
+        let _ = on_tick(&mut combat, end, false);
+        assert_ne!(combat.fighters[0].actor_state(), ActorStateType::Blocking);
+        assert!(combat.fighters[0].block_phase(end).is_none());
     }
 
     /// Report from live play: "Ice Spike now stuns, but it does it instantaneously,
@@ -14115,6 +14345,65 @@ mod shipped_effects_tests {
         let _ = emit_damage(&mut opt, 0, 1, &high, now);
         assert_eq!(opt.fighters[0].ravaged_stamina, 42);
         assert_eq!(hp_before - opt.fighters[0].health, 20);
+    }
+
+    /// Report #530/#533 ("Exhaustion and Nullifying"): Shield Stamina/Magicka Damage
+    /// (tier-10 suffixes "of Exhaustion"/"of Nullifying") on an OPTIMAL block return
+    /// `Damage(_damageType 8/9, X)` to the ATTACKER through Revenge
+    /// (`ShieldElementalDamageBonusInstance$$BlockedDamage@0x1d525e0`, any v > 0). The
+    /// retaliation summed health types only, so a pool-only shield enchant did nothing.
+    #[test]
+    fn report_530_shield_exhaustion_drains_the_attacker_on_an_optimal_block() {
+        let now = Instant::now();
+        for (ty, low_control) in [(DamageType::Stamina, true), (DamageType::Magicka, false)] {
+            let hit = ResolvedDamage {
+                source: DamageSource::Attack,
+                active_side: ActiveSide::Right,
+                flags: flags::SHOW_DAMAGE | flags::HAS_ATTACKER,
+                pre_mitigation_components: vec![(DamageType::Slashing, 10.0)],
+                components: vec![(DamageType::Slashing, 10.0)],
+                raw_components: vec![(DamageType::Slashing, 10.0)],
+                total: 10.0,
+                most_resisted: DamageType::None,
+                negated: false,
+                heal: 0.0,
+                block_physical: 1.0,
+                blocked: true,
+                resistance_scale: 1.0,
+            };
+            let pool = |c: &MatchCombat| match ty {
+                DamageType::Stamina => c.fighters[0].stamina,
+                _ => c.fighters[0].magicka,
+            };
+            if low_control {
+                let mut c = combat2(now);
+                c.fighters[1].loadout.shield_enchant_damage = vec![(ty, 100.0)];
+                let before = pool(&c);
+                let _ = emit_damage(&mut c, 0, 1, &hit, now);
+                assert_eq!(
+                    pool(&c),
+                    before,
+                    "a LOW block fires no shield enchant in PvP"
+                );
+            }
+            let mut c = combat2(now);
+            c.fighters[1].loadout.shield_enchant_damage = vec![(ty, 100.0)];
+            let before = pool(&c);
+            let mut high = hit.clone();
+            high.flags |= flags::WAS_OPTIMAL_BLOCKING;
+            let defender_before = (c.fighters[1].stamina, c.fighters[1].magicka);
+            let _ = emit_damage(&mut c, 0, 1, &high, now);
+            assert!(
+                pool(&c) < before,
+                "{ty:?}: the attacker loses {ty:?} to the blocker's shield ({before} -> {})",
+                pool(&c)
+            );
+            assert_eq!(
+                (c.fighters[1].stamina, c.fighters[1].magicka),
+                defender_before,
+                "the blocker's own pools are untouched"
+            );
+        }
     }
 
     #[test]
